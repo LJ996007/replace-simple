@@ -1,0 +1,6 @@
+python-docx
+openpyxl
+xlrd
+python-pptx
+pyinstaller
+tksheet

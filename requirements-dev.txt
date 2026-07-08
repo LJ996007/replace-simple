@@ -1,0 +1,4 @@
+# 开发/测试额外依赖：运行 tests/ 时需要，运行主程序不需要。
+# 安装：pip install -r requirements-dev.txt
+-r requirements.txt
+xlwt   # 仅测试用：生成 .xls 样本以验证 .xls 规则表读取
