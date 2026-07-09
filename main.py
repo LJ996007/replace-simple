@@ -184,8 +184,10 @@ class ReplaceSimpleApp:
         self._apply_window_icon()
 
         self.replace_files = []
+        self.recent_word_files = []
         self.output_dir = None
         self._last_output_dir_to_open = None
+        self.table_export_window = None
 
         self._setup_fonts()
         self._create_widgets()
@@ -235,6 +237,66 @@ class ReplaceSimpleApp:
         style.configure("Hint.TLabel", font=self.small_font, foreground=self.muted_fg, background=self.surface_bg)
         style.configure("Muted.TLabel", font=self.body_font, foreground=self.muted_fg, background=self.surface_bg)
         style.configure("Status.TLabel", font=self.body_font, foreground=self.accent_fg, background=self.surface_bg)
+        style.configure(
+            "Scan.Treeview",
+            font=self.body_font,
+            rowheight=32,
+            background=self.surface_bg,
+            fieldbackground=self.surface_bg,
+            foreground=self.text_fg,
+            bordercolor=self.border_color,
+            borderwidth=1,
+        )
+        style.configure(
+            "Scan.Treeview.Heading",
+            font=self.section_font,
+            padding=(8, 8),
+            background=HEADER_BG,
+            foreground=self.text_fg,
+            relief="flat",
+            bordercolor=HEADER_GRID_COLOR,
+        )
+        style.map(
+            "Scan.Treeview.Heading",
+            background=[("active", "#E2E8F0")],
+            foreground=[("active", self.text_fg)],
+        )
+        style.configure(
+            "Scan.Vertical.TScrollbar",
+            gripcount=0,
+            width=20,
+            arrowsize=20,
+            background="#DDE5EF",
+            darkcolor="#DDE5EF",
+            lightcolor="#DDE5EF",
+            troughcolor="#F1F4F8",
+            bordercolor="#C4CEDA",
+            arrowcolor=self.text_fg,
+            relief="flat",
+        )
+        style.map(
+            "Scan.Vertical.TScrollbar",
+            background=[("pressed", "#C8D3E0"), ("active", "#D3DCE8")],
+            arrowcolor=[("disabled", "#9AA4B2")],
+        )
+        style.configure(
+            "Scan.Horizontal.TScrollbar",
+            gripcount=0,
+            width=20,
+            arrowsize=20,
+            background="#DDE5EF",
+            darkcolor="#DDE5EF",
+            lightcolor="#DDE5EF",
+            troughcolor="#F1F4F8",
+            bordercolor="#C4CEDA",
+            arrowcolor=self.text_fg,
+            relief="flat",
+        )
+        style.map(
+            "Scan.Horizontal.TScrollbar",
+            background=[("pressed", "#C8D3E0"), ("active", "#D3DCE8")],
+            arrowcolor=[("disabled", "#9AA4B2")],
+        )
 
         # 扁平次级按钮（clam 主题下方可定制 background/relief）
         style.configure(
@@ -287,7 +349,18 @@ class ReplaceSimpleApp:
         self.header_frame = ttk.Frame(self.container, style="App.TFrame")
         header_frame = self.header_frame
         header_frame.pack(fill="x", pady=(0, 10))
-        ttk.Label(header_frame, text="批量文本替换", style="Title.TLabel").pack(anchor="w")
+
+        header_top = ttk.Frame(header_frame, style="App.TFrame")
+        header_top.pack(fill="x")
+        ttk.Label(header_top, text="批量文本替换", style="Title.TLabel").pack(side="left", anchor="w")
+        self.table_export_button = ttk.Button(
+            header_top,
+            text="提取 Word 表格",
+            command=self.open_word_table_exporter,
+            width=14,
+        )
+        self.table_export_button.pack(side="right")
+
         ttk.Label(
             header_frame,
             text="Word / Excel / PPT 文件内容与文件名同步替换",
@@ -350,11 +423,12 @@ class ReplaceSimpleApp:
         ttk.Button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=9).pack(side="left", padx=(0, 6))
         ttk.Button(rules_toolbar, text="清空规则", command=self.clear_rules, width=9).pack(side="left", padx=(0, 6))
         ttk.Button(rules_toolbar, text="导入 Excel", command=self.import_rules_from_excel, width=10).pack(side="left", padx=(0, 6))
+        ttk.Button(rules_toolbar, text="导入招标文件", command=self.import_rules_from_tender_file, width=13).pack(side="left", padx=(0, 6))
         ttk.Button(rules_toolbar, text="导出 Excel", command=self.export_rules_to_excel, width=10).pack(side="left")
 
         self.rules_hint = ttk.Label(
             rules_frame,
-            text="双击单元格可编辑；粘贴可自动向下扩行；执行时按原文长度长词优先。",
+            text="双击单元格可编辑；可从 Excel 或招标 Word 提取规则；执行时按原文长度长词优先。",
             style="Hint.TLabel",
         )
         self.rules_hint.grid(row=1, column=0, sticky="w", pady=(4, 6))
@@ -458,7 +532,7 @@ class ReplaceSimpleApp:
 
         ttk.Label(
             bottom_frame,
-            text="规则表第一列为原文、第二列为替换文；处理文件支持 .docx / .xlsx / .xlsm / .pptx。",
+            text="规则表第一列为原文、第二列为替换文；招标文件导入会生成 {项目名称} 等占位符规则。",
             style="Hint.TLabel",
         ).grid(row=4, column=0, sticky="w", pady=(7, 0))
 
@@ -664,7 +738,92 @@ class ReplaceSimpleApp:
         foreground = "green" if count else self.muted_fg
         self.files_label.config(text=f"已选择 {count} 个文件", foreground=foreground)
 
+    def _is_docx_file(self, file_path):
+        return (
+            os.path.splitext(file_path)[1].lower() == ".docx"
+            and not os.path.basename(file_path).startswith("~$")
+        )
+
+    def _remember_word_files(self, file_paths):
+        existing = {_file_identity(path) for path in self.recent_word_files}
+        changed = False
+        for file_path in file_paths:
+            if not self._is_docx_file(file_path):
+                continue
+            identity = _file_identity(file_path)
+            if identity in existing:
+                continue
+            self.recent_word_files.append(file_path)
+            existing.add(identity)
+            changed = True
+        return changed
+
+    def _selected_replace_word_files(self):
+        selected = list(self.file_listbox.curselection())
+        if not selected:
+            return []
+        return [
+            self.replace_files[index]
+            for index in selected
+            if 0 <= index < len(self.replace_files) and self._is_docx_file(self.replace_files[index])
+        ]
+
+    def _table_export_word_files(self, selected_only=False):
+        window = self.table_export_window
+        if not window or not window.exists():
+            return []
+        if selected_only:
+            selected = list(window.file_listbox.curselection())
+            return [
+                window.file_paths[index]
+                for index in selected
+                if 0 <= index < len(window.file_paths) and self._is_docx_file(window.file_paths[index])
+            ]
+        return [path for path in window.file_paths if self._is_docx_file(path)]
+
+    def _dedupe_existing_word_files(self, file_paths):
+        seen = set()
+        result = []
+        for file_path in file_paths:
+            if not self._is_docx_file(file_path):
+                continue
+            identity = _file_identity(file_path)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result.append(file_path)
+        return result
+
+    def _word_files_for_reuse(self):
+        return self._dedupe_existing_word_files([
+            *self._selected_replace_word_files(),
+            *self._table_export_word_files(selected_only=True),
+            *self.recent_word_files,
+            *self._table_export_word_files(selected_only=False),
+        ])
+
+    def _choose_tender_file_for_import(self):
+        candidates = self._word_files_for_reuse()
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if len(candidates) > 1:
+            messagebox.showinfo(
+                "选择招标文件",
+                "已检测到多个 Word 文件。\n\n"
+                "请在主文件列表或「提取 Word 表格」窗口中选中一个招标文件，"
+                "或者在接下来的窗口中重新选择。",
+            )
+
+        return filedialog.askopenfilename(
+            title="从招标文件读取项目信息",
+            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")],
+        )
+
     def _remove_rules_file_from_replace_files(self, file_path):
+        return self._remove_import_source_from_replace_files(file_path, "导入源文件")
+
+    def _remove_import_source_from_replace_files(self, file_path, source_label):
         remaining, removed = remove_matching_file_paths(self.replace_files, file_path)
         if not removed:
             return False
@@ -673,7 +832,7 @@ class ReplaceSimpleApp:
         self._refresh_file_list()
         messagebox.showinfo(
             "提示",
-            "导入的规则表已从待处理文件列表中自动移除，避免规则表被一起替换：\n"
+            f"{source_label}已从待处理文件列表中自动移除，避免被一起替换：\n"
             f"{os.path.basename(file_path)}",
         )
         return True
@@ -754,6 +913,37 @@ class ReplaceSimpleApp:
             status += "；已从待处理文件中移除规则表"
         self.status_var.set(status)
 
+    def import_rules_from_tender_file(self):
+        file_path = self._choose_tender_file_for_import()
+        if not file_path:
+            return
+
+        try:
+            from tender_info_extractor import extract_project_info_rules
+            rules = extract_project_info_rules(file_path)
+        except Exception as exc:
+            messagebox.showerror("错误", f"读取招标文件失败：{exc}")
+            return
+
+        if not rules:
+            messagebox.showwarning(
+                "提示",
+                "未识别到可导入的项目信息。\n\n"
+                "目前支持常见写法，例如：项目名称、项目编号、采购人、预算金额等字段。",
+            )
+            return
+
+        data = [[old, new] for old, new in rules]
+        self.rules_sheet.set_sheet_data(data)
+        self._ensure_blank_rule_rows()
+        self._refresh_rules_sheet_view()
+        self._remember_word_files([file_path])
+        removed_from_targets = self._remove_import_source_from_replace_files(file_path, "招标文件")
+        status = f"已从招标文件导入 {len(rules)} 条项目信息：{os.path.basename(file_path)}"
+        if removed_from_targets:
+            status += "；已从待处理文件中移除招标文件"
+        self.status_var.set(status)
+
     def export_rules_to_excel(self):
         rules = self.get_rules_from_table()
         if not rules:
@@ -811,6 +1001,7 @@ class ReplaceSimpleApp:
         existing = {_file_identity(path) for path in self.replace_files}
         added = 0
         skipped = 0
+        added_paths = []
 
         for file_path in file_paths:
             if not self._is_supported_file(file_path):
@@ -822,8 +1013,10 @@ class ReplaceSimpleApp:
                 continue
             self.replace_files.append(file_path)
             existing.add(identity)
+            added_paths.append(file_path)
             added += 1
 
+        self._remember_word_files(added_paths)
         self._refresh_file_list()
         if added:
             message = f"已添加 {added} 个待处理文件"
@@ -1010,6 +1203,702 @@ class ReplaceSimpleApp:
             font=self.body_font,
             bg=self.surface_bg,
             fg=self.text_fg,
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=8,
+        )
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.insert("1.0", message)
+        text.configure(state="disabled")
+
+        buttons = ttk.Frame(body, style="App.TFrame")
+        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="打开输出目录", command=self._open_output_dir, width=14).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="关闭", command=window.destroy, width=10).pack(side="left")
+
+    def open_word_table_exporter(self):
+        initial_files = self._word_files_for_reuse()
+        if self.table_export_window and self.table_export_window.exists():
+            if initial_files:
+                self.table_export_window._append_files(initial_files, show_status=False)
+            self.table_export_window.focus()
+            return
+        self.table_export_window = WordTableExportWindow(self, initial_files=initial_files)
+
+
+class WordTableExportWindow:
+    def __init__(self, app, initial_files=None):
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("提取 Word 表格到 Excel")
+        self.window.geometry("1180x720")
+        self.window.minsize(900, 640)
+        self.window.configure(bg=app.app_bg)
+        self.window.transient(app.root)
+        try:
+            self.window.iconphoto(True, app._icon_photo)
+        except Exception:
+            pass
+
+        self.file_paths = []
+        self.table_items = []
+        self.table_item_by_iid = {}
+        self.selected_table_keys = set()
+        self.output_dir = None
+        self._last_output_dir_to_open = None
+        self.status_var = tk.StringVar(value="就绪")
+
+        self._create_widgets()
+        if initial_files:
+            self._append_files(initial_files, show_status=False)
+            self.status_var.set(f"已自动带入 {len(self.file_paths)} 个 Word 文件")
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+    def exists(self):
+        try:
+            return bool(self.window.winfo_exists())
+        except Exception:
+            return False
+
+    def focus(self):
+        try:
+            self.window.lift()
+            self.window.focus_force()
+        except Exception:
+            pass
+
+    def close(self):
+        self.app.table_export_window = None
+        self.window.destroy()
+
+    def _create_widgets(self):
+        body = ttk.Frame(self.window, padding=12, style="App.TFrame")
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(body, style="App.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        ttk.Label(header, text="提取 Word 表格到 Excel", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="选择 .docx 文件；每个 Word 生成一个 Excel，每张表格对应一个工作表。",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        file_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
+        file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        file_frame.columnconfigure(0, weight=1)
+
+        file_header = ttk.Frame(file_frame, style="Toolbar.TFrame")
+        file_header.grid(row=0, column=0, sticky="ew")
+        file_header.columnconfigure(0, weight=1)
+        ttk.Label(file_header, text="Word 文件", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+
+        file_toolbar = ttk.Frame(file_header, style="Toolbar.TFrame")
+        file_toolbar.grid(row=0, column=1, sticky="e")
+        ttk.Button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
+        ttk.Button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
+        ttk.Button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
+        ttk.Button(file_toolbar, text="清空", command=self.clear_files, width=7).pack(side="left")
+
+        list_frame = ttk.Frame(file_frame, style="Toolbar.TFrame")
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        self.file_listbox = tk.Listbox(
+            list_frame,
+            height=2,
+            selectmode="extended",
+            exportselection=False,
+            font=self.app.small_font,
+            bg=self.app.surface_bg,
+            fg=self.app.text_fg,
+            highlightthickness=1,
+            highlightbackground=self.app.border_color,
+            relief="flat",
+        )
+        self.file_listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.file_listbox.configure(yscrollcommand=scrollbar.set)
+
+        self.files_label = ttk.Label(file_frame, text="已选择 0 个 Word 文件", style="Muted.TLabel")
+        self.files_label.grid(row=2, column=0, sticky="w", pady=(5, 0))
+
+        scan_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
+        scan_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        scan_frame.columnconfigure(0, weight=1)
+        scan_frame.rowconfigure(1, weight=1)
+
+        scan_header = ttk.Frame(scan_frame, style="Toolbar.TFrame")
+        scan_header.grid(row=0, column=0, sticky="ew")
+        scan_header.columnconfigure(0, weight=1)
+        ttk.Label(scan_header, text="扫描结果", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+
+        scan_toolbar = ttk.Frame(scan_header, style="Toolbar.TFrame")
+        scan_toolbar.grid(row=0, column=1, sticky="e")
+        self.scan_button = ttk.Button(scan_toolbar, text="扫描表格", command=self.scan_tables, width=10)
+        self.scan_button.pack(side="left", padx=(0, 6))
+        ttk.Button(scan_toolbar, text="推荐选择", command=self.select_recommended_tables, width=10).pack(side="left", padx=(0, 6))
+        ttk.Button(scan_toolbar, text="全选", command=self.select_all_tables, width=7).pack(side="left", padx=(0, 6))
+        ttk.Button(scan_toolbar, text="全不选", command=self.clear_table_selection, width=8).pack(side="left")
+
+        tree_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
+        tree_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        self.scan_tree = ttk.Treeview(
+            tree_frame,
+            columns=("selected", "file", "table", "size", "hint", "section"),
+            show="headings",
+            selectmode="extended",
+            style="Scan.Treeview",
+            height=7,
+        )
+        self.scan_tree.heading("selected", text="导出")
+        self.scan_tree.heading("file", text="文件")
+        self.scan_tree.heading("table", text="表格")
+        self.scan_tree.heading("size", text="行列")
+        self.scan_tree.heading("hint", text="提示")
+        self.scan_tree.heading("section", text="所在章节")
+        self.scan_tree.column("selected", width=68, minwidth=60, anchor="center", stretch=False)
+        self.scan_tree.column("file", width=170, minwidth=120, stretch=False)
+        self.scan_tree.column("table", width=70, minwidth=62, anchor="center", stretch=False)
+        self.scan_tree.column("size", width=72, minwidth=62, anchor="center", stretch=False)
+        self.scan_tree.column("hint", width=320, minwidth=220)
+        self.scan_tree.column("section", width=420, minwidth=240)
+        self.scan_tree.grid(row=0, column=0, sticky="nsew")
+        y_scrollbar = ttk.Scrollbar(
+            tree_frame,
+            orient="vertical",
+            command=self.scan_tree.yview,
+            style="Scan.Vertical.TScrollbar",
+        )
+        y_scrollbar.grid(row=0, column=1, sticky="ns")
+        x_scrollbar = ttk.Scrollbar(
+            tree_frame,
+            orient="horizontal",
+            command=self.scan_tree.xview,
+            style="Scan.Horizontal.TScrollbar",
+        )
+        x_scrollbar.grid(row=1, column=0, sticky="ew")
+        self.scan_tree.configure(yscrollcommand=y_scrollbar.set, xscrollcommand=x_scrollbar.set)
+        self.scan_tree.bind("<Button-1>", self._toggle_scan_checkbox_from_click)
+        self.scan_tree.bind("<Double-1>", self._toggle_scan_row_from_event)
+        self.scan_tree.bind("<space>", self._toggle_scan_rows_from_keyboard)
+        self.scan_tree.bind("<<TreeviewSelect>>", self._update_scan_detail)
+
+        detail_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
+        detail_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        detail_frame.columnconfigure(0, weight=1)
+        self.detail_text = tk.Text(
+            detail_frame,
+            height=3,
+            wrap="word",
+            font=self.app.small_font,
+            bg="#F8FAFC",
+            fg=self.app.text_fg,
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+        )
+        self.detail_text.grid(row=0, column=0, sticky="ew")
+        self.detail_text.insert("1.0", "选择扫描结果中的一行，可在这里查看完整章节、表格前文和内容预览。")
+        self.detail_text.configure(state="disabled")
+
+        self.scan_label = ttk.Label(scan_frame, text="请先添加 Word 文件并扫描表格", style="Muted.TLabel")
+        self.scan_label.grid(row=3, column=0, sticky="w", pady=(5, 0))
+
+        output_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
+        output_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        output_frame.columnconfigure(0, weight=1)
+
+        output_header = ttk.Frame(output_frame, style="Toolbar.TFrame")
+        output_header.grid(row=0, column=0, sticky="ew")
+        output_header.columnconfigure(0, weight=1)
+        ttk.Label(output_header, text="输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
+
+        self.output_label = ttk.Label(
+            output_frame,
+            text="未选择则输出到原 Word 文件所在目录",
+            style="Muted.TLabel",
+            wraplength=700,
+            justify="left",
+        )
+        self.output_label.grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        action_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
+        action_frame.grid(row=4, column=0, sticky="ew")
+        action_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(action_frame, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(action_frame, mode="determinate", length=220)
+        self.progress.grid(row=0, column=1, sticky="ew", padx=(14, 12))
+        self.progress.grid_remove()
+
+        self.export_button = ttk.Button(
+            action_frame,
+            text="开始导出",
+            command=self.start_export,
+            width=14,
+            style="Accent.TButton",
+        )
+        self.export_button.grid(row=0, column=2, sticky="e")
+
+    def select_files(self):
+        file_paths = filedialog.askopenfilenames(
+            title="选择 Word 文件",
+            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")],
+            parent=self.window,
+        )
+        if file_paths:
+            self._append_files(file_paths)
+
+    def select_folder(self):
+        directory = filedialog.askdirectory(title="选择包含 Word 文件的文件夹", parent=self.window)
+        if not directory:
+            return
+
+        collected = []
+        for root_dir, _dirs, files in os.walk(directory):
+            for filename in files:
+                if filename.startswith("~$"):
+                    continue
+                file_path = os.path.join(root_dir, filename)
+                if self._is_docx(file_path):
+                    collected.append(file_path)
+
+        if not collected:
+            messagebox.showinfo("提示", "该文件夹中未找到 .docx 文件。", parent=self.window)
+            return
+
+        self._append_files(collected)
+
+    def _append_files(self, file_paths, show_status=True):
+        existing = {_file_identity(path) for path in self.file_paths}
+        added = 0
+        skipped = 0
+        added_paths = []
+
+        for file_path in file_paths:
+            if not self._is_docx(file_path):
+                skipped += 1
+                continue
+            identity = _file_identity(file_path)
+            if identity in existing:
+                skipped += 1
+                continue
+            self.file_paths.append(file_path)
+            existing.add(identity)
+            added_paths.append(file_path)
+            added += 1
+
+        self.app._remember_word_files(added_paths)
+        self._refresh_file_list()
+        if added:
+            self._clear_scan_results("文件列表已变化，请重新扫描表格")
+        if not show_status:
+            return
+        if added:
+            message = f"已添加 {added} 个 Word 文件"
+            if skipped:
+                message += f"；跳过 {skipped} 个重复或不支持的文件"
+            self.status_var.set(message)
+        elif skipped:
+            self.status_var.set(f"未添加新文件；跳过 {skipped} 个重复或不支持的文件")
+
+    def _is_docx(self, file_path):
+        return os.path.splitext(file_path)[1].lower() == ".docx"
+
+    def _refresh_file_list(self):
+        self.file_listbox.delete(0, "end")
+        for file_path in self.file_paths:
+            self.file_listbox.insert("end", file_path)
+        count = len(self.file_paths)
+        foreground = "green" if count else self.app.muted_fg
+        self.files_label.config(text=f"已选择 {count} 个 Word 文件", foreground=foreground)
+
+    def remove_selected_files(self):
+        selected = list(self.file_listbox.curselection())
+        if not selected:
+            return
+        for index in reversed(selected):
+            del self.file_paths[index]
+        self._refresh_file_list()
+        self._clear_scan_results("文件列表已变化，请重新扫描表格")
+        self.status_var.set(f"已移除 {len(selected)} 个文件")
+
+    def clear_files(self):
+        if not self.file_paths:
+            return
+        self.file_paths = []
+        self._refresh_file_list()
+        self._clear_scan_results("请先添加 Word 文件并扫描表格")
+        self.status_var.set("Word 文件列表已清空")
+
+    def scan_tables(self):
+        if not self.file_paths:
+            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
+            return
+
+        file_paths = list(self.file_paths)
+        self.scan_button.config(state="disabled")
+        self.export_button.config(state="disabled")
+        self.progress.grid()
+        self.progress.configure(maximum=len(file_paths), value=0)
+        self.status_var.set(f"正在扫描 {len(file_paths)} 个 Word 文件...")
+
+        def task():
+            try:
+                def progress_callback(current, total, filename):
+                    self._after(lambda: self._update_progress(current, total, filename))
+
+                from word_table_exporter import batch_scan_word_tables
+
+                items, skipped, error = batch_scan_word_tables(
+                    file_paths,
+                    progress_callback=progress_callback,
+                )
+                self._after(lambda: self._show_scan_result(items, skipped, error))
+            except Exception as exc:
+                log_path = write_error_log(type(exc), exc, exc.__traceback__, context="Word 表格扫描线程")
+                self._after(lambda: self._finish_with_error(str(exc), log_path))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _show_scan_result(self, items, skipped, error):
+        self.table_items = list(items)
+        self.table_item_by_iid = {}
+        self.selected_table_keys = set()
+        self.scan_tree.delete(*self.scan_tree.get_children())
+
+        for row_index, item in enumerate(self.table_items, start=1):
+            iid = str(row_index)
+            self.table_item_by_iid[iid] = item
+            self.scan_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=self._scan_tree_values(item, selected=False),
+            )
+        if self.table_items:
+            self.scan_tree.selection_set("1")
+            self.scan_tree.focus("1")
+            self._update_scan_detail()
+        else:
+            self._set_detail_text("没有扫描到可导出的正文表格。")
+
+        self._reset_busy_state()
+        self.scan_button.config(state="normal")
+        selected_count = len(self.selected_table_keys)
+        skipped_count = len(skipped)
+        message = f"已扫描到 {len(items)} 张表格，已选择 {selected_count} 张"
+        if skipped_count:
+            message += f"；跳过 {skipped_count} 个文件"
+        if error:
+            message += "；部分文件失败"
+        self.scan_label.config(text=message, foreground="green" if items else self.app.muted_fg)
+        self.status_var.set("扫描完成" if not error else "扫描完成（部分失败）")
+
+        if skipped or error:
+            lines = ["扫描完成。", "", message]
+            if skipped:
+                lines.extend(["", "跳过文件："])
+                for filename, reason in skipped.items():
+                    lines.append(f"  {filename}: {reason}")
+            if error:
+                lines.extend(["", "失败文件：", error])
+            self._show_result_window("\n".join(lines), title="扫描结果")
+
+    def _clear_scan_results(self, label_text):
+        self.table_items = []
+        self.table_item_by_iid = {}
+        self.selected_table_keys = set()
+        if hasattr(self, "scan_tree"):
+            self.scan_tree.delete(*self.scan_tree.get_children())
+        if hasattr(self, "scan_label"):
+            self.scan_label.config(text=label_text, foreground=self.app.muted_fg)
+        if hasattr(self, "detail_text"):
+            self._set_detail_text("选择扫描结果中的一行，可在这里查看完整章节、表格前文和内容预览。")
+
+    def _scan_tree_values(self, item, selected):
+        return (
+            "☑" if selected else "☐",
+            item.filename,
+            f"表格{item.table_index}",
+            f"{item.row_count}x{item.column_count}",
+            item.hint,
+            item.section,
+        )
+
+    def _table_key(self, item):
+        return (_file_identity(item.file_path), item.table_index)
+
+    def _refresh_scan_row(self, iid):
+        item = self.table_item_by_iid.get(iid)
+        if item is None:
+            return
+        selected = self._table_key(item) in self.selected_table_keys
+        self.scan_tree.item(iid, values=self._scan_tree_values(item, selected))
+        self._refresh_scan_label()
+
+    def _refresh_scan_label(self):
+        total = len(self.table_items)
+        selected = len(self.selected_table_keys)
+        text = f"已扫描到 {total} 张表格，已选择 {selected} 张"
+        self.scan_label.config(text=text, foreground="green" if selected else self.app.muted_fg)
+
+    def _toggle_scan_row_from_event(self, event):
+        row_id = self.scan_tree.identify_row(event.y)
+        if row_id:
+            self._toggle_scan_iids([row_id])
+
+    def _toggle_scan_checkbox_from_click(self, event):
+        if self.scan_tree.identify_region(event.x, event.y) != "cell":
+            return None
+        if self.scan_tree.identify_column(event.x) != "#1":
+            return None
+        row_id = self.scan_tree.identify_row(event.y)
+        if not row_id:
+            return None
+        self.scan_tree.selection_set(row_id)
+        self.scan_tree.focus(row_id)
+        self._toggle_scan_iids([row_id])
+        self._update_scan_detail()
+        return "break"
+
+    def _toggle_scan_rows_from_keyboard(self, event=None):
+        self.toggle_selected_scan_rows()
+        return "break"
+
+    def toggle_selected_scan_rows(self):
+        selected_rows = self.scan_tree.selection()
+        if not selected_rows:
+            return
+        self._toggle_scan_iids(selected_rows)
+        self._update_scan_detail()
+
+    def _toggle_scan_iids(self, iids):
+        for iid in iids:
+            item = self.table_item_by_iid.get(iid)
+            if item is None:
+                continue
+            key = self._table_key(item)
+            if key in self.selected_table_keys:
+                self.selected_table_keys.remove(key)
+            else:
+                self.selected_table_keys.add(key)
+            self._refresh_scan_row(iid)
+
+    def select_recommended_tables(self):
+        self.selected_table_keys = {
+            self._table_key(item)
+            for item in self.table_items
+            if item.hint.startswith("建议关注")
+        }
+        self._refresh_all_scan_rows()
+        self._update_scan_detail()
+        self.status_var.set(f"已按提示选择 {len(self.selected_table_keys)} 张建议关注的表格")
+
+    def select_all_tables(self):
+        self.selected_table_keys = {self._table_key(item) for item in self.table_items}
+        self._refresh_all_scan_rows()
+        self._update_scan_detail()
+        self.status_var.set(f"已选择全部 {len(self.selected_table_keys)} 张表格")
+
+    def clear_table_selection(self):
+        self.selected_table_keys = set()
+        self._refresh_all_scan_rows()
+        self._update_scan_detail()
+        self.status_var.set("已取消所有表格选择")
+
+    def _refresh_all_scan_rows(self):
+        for iid in self.table_item_by_iid:
+            self._refresh_scan_row(iid)
+
+    def _update_scan_detail(self, event=None):
+        selection = self.scan_tree.selection()
+        iid = selection[0] if selection else self.scan_tree.focus()
+        item = self.table_item_by_iid.get(iid)
+        if item is None:
+            self._set_detail_text("选择扫描结果中的一行，可在这里查看完整章节、表格前文和内容预览。")
+            return
+
+        selected = "是" if self._table_key(item) in self.selected_table_keys else "否"
+        detail = (
+            f"导出：{selected}    文件：{item.filename}    表格：{item.table_index}    行列：{item.row_count}x{item.column_count}\n"
+            f"所在章节：{item.section}\n"
+            f"提示：{item.hint}\n"
+            f"表格前文：{item.context}\n"
+            f"内容预览：{item.preview}"
+        )
+        self._set_detail_text(detail)
+
+    def _set_detail_text(self, text):
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", text)
+        self.detail_text.configure(state="disabled")
+
+    def select_output_dir(self):
+        directory = filedialog.askdirectory(title="选择输出目录", parent=self.window)
+        if not directory:
+            return
+        self.output_dir = directory
+        self.output_label.config(text=directory, foreground="green")
+        self.status_var.set(f"已选择输出目录：{directory}")
+
+    def start_export(self):
+        if not self.file_paths:
+            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
+            return
+        if not self.table_items:
+            messagebox.showwarning("提示", "请先点击“扫描表格”，再选择需要导出的表格。", parent=self.window)
+            return
+        if not self.selected_table_keys:
+            messagebox.showwarning("提示", "请先在扫描结果中选择至少一张表格。", parent=self.window)
+            return
+
+        selected_tables = {}
+        for item in self.table_items:
+            key = self._table_key(item)
+            if key not in self.selected_table_keys:
+                continue
+            selected_tables.setdefault(key[0], []).append(item.table_index)
+
+        file_paths = [
+            file_path
+            for file_path in self.file_paths
+            if _file_identity(file_path) in selected_tables
+        ]
+        self.export_button.config(state="disabled")
+        self.scan_button.config(state="disabled")
+        self.progress.grid()
+        self.progress.configure(maximum=len(file_paths), value=0)
+        self.status_var.set(f"正在导出 {len(self.selected_table_keys)} 张已选表格...")
+
+        def task():
+            try:
+                def progress_callback(current, total, filename):
+                    self._after(lambda: self._update_progress(current, total, filename))
+
+                from word_table_exporter import batch_export_word_tables
+
+                results, skipped, error = batch_export_word_tables(
+                    file_paths,
+                    output_dir=self.output_dir,
+                    progress_callback=progress_callback,
+                    selected_tables=selected_tables,
+                )
+                self._after(lambda: self._show_export_result(results, skipped, error, file_paths))
+            except Exception as exc:
+                log_path = write_error_log(type(exc), exc, exc.__traceback__, context="Word 表格导出线程")
+                self._after(lambda: self._finish_with_error(str(exc), log_path))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _after(self, callback):
+        try:
+            if self.window.winfo_exists():
+                self.window.after(0, callback)
+        except Exception:
+            pass
+
+    def _update_progress(self, current, total, filename):
+        self.progress.configure(maximum=total, value=current)
+        self.status_var.set(f"正在导出 ({current}/{total})：{filename}")
+
+    def _reset_busy_state(self):
+        self.progress.configure(value=0)
+        self.progress.grid_remove()
+        self.export_button.config(state="normal")
+        if hasattr(self, "scan_button"):
+            self.scan_button.config(state="normal")
+
+    def _finish_with_error(self, message, log_path=None):
+        self._reset_busy_state()
+        self.status_var.set("导出失败")
+        detail = f"导出失败：{message}"
+        if log_path:
+            detail += f"\n\n错误日志：{log_path}"
+        messagebox.showerror("错误", detail, parent=self.window)
+
+    def _show_export_result(self, results, skipped, error, source_files):
+        self._reset_busy_state()
+        total_tables = sum(int(item["tables"]) for item in results.values())
+        lines = [
+            "导出完成。",
+            "",
+            f"成功导出 {len(results)} 个文件，共 {total_tables} 张表格。",
+            "",
+        ]
+
+        if results:
+            lines.append("成功文件：")
+            for filename, info in results.items():
+                lines.append(f"  {filename}: {info['tables']} 张表格 -> {info['output_path']}")
+
+        if skipped:
+            lines.extend(["", "跳过文件："])
+            for filename, reason in skipped.items():
+                lines.append(f"  {filename}: {reason}")
+
+        if error:
+            lines.extend(["", "失败文件：", error])
+            self.status_var.set("导出完成（部分失败）")
+        else:
+            self.status_var.set("导出完成")
+
+        self._last_output_dir_to_open = self._default_output_dir_to_open(results, source_files)
+        self._show_result_window("\n".join(lines))
+
+    def _default_output_dir_to_open(self, results=None, source_files=None):
+        if self.output_dir:
+            return self.output_dir
+        if results:
+            first = next(iter(results.values()), None)
+            if first and first.get("output_path"):
+                return os.path.dirname(first["output_path"])
+        if source_files:
+            return os.path.dirname(source_files[0])
+        return None
+
+    def _open_output_dir(self):
+        directory = self._last_output_dir_to_open or self._default_output_dir_to_open()
+        if not directory:
+            return
+        try:
+            os.startfile(directory)
+        except Exception as exc:
+            messagebox.showerror("错误", f"无法打开输出目录：{exc}", parent=self.window)
+
+    def _show_result_window(self, message, title="导出结果"):
+        window = tk.Toplevel(self.window)
+        window.title(title)
+        window.geometry("720x440")
+        window.minsize(560, 320)
+        window.configure(bg=self.app.app_bg)
+        window.transient(self.window)
+
+        body = ttk.Frame(window, padding=12, style="App.TFrame")
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        text = tk.Text(
+            body,
+            wrap="word",
+            font=self.app.body_font,
+            bg=self.app.surface_bg,
+            fg=self.app.text_fg,
             relief="solid",
             borderwidth=1,
             padx=8,
