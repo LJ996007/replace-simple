@@ -14,7 +14,13 @@ from pptx import Presentation
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import main as simple_main
-from main import ReplaceSimpleApp, normalize_rule_rows, remove_matching_file_paths
+from main import (
+    BackgroundTaskRunner,
+    ReplaceSimpleApp,
+    collect_supported_files,
+    normalize_rule_rows,
+    remove_matching_file_paths,
+)
 from string_replacer import (
     apply_rules_to_filename,
     batch_replace,
@@ -46,6 +52,54 @@ def create_hidden_root():
 
 
 class SimpleReplacementTests(unittest.TestCase):
+    def test_background_task_runner_returns_events_on_tk_thread(self):
+        root = create_hidden_root()
+        try:
+            runner = BackgroundTaskRunner(root)
+            progress = []
+            completed = []
+            errors = []
+
+            submitted = runner.submit(
+                lambda publish: (publish("读取中"), "完成")[1],
+                completed.append,
+                errors.append,
+                progress.append,
+            )
+
+            deadline = time.monotonic() + 1
+            while not completed and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.01)
+
+            self.assertTrue(submitted)
+            self.assertFalse(runner.active)
+            self.assertEqual(progress, ["读取中"])
+            self.assertEqual(completed, ["完成"])
+            self.assertEqual(errors, [])
+        finally:
+            root.destroy()
+
+    def test_collect_supported_files_skips_temporary_and_unsupported_files(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "normal.docx").touch()
+            (nested / "normal.xlsx").touch()
+            (nested / "~$temporary.docx").touch()
+            (nested / "notes.txt").touch()
+            progress = []
+
+            files = collect_supported_files(
+                str(root),
+                (".docx", ".xlsx"),
+                progress.append,
+            )
+
+        self.assertEqual({Path(path).name for path in files}, {"normal.docx", "normal.xlsx"})
+        self.assertTrue(progress)
+
     def test_load_replacement_rules_reads_two_columns_from_first_row(self):
         with TemporaryDirectory() as tmp_dir:
             rules_path = Path(tmp_dir) / "rules.xlsx"
@@ -165,6 +219,18 @@ class SimpleReplacementTests(unittest.TestCase):
             root.update_idletasks()
 
             self.assertEqual(app.table_export_button.cget("text"), "提取 Word 表格")
+            self.assertEqual(app.version_info_button.cget("text"), "版本")
+            self.assertEqual(root.title(), simple_main.format_version_title())
+
+            app.version_info_button.invoke()
+            root.update_idletasks()
+            version_windows = [
+                child
+                for child in root.winfo_children()
+                if isinstance(child, tk.Toplevel) and child.title() == "版本信息"
+            ]
+            self.assertEqual(len(version_windows), 1)
+            version_windows[0].destroy()
 
             app.open_word_table_exporter()
             root.update_idletasks()
@@ -222,6 +288,11 @@ class SimpleReplacementTests(unittest.TestCase):
 
                 simple_main.filedialog.askopenfilename = fail_dialog
                 app.import_rules_from_tender_file()
+
+                deadline = time.monotonic() + 2
+                while not app.get_rules_from_table() and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
 
                 self.assertIn(("{项目名称}", "一次选择项目"), app.get_rules_from_table())
             finally:
@@ -321,6 +392,21 @@ class SimpleReplacementTests(unittest.TestCase):
 
         self.assertEqual(Path(output_path).name, "sample_已替换.xlsx")
 
+    def test_get_output_path_avoids_existing_output_file(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "sample.xlsx"
+            source_path.touch()
+            existing_output = Path(tmp_dir) / "sample_已替换.xlsx"
+            existing_output.touch()
+
+            output_path = get_output_path(
+                str(source_path),
+                [("采购人", "建设单位")],
+                output_dir=None,
+            )
+
+        self.assertEqual(Path(output_path).name, "sample_已替换_1.xlsx")
+
     def test_filename_replacement_preserves_extension(self):
         filename = apply_rules_to_filename(
             "投标文件.docx",
@@ -396,6 +482,42 @@ class SimpleReplacementTests(unittest.TestCase):
         self.assertEqual(results, {"sample.xlsx": 1})
         self.assertEqual(source_value, "采购人名单")
         self.assertEqual(output_value, "建设单位名单")
+
+    def test_batch_replace_uses_distinct_outputs_for_same_filename(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first_dir = root / "first"
+            second_dir = root / "second"
+            output_dir = root / "output"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            output_dir.mkdir()
+            source_paths = [first_dir / "sample.xlsx", second_dir / "sample.xlsx"]
+
+            for source_path in source_paths:
+                workbook = Workbook()
+                workbook.active["A1"] = "采购人名单"
+                workbook.save(source_path)
+                workbook.close()
+
+            results, error = batch_replace(
+                [str(path) for path in source_paths],
+                [("采购人", "建设单位")],
+                output_dir=str(output_dir),
+            )
+
+            output_paths = [output_dir / "sample.xlsx", output_dir / "sample_1.xlsx"]
+            output_values = []
+            for output_path in output_paths:
+                workbook = load_workbook(output_path)
+                try:
+                    output_values.append(workbook.active["A1"].value)
+                finally:
+                    workbook.close()
+
+        self.assertIsNone(error)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(output_values, ["建设单位名单", "建设单位名单"])
 
     def test_docx_cross_run_replacement_preserves_unmatched_run_formatting(self):
         with TemporaryDirectory() as tmp_dir:

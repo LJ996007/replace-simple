@@ -14,6 +14,7 @@
 - 文件内容和文件名都会按规则同步替换
 - 当文件名替换后会覆盖源文件时，自动添加 `_已替换` 后缀保护源文件
 - 可独立提取 Word `.docx` 正文表格到 Excel：每个 Word 生成一个 `_表格.xlsx`，每张表格对应一个工作表，并尽量保留合并单元格
+- 可通过主界面右上角「版本」按钮查看当前版本号、发布日期和历次更新说明
 
 ## 运行
 
@@ -29,7 +30,7 @@ python build.py
 ```
 
 生成目录位于 `dist/replace-simple/`，可直接运行 `dist/replace-simple/replace-simple.exe`。
-脚本会同时生成便于分发的 `dist/replace-simple-portable.zip`。
+脚本会同时生成带版本号、便于分发的 `dist/replace-simple-v<版本号>-portable.zip`。
 
 ## Word 表格导出
 
@@ -59,3 +60,5 @@ python build.py
 
 - 测试：`python -m pytest tests`
 - 打包前建议清理旧的 `build/`、`dist/`，`build.py --clean` 已会重新生成 PyInstaller 分析结果。
+- 每次发布前在 `app_info.py` 中更新 `APP_VERSION`、`APP_RELEASE_DATE`，并把本次更新说明添加到 `APP_CHANGELOG` 首位。
+- `python build.py` 会校验当前版本是否有更新说明，并同步更新窗口标题、软件内版本信息、Windows EXE 文件属性和压缩包文件名。

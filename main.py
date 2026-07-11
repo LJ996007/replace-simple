@@ -6,6 +6,7 @@ replace-simple GUI 入口。
 import ctypes
 import json
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -15,6 +16,8 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from tksheet import Sheet
+
+from app_info import format_changelog, format_version_title
 
 # string_replacer 会拖入 openpyxl(~290ms)+ docx(~100ms)，合计约 400ms。
 # 改为按需延迟导入：仅在「导入 Excel」或「开始替换」时加载，让窗口瞬间弹出。
@@ -28,6 +31,8 @@ SETTINGS_NAME = "settings.json"
 
 COMPRESSED_SHEET_HEIGHT = 210      # 基准规则表像素高度（默认窗口下约露 6 行 + 表头，且底部按钮可见）
 MIN_SHEET_HEIGHT = 120             # 窗口较矮或系统缩放较大时，优先保住底部操作区
+TASK_POLL_INTERVAL_MS = 40
+FOLDER_SCAN_PROGRESS_INTERVAL = 100
 
 # 网格线配色（清晰可见版）：tksheet 的网格线宽度被硬编码为 1px，无法加粗，
 # 只能靠加深颜色让线条在白底上明显可辨。
@@ -172,11 +177,108 @@ def remove_matching_file_paths(file_paths, target_path):
     return remaining, removed
 
 
+def collect_supported_files(directory, extensions, progress_callback=None):
+    """递归收集支持的文件，跳过 Office 创建的临时文件。"""
+    collected = []
+    scanned_count = 0
+
+    for root_dir, _dirs, files in os.walk(directory):
+        for filename in files:
+            scanned_count += 1
+            if filename.startswith("~$"):
+                continue
+            file_path = os.path.join(root_dir, filename)
+            if os.path.splitext(filename)[1].lower() in extensions:
+                collected.append(file_path)
+            if progress_callback and scanned_count % FOLDER_SCAN_PROGRESS_INTERVAL == 0:
+                progress_callback(scanned_count)
+
+    if progress_callback:
+        progress_callback(scanned_count)
+    return collected
+
+
+class BackgroundTaskRunner:
+    """通过队列把后台任务结果安全地交回 Tk 主线程。"""
+
+    def __init__(self, widget):
+        self.widget = widget
+        self._events = queue.Queue()
+        self._active = False
+        self._on_progress = None
+        self._on_success = None
+        self._on_error = None
+
+    @property
+    def active(self):
+        return self._active
+
+    def submit(self, work, on_success, on_error, on_progress=None):
+        if self._active:
+            return False
+
+        self._active = True
+        self._on_progress = on_progress
+        self._on_success = on_success
+        self._on_error = on_error
+
+        def publish_progress(*args):
+            self._events.put(("progress", args))
+
+        def task():
+            try:
+                result = work(publish_progress)
+            except Exception as exc:
+                self._events.put(("error", (exc,)))
+            else:
+                self._events.put(("success", (result,)))
+
+        threading.Thread(target=task, daemon=True).start()
+        self._poll_events()
+        return True
+
+    def _poll_events(self):
+        latest_progress = None
+        completion = None
+
+        while True:
+            try:
+                event_name, args = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if event_name == "progress":
+                latest_progress = args
+            else:
+                completion = (event_name, args)
+
+        if latest_progress and self._on_progress:
+            self._on_progress(*latest_progress)
+
+        if completion:
+            event_name, args = completion
+            on_success = self._on_success
+            on_error = self._on_error
+            self._active = False
+            self._on_progress = None
+            self._on_success = None
+            self._on_error = None
+            if event_name == "success" and on_success:
+                on_success(*args)
+            elif event_name == "error" and on_error:
+                on_error(*args)
+            return
+
+        if self._active:
+            self.widget.after(TASK_POLL_INTERVAL_MS, self._poll_events)
+
+
 class ReplaceSimpleApp:
     def __init__(self, root, restore_session=True):
         self.root = root
         self.restore_session = restore_session
-        self.root.title("replace-simple")
+        self._task_runner = BackgroundTaskRunner(root)
+        self._busy_widgets = []
+        self.root.title(format_version_title())
         self.root.geometry("860x720")
         self.root.minsize(800, 660)
 
@@ -341,6 +443,38 @@ class ReplaceSimpleApp:
                 except tk.TclError:
                     continue
 
+    def _create_busy_button(self, parent, **kwargs):
+        button = ttk.Button(parent, **kwargs)
+        self._busy_widgets.append(button)
+        return button
+
+    def _set_busy_controls(self, busy):
+        state = "disabled" if busy else "normal"
+        for widget in self._busy_widgets:
+            try:
+                if widget.winfo_exists():
+                    widget.config(state=state)
+            except tk.TclError:
+                continue
+
+    def _begin_indeterminate_task(self, status):
+        self._set_busy_controls(True)
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.grid()
+        self.progress.start(12)
+        self.status_var.set(status)
+
+    def _begin_determinate_task(self, status, maximum):
+        self._set_busy_controls(True)
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=maximum, value=0)
+        self.progress.grid()
+        self.status_var.set(status)
+
+    def _handle_background_error(self, exc, context):
+        log_path = write_error_log(type(exc), exc, exc.__traceback__, context=context)
+        self._finish_with_error(str(exc), log_path)
+
     def _create_widgets(self):
         self.container = ttk.Frame(self.root, padding=(16, 12), style="App.TFrame")
         self.container.pack(fill="both", expand=True)
@@ -353,13 +487,20 @@ class ReplaceSimpleApp:
         header_top = ttk.Frame(header_frame, style="App.TFrame")
         header_top.pack(fill="x")
         ttk.Label(header_top, text="批量文本替换", style="Title.TLabel").pack(side="left", anchor="w")
-        self.table_export_button = ttk.Button(
+        self.table_export_button = self._create_busy_button(
             header_top,
             text="提取 Word 表格",
             command=self.open_word_table_exporter,
             width=14,
         )
-        self.table_export_button.pack(side="right")
+        self.version_info_button = ttk.Button(
+            header_top,
+            text="版本",
+            command=self.show_version_info,
+            width=6,
+        )
+        self.version_info_button.pack(side="right")
+        self.table_export_button.pack(side="right", padx=(0, 6))
 
         ttk.Label(
             header_frame,
@@ -375,10 +516,10 @@ class ReplaceSimpleApp:
 
         file_toolbar = ttk.Frame(file_frame, style="Toolbar.TFrame")
         file_toolbar.grid(row=0, column=1, sticky="e")
-        ttk.Button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
-        ttk.Button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
-        ttk.Button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
-        ttk.Button(file_toolbar, text="清空", command=self.clear_files, width=7).pack(side="left")
+        self._create_busy_button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
+        self._create_busy_button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(file_toolbar, text="清空", command=self.clear_files, width=7).pack(side="left")
 
         file_list_frame = ttk.Frame(file_frame, style="Toolbar.TFrame")
         file_list_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
@@ -419,12 +560,12 @@ class ReplaceSimpleApp:
 
         rules_toolbar = ttk.Frame(rules_header, style="Toolbar.TFrame")
         rules_toolbar.grid(row=0, column=1, sticky="e")
-        ttk.Button(rules_toolbar, text="新增一行", command=self.add_rule_row, width=9).pack(side="left", padx=(0, 6))
-        ttk.Button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=9).pack(side="left", padx=(0, 6))
-        ttk.Button(rules_toolbar, text="清空规则", command=self.clear_rules, width=9).pack(side="left", padx=(0, 6))
-        ttk.Button(rules_toolbar, text="导入 Excel", command=self.import_rules_from_excel, width=10).pack(side="left", padx=(0, 6))
-        ttk.Button(rules_toolbar, text="导入招标文件", command=self.import_rules_from_tender_file, width=13).pack(side="left", padx=(0, 6))
-        ttk.Button(rules_toolbar, text="导出 Excel", command=self.export_rules_to_excel, width=10).pack(side="left")
+        self._create_busy_button(rules_toolbar, text="新增一行", command=self.add_rule_row, width=9).pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=9).pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="清空规则", command=self.clear_rules, width=9).pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="导入 Excel", command=self.import_rules_from_excel, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="导入招标文件", command=self.import_rules_from_tender_file, width=13).pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="导出 Excel", command=self.export_rules_to_excel, width=10).pack(side="left")
 
         self.rules_hint = ttk.Label(
             rules_frame,
@@ -505,7 +646,7 @@ class ReplaceSimpleApp:
         output_header.grid(row=0, column=0, sticky="ew")
         output_header.columnconfigure(0, weight=1)
         ttk.Label(output_header, text="3  输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
+        self._create_busy_button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
 
         # 输出路径/说明单独占整行，避免被右侧按钮挤掉；超长路径自动换行
         self.output_label = ttk.Label(
@@ -525,7 +666,7 @@ class ReplaceSimpleApp:
         self.progress = ttk.Progressbar(action_row, mode="determinate", length=220)
         self.progress.grid(row=0, column=1, sticky="ew", padx=(14, 12))
         self.progress.grid_remove()   # 空闲时隐藏，避免显示成一根灰槽；开始替换时再显示
-        self.start_button = ttk.Button(
+        self.start_button = self._create_busy_button(
             action_row, text="开始替换", command=self.start_replace, width=14, style="Accent.TButton",
         )
         self.start_button.grid(row=0, column=2, sticky="e")
@@ -720,6 +861,14 @@ class ReplaceSimpleApp:
         save_settings(data)
 
     def on_close(self):
+        table_exporter_busy = (
+            self.table_export_window
+            and self.table_export_window.exists()
+            and self.table_export_window._task_runner.active
+        )
+        if self._task_runner.active or table_exporter_busy:
+            messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭程序。")
+            return
         try:
             try:
                 self._save_session()
@@ -889,60 +1038,78 @@ class ReplaceSimpleApp:
         if not file_path:
             return
 
-        try:
+        self._begin_indeterminate_task("正在读取 Excel 规则表...")
+
+        def work(_publish_progress):
             from string_replacer import load_replacement_rules
-            rules = load_replacement_rules(file_path)
-        except Exception as exc:
-            messagebox.showerror("错误", f"导入规则失败：{exc}")
-            return
 
-        if not rules:
-            messagebox.showwarning("提示", "规则表为空，请检查 Excel 文件。")
-            return
+            return load_replacement_rules(file_path)
 
-        data = [
-            ["" if old is None else str(old), "" if new is None else str(new)]
-            for old, new in rules
-        ]
-        self.rules_sheet.set_sheet_data(data)
-        self._ensure_blank_rule_rows()
-        self._refresh_rules_sheet_view()
-        removed_from_targets = self._remove_rules_file_from_replace_files(file_path)
-        status = f"已导入 {len(rules)} 条规则：{os.path.basename(file_path)}"
-        if removed_from_targets:
-            status += "；已从待处理文件中移除规则表"
-        self.status_var.set(status)
+        def on_success(rules):
+            self._reset_busy_state()
+            if not rules:
+                messagebox.showwarning("提示", "规则表为空，请检查 Excel 文件。")
+                return
+
+            data = [
+                ["" if old is None else str(old), "" if new is None else str(new)]
+                for old, new in rules
+            ]
+            self.rules_sheet.set_sheet_data(data)
+            self._ensure_blank_rule_rows()
+            self._refresh_rules_sheet_view()
+            removed_from_targets = self._remove_rules_file_from_replace_files(file_path)
+            status = f"已导入 {len(rules)} 条规则：{os.path.basename(file_path)}"
+            if removed_from_targets:
+                status += "；已从待处理文件中移除规则表"
+            self.status_var.set(status)
+
+        def on_error(exc):
+            self._reset_busy_state()
+            log_path = write_error_log(type(exc), exc, exc.__traceback__, context="导入 Excel 规则")
+            messagebox.showerror("错误", f"导入规则失败：{exc}\n\n错误日志：{log_path}")
+
+        self._task_runner.submit(work, on_success, on_error)
 
     def import_rules_from_tender_file(self):
         file_path = self._choose_tender_file_for_import()
         if not file_path:
             return
 
-        try:
+        self._begin_indeterminate_task("正在读取招标文件项目信息...")
+
+        def work(_publish_progress):
             from tender_info_extractor import extract_project_info_rules
-            rules = extract_project_info_rules(file_path)
-        except Exception as exc:
-            messagebox.showerror("错误", f"读取招标文件失败：{exc}")
-            return
 
-        if not rules:
-            messagebox.showwarning(
-                "提示",
-                "未识别到可导入的项目信息。\n\n"
-                "目前支持常见写法，例如：项目名称、项目编号、采购人、预算金额等字段。",
-            )
-            return
+            return extract_project_info_rules(file_path)
 
-        data = [[old, new] for old, new in rules]
-        self.rules_sheet.set_sheet_data(data)
-        self._ensure_blank_rule_rows()
-        self._refresh_rules_sheet_view()
-        self._remember_word_files([file_path])
-        removed_from_targets = self._remove_import_source_from_replace_files(file_path, "招标文件")
-        status = f"已从招标文件导入 {len(rules)} 条项目信息：{os.path.basename(file_path)}"
-        if removed_from_targets:
-            status += "；已从待处理文件中移除招标文件"
-        self.status_var.set(status)
+        def on_success(rules):
+            self._reset_busy_state()
+            if not rules:
+                messagebox.showwarning(
+                    "提示",
+                    "未识别到可导入的项目信息。\n\n"
+                    "目前支持常见写法，例如：项目名称、项目编号、采购人、预算金额等字段。",
+                )
+                return
+
+            data = [[old, new] for old, new in rules]
+            self.rules_sheet.set_sheet_data(data)
+            self._ensure_blank_rule_rows()
+            self._refresh_rules_sheet_view()
+            self._remember_word_files([file_path])
+            removed_from_targets = self._remove_import_source_from_replace_files(file_path, "招标文件")
+            status = f"已从招标文件导入 {len(rules)} 条项目信息：{os.path.basename(file_path)}"
+            if removed_from_targets:
+                status += "；已从待处理文件中移除招标文件"
+            self.status_var.set(status)
+
+        def on_error(exc):
+            self._reset_busy_state()
+            log_path = write_error_log(type(exc), exc, exc.__traceback__, context="读取招标文件")
+            messagebox.showerror("错误", f"读取招标文件失败：{exc}\n\n错误日志：{log_path}")
+
+        self._task_runner.submit(work, on_success, on_error)
 
     def export_rules_to_excel(self):
         rules = self.get_rules_from_table()
@@ -959,42 +1126,48 @@ class ReplaceSimpleApp:
         if not file_path:
             return
 
-        wb = None
-        try:
+        self._begin_indeterminate_task("正在导出 Excel 规则表...")
+
+        def work(_publish_progress):
             from openpyxl import Workbook
 
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "替换规则"
-            for row_index, (old_text, new_text) in enumerate(rules, start=1):
-                ws.cell(row=row_index, column=1, value=old_text)
-                ws.cell(row=row_index, column=2, value=new_text)
-            ws.column_dimensions["A"].width = 32
-            ws.column_dimensions["B"].width = 32
-            wb.save(file_path)
-        except PermissionError:
-            messagebox.showerror("错误", "导出失败：请先关闭正在打开的规则表文件后重试。")
-            return
-        except Exception as exc:
-            messagebox.showerror("错误", f"导出失败：{exc}")
-            return
-        finally:
+            workbook = Workbook()
             try:
-                if wb is not None:
-                    wb.close()
-            except Exception:
-                pass
+                worksheet = workbook.active
+                worksheet.title = "替换规则"
+                for row_index, (old_text, new_text) in enumerate(rules, start=1):
+                    worksheet.cell(row=row_index, column=1, value=old_text)
+                    worksheet.cell(row=row_index, column=2, value=new_text)
+                worksheet.column_dimensions["A"].width = 32
+                worksheet.column_dimensions["B"].width = 32
+                workbook.save(file_path)
+            finally:
+                workbook.close()
+            return len(rules)
 
-        self.status_var.set(f"已导出 {len(rules)} 条规则：{os.path.basename(file_path)}")
+        def on_success(rule_count):
+            self._reset_busy_state()
+            self.status_var.set(f"已导出 {rule_count} 条规则：{os.path.basename(file_path)}")
+
+        def on_error(exc):
+            self._reset_busy_state()
+            log_path = write_error_log(type(exc), exc, exc.__traceback__, context="导出 Excel 规则")
+            detail = "导出失败：请先关闭正在打开的规则表文件后重试。" if isinstance(exc, PermissionError) else f"导出失败：{exc}"
+            messagebox.showerror("错误", f"{detail}\n\n错误日志：{log_path}")
+
+        self._task_runner.submit(work, on_success, on_error)
 
     # ---------- 文件 / 输出目录 ----------
     def _is_supported_file(self, file_path):
-        return os.path.splitext(file_path)[1].lower() in SUPPORTED_EXTENSIONS
+        return (
+            not os.path.basename(file_path).startswith("~$")
+            and os.path.splitext(file_path)[1].lower() in SUPPORTED_EXTENSIONS
+        )
 
     def _refresh_file_list(self):
         self.file_listbox.delete(0, "end")
-        for file_path in self.replace_files:
-            self.file_listbox.insert("end", file_path)
+        if self.replace_files:
+            self.file_listbox.insert("end", *self.replace_files)
         self._update_files_label()
 
     def _append_replace_files(self, file_paths):
@@ -1047,18 +1220,25 @@ class ReplaceSimpleApp:
         if not directory:
             return
 
-        collected = []
-        for root_dir, _dirs, files in os.walk(directory):
-            for filename in files:
-                file_path = os.path.join(root_dir, filename)
-                if self._is_supported_file(file_path):
-                    collected.append(file_path)
+        self._begin_indeterminate_task("正在扫描文件夹中的 Office 文件...")
 
-        if not collected:
-            messagebox.showinfo("提示", "该文件夹中未找到支持的 Office 文件。")
-            return
+        def work(publish_progress):
+            return collect_supported_files(directory, SUPPORTED_EXTENSIONS, publish_progress)
 
-        self._append_replace_files(collected)
+        def on_progress(scanned_count):
+            self.status_var.set(f"正在扫描文件夹：已检查 {scanned_count} 个文件...")
+
+        def on_success(collected):
+            self._reset_busy_state()
+            if not collected:
+                messagebox.showinfo("提示", "该文件夹中未找到支持的 Office 文件。")
+                return
+            self._append_replace_files(collected)
+
+        def on_error(exc):
+            self._handle_background_error(exc, "扫描待处理文件夹")
+
+        self._task_runner.submit(work, on_success, on_error, on_progress)
 
     def remove_selected_files(self):
         selected = list(self.file_listbox.curselection())
@@ -1092,44 +1272,44 @@ class ReplaceSimpleApp:
             messagebox.showwarning("提示", "请先选择待处理文件。")
             return
 
-        rules = self.get_rules_from_table()
+        file_paths = list(self.replace_files)
+        rules = list(self.get_rules_from_table())
+        output_dir = self.output_dir
         if not rules:
             messagebox.showwarning("提示", "请先新增或导入至少一条替换规则。")
             return
 
-        self.start_button.config(state="disabled")
-        self.progress.grid()
-        self.progress.configure(maximum=len(self.replace_files), value=0)
-        self.status_var.set(f"正在使用 {len(rules)} 条规则替换...")
+        self._begin_determinate_task(f"正在使用 {len(rules)} 条规则替换...", len(file_paths))
 
-        def task():
-            try:
-                def progress_callback(current, total, filename):
-                    def update_progress():
-                        self.progress.configure(maximum=total, value=current)
-                        self.status_var.set(f"正在处理 ({current}/{total})：{filename}")
+        def work(publish_progress):
+            from string_replacer import batch_replace
 
-                    self.root.after(0, update_progress)
+            return batch_replace(
+                file_paths,
+                rules,
+                output_dir=output_dir,
+                progress_callback=publish_progress,
+            )
 
-                from string_replacer import batch_replace
-                results, error = batch_replace(
-                    self.replace_files,
-                    rules,
-                    output_dir=self.output_dir,
-                    progress_callback=progress_callback,
-                )
+        def on_progress(current, total, filename):
+            self.progress.configure(maximum=total, value=current)
+            self.status_var.set(f"正在处理 ({current}/{total})：{filename}")
 
-                self.root.after(0, lambda: self._show_result(results, error))
-            except Exception as exc:
-                log_path = write_error_log(type(exc), exc, exc.__traceback__, context="替换线程")
-                self.root.after(0, lambda: self._finish_with_error(str(exc), log_path))
+        def on_success(result):
+            results, error = result
+            self._show_result(results, error, file_paths=file_paths, output_dir=output_dir)
 
-        threading.Thread(target=task, daemon=True).start()
+        def on_error(exc):
+            self._handle_background_error(exc, "替换线程")
+
+        self._task_runner.submit(work, on_success, on_error, on_progress)
 
     def _reset_busy_state(self):
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
         self.progress.configure(value=0)
         self.progress.grid_remove()
-        self.start_button.config(state="normal")
+        self._set_busy_controls(False)
 
     def _finish_with_warning(self, message):
         self._reset_busy_state()
@@ -1144,7 +1324,7 @@ class ReplaceSimpleApp:
             detail += f"\n\n错误日志：{log_path}"
         messagebox.showerror("错误", detail)
 
-    def _show_result(self, results, error):
+    def _show_result(self, results, error, file_paths=None, output_dir=None):
         self._reset_busy_state()
         total_count = sum(results.values())
         lines = [
@@ -1165,14 +1345,15 @@ class ReplaceSimpleApp:
         else:
             self.status_var.set("替换完成")
 
-        self._last_output_dir_to_open = self._default_output_dir_to_open()
+        self._last_output_dir_to_open = output_dir or self._default_output_dir_to_open(file_paths=file_paths)
         self._show_result_window("\n".join(lines))
 
-    def _default_output_dir_to_open(self):
+    def _default_output_dir_to_open(self, file_paths=None):
         if self.output_dir:
             return self.output_dir
-        if self.replace_files:
-            return os.path.dirname(self.replace_files[0])
+        source_files = file_paths if file_paths is not None else self.replace_files
+        if source_files:
+            return os.path.dirname(source_files[0])
         return None
 
     def _open_output_dir(self):
@@ -1220,6 +1401,46 @@ class ReplaceSimpleApp:
         ttk.Button(buttons, text="打开输出目录", command=self._open_output_dir, width=14).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="关闭", command=window.destroy, width=10).pack(side="left")
 
+    def show_version_info(self):
+        window = tk.Toplevel(self.root)
+        window.title("版本信息")
+        window.geometry("560x360")
+        window.minsize(480, 280)
+        window.configure(bg=self.app_bg)
+        window.transient(self.root)
+
+        try:
+            window.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
+
+        body = ttk.Frame(window, padding=12, style="App.TFrame")
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        text = tk.Text(
+            body,
+            wrap="word",
+            font=self.body_font,
+            bg=self.surface_bg,
+            fg=self.text_fg,
+            relief="solid",
+            borderwidth=1,
+            padx=10,
+            pady=10,
+        )
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.insert("1.0", format_changelog())
+        text.configure(state="disabled")
+
+        buttons = ttk.Frame(body, style="App.TFrame")
+        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="关闭", command=window.destroy, width=10).pack()
+
     def open_word_table_exporter(self):
         initial_files = self._word_files_for_reuse()
         if self.table_export_window and self.table_export_window.exists():
@@ -1234,6 +1455,8 @@ class WordTableExportWindow:
     def __init__(self, app, initial_files=None):
         self.app = app
         self.window = tk.Toplevel(app.root)
+        self._task_runner = BackgroundTaskRunner(self.window)
+        self._busy_widgets = []
         self.window.title("提取 Word 表格到 Excel")
         self.window.geometry("1180x720")
         self.window.minsize(900, 640)
@@ -1272,8 +1495,39 @@ class WordTableExportWindow:
             pass
 
     def close(self):
+        if self._task_runner.active:
+            messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭窗口。", parent=self.window)
+            return
         self.app.table_export_window = None
         self.window.destroy()
+
+    def _create_busy_button(self, parent, **kwargs):
+        button = ttk.Button(parent, **kwargs)
+        self._busy_widgets.append(button)
+        return button
+
+    def _set_busy_controls(self, busy):
+        state = "disabled" if busy else "normal"
+        for widget in self._busy_widgets:
+            try:
+                if widget.winfo_exists():
+                    widget.config(state=state)
+            except tk.TclError:
+                continue
+
+    def _begin_indeterminate_task(self, status):
+        self._set_busy_controls(True)
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.grid()
+        self.progress.start(12)
+        self.status_var.set(status)
+
+    def _begin_determinate_task(self, status, maximum):
+        self._set_busy_controls(True)
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=maximum, value=0)
+        self.progress.grid()
+        self.status_var.set(status)
 
     def _create_widgets(self):
         body = ttk.Frame(self.window, padding=12, style="App.TFrame")
@@ -1301,10 +1555,10 @@ class WordTableExportWindow:
 
         file_toolbar = ttk.Frame(file_header, style="Toolbar.TFrame")
         file_toolbar.grid(row=0, column=1, sticky="e")
-        ttk.Button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
-        ttk.Button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
-        ttk.Button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
-        ttk.Button(file_toolbar, text="清空", command=self.clear_files, width=7).pack(side="left")
+        self._create_busy_button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
+        self._create_busy_button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(file_toolbar, text="清空", command=self.clear_files, width=7).pack(side="left")
 
         list_frame = ttk.Frame(file_frame, style="Toolbar.TFrame")
         list_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
@@ -1342,11 +1596,11 @@ class WordTableExportWindow:
 
         scan_toolbar = ttk.Frame(scan_header, style="Toolbar.TFrame")
         scan_toolbar.grid(row=0, column=1, sticky="e")
-        self.scan_button = ttk.Button(scan_toolbar, text="扫描表格", command=self.scan_tables, width=10)
+        self.scan_button = self._create_busy_button(scan_toolbar, text="扫描表格", command=self.scan_tables, width=10)
         self.scan_button.pack(side="left", padx=(0, 6))
-        ttk.Button(scan_toolbar, text="推荐选择", command=self.select_recommended_tables, width=10).pack(side="left", padx=(0, 6))
-        ttk.Button(scan_toolbar, text="全选", command=self.select_all_tables, width=7).pack(side="left", padx=(0, 6))
-        ttk.Button(scan_toolbar, text="全不选", command=self.clear_table_selection, width=8).pack(side="left")
+        self._create_busy_button(scan_toolbar, text="推荐选择", command=self.select_recommended_tables, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(scan_toolbar, text="全选", command=self.select_all_tables, width=7).pack(side="left", padx=(0, 6))
+        self._create_busy_button(scan_toolbar, text="全不选", command=self.clear_table_selection, width=8).pack(side="left")
 
         tree_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
         tree_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
@@ -1424,7 +1678,7 @@ class WordTableExportWindow:
         output_header.grid(row=0, column=0, sticky="ew")
         output_header.columnconfigure(0, weight=1)
         ttk.Label(output_header, text="输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
+        self._create_busy_button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
 
         self.output_label = ttk.Label(
             output_frame,
@@ -1444,7 +1698,7 @@ class WordTableExportWindow:
         self.progress.grid(row=0, column=1, sticky="ew", padx=(14, 12))
         self.progress.grid_remove()
 
-        self.export_button = ttk.Button(
+        self.export_button = self._create_busy_button(
             action_frame,
             text="开始导出",
             command=self.start_export,
@@ -1467,20 +1721,25 @@ class WordTableExportWindow:
         if not directory:
             return
 
-        collected = []
-        for root_dir, _dirs, files in os.walk(directory):
-            for filename in files:
-                if filename.startswith("~$"):
-                    continue
-                file_path = os.path.join(root_dir, filename)
-                if self._is_docx(file_path):
-                    collected.append(file_path)
+        self._begin_indeterminate_task("正在扫描文件夹中的 Word 文件...")
 
-        if not collected:
-            messagebox.showinfo("提示", "该文件夹中未找到 .docx 文件。", parent=self.window)
-            return
+        def work(publish_progress):
+            return collect_supported_files(directory, (".docx",), publish_progress)
 
-        self._append_files(collected)
+        def on_progress(scanned_count):
+            self.status_var.set(f"正在扫描文件夹：已检查 {scanned_count} 个文件...")
+
+        def on_success(collected):
+            self._reset_busy_state()
+            if not collected:
+                messagebox.showinfo("提示", "该文件夹中未找到 .docx 文件。", parent=self.window)
+                return
+            self._append_files(collected)
+
+        def on_error(exc):
+            self._finish_background_error(exc, "扫描 Word 文件夹")
+
+        self._task_runner.submit(work, on_success, on_error, on_progress)
 
     def _append_files(self, file_paths, show_status=True):
         existing = {_file_identity(path) for path in self.file_paths}
@@ -1516,12 +1775,15 @@ class WordTableExportWindow:
             self.status_var.set(f"未添加新文件；跳过 {skipped} 个重复或不支持的文件")
 
     def _is_docx(self, file_path):
-        return os.path.splitext(file_path)[1].lower() == ".docx"
+        return (
+            not os.path.basename(file_path).startswith("~$")
+            and os.path.splitext(file_path)[1].lower() == ".docx"
+        )
 
     def _refresh_file_list(self):
         self.file_listbox.delete(0, "end")
-        for file_path in self.file_paths:
-            self.file_listbox.insert("end", file_path)
+        if self.file_paths:
+            self.file_listbox.insert("end", *self.file_paths)
         count = len(self.file_paths)
         foreground = "green" if count else self.app.muted_fg
         self.files_label.config(text=f"已选择 {count} 个 Word 文件", foreground=foreground)
@@ -1550,29 +1812,26 @@ class WordTableExportWindow:
             return
 
         file_paths = list(self.file_paths)
-        self.scan_button.config(state="disabled")
-        self.export_button.config(state="disabled")
-        self.progress.grid()
-        self.progress.configure(maximum=len(file_paths), value=0)
-        self.status_var.set(f"正在扫描 {len(file_paths)} 个 Word 文件...")
+        self._begin_determinate_task(f"正在扫描 {len(file_paths)} 个 Word 文件...", len(file_paths))
 
-        def task():
-            try:
-                def progress_callback(current, total, filename):
-                    self._after(lambda: self._update_progress(current, total, filename))
+        def work(publish_progress):
+            from word_table_exporter import batch_scan_word_tables
 
-                from word_table_exporter import batch_scan_word_tables
+            return batch_scan_word_tables(file_paths, progress_callback=publish_progress)
 
-                items, skipped, error = batch_scan_word_tables(
-                    file_paths,
-                    progress_callback=progress_callback,
-                )
-                self._after(lambda: self._show_scan_result(items, skipped, error))
-            except Exception as exc:
-                log_path = write_error_log(type(exc), exc, exc.__traceback__, context="Word 表格扫描线程")
-                self._after(lambda: self._finish_with_error(str(exc), log_path))
+        def on_success(result):
+            items, skipped, error = result
+            self._show_scan_result(items, skipped, error)
 
-        threading.Thread(target=task, daemon=True).start()
+        def on_error(exc):
+            self._finish_background_error(exc, "Word 表格扫描线程")
+
+        self._task_runner.submit(
+            work,
+            on_success,
+            on_error,
+            lambda current, total, filename: self._update_progress(current, total, filename, "正在扫描"),
+        )
 
     def _show_scan_result(self, items, skipped, error):
         self.table_items = list(items)
@@ -1597,7 +1856,6 @@ class WordTableExportWindow:
             self._set_detail_text("没有扫描到可导出的正文表格。")
 
         self._reset_busy_state()
-        self.scan_button.config(state="normal")
         selected_count = len(self.selected_table_keys)
         skipped_count = len(skipped)
         message = f"已扫描到 {len(items)} 张表格，已选择 {selected_count} 张"
@@ -1642,13 +1900,14 @@ class WordTableExportWindow:
     def _table_key(self, item):
         return (_file_identity(item.file_path), item.table_index)
 
-    def _refresh_scan_row(self, iid):
+    def _refresh_scan_row(self, iid, refresh_label=True):
         item = self.table_item_by_iid.get(iid)
         if item is None:
             return
         selected = self._table_key(item) in self.selected_table_keys
         self.scan_tree.item(iid, values=self._scan_tree_values(item, selected))
-        self._refresh_scan_label()
+        if refresh_label:
+            self._refresh_scan_label()
 
     def _refresh_scan_label(self):
         total = len(self.table_items)
@@ -1722,7 +1981,8 @@ class WordTableExportWindow:
 
     def _refresh_all_scan_rows(self):
         for iid in self.table_item_by_iid:
-            self._refresh_scan_row(iid)
+            self._refresh_scan_row(iid, refresh_label=False)
+        self._refresh_scan_label()
 
     def _update_scan_detail(self, event=None):
         selection = self.scan_tree.selection()
@@ -1779,49 +2039,45 @@ class WordTableExportWindow:
             for file_path in self.file_paths
             if _file_identity(file_path) in selected_tables
         ]
-        self.export_button.config(state="disabled")
-        self.scan_button.config(state="disabled")
-        self.progress.grid()
-        self.progress.configure(maximum=len(file_paths), value=0)
-        self.status_var.set(f"正在导出 {len(self.selected_table_keys)} 张已选表格...")
+        output_dir = self.output_dir
+        self._begin_determinate_task(
+            f"正在导出 {len(self.selected_table_keys)} 张已选表格...",
+            len(file_paths),
+        )
 
-        def task():
-            try:
-                def progress_callback(current, total, filename):
-                    self._after(lambda: self._update_progress(current, total, filename))
+        def work(publish_progress):
+            from word_table_exporter import batch_export_word_tables
 
-                from word_table_exporter import batch_export_word_tables
+            return batch_export_word_tables(
+                file_paths,
+                output_dir=output_dir,
+                progress_callback=publish_progress,
+                selected_tables=selected_tables,
+            )
 
-                results, skipped, error = batch_export_word_tables(
-                    file_paths,
-                    output_dir=self.output_dir,
-                    progress_callback=progress_callback,
-                    selected_tables=selected_tables,
-                )
-                self._after(lambda: self._show_export_result(results, skipped, error, file_paths))
-            except Exception as exc:
-                log_path = write_error_log(type(exc), exc, exc.__traceback__, context="Word 表格导出线程")
-                self._after(lambda: self._finish_with_error(str(exc), log_path))
+        def on_success(result):
+            results, skipped, error = result
+            self._show_export_result(results, skipped, error, file_paths)
 
-        threading.Thread(target=task, daemon=True).start()
+        def on_error(exc):
+            self._finish_background_error(exc, "Word 表格导出线程")
 
-    def _after(self, callback):
-        try:
-            if self.window.winfo_exists():
-                self.window.after(0, callback)
-        except Exception:
-            pass
+        self._task_runner.submit(work, on_success, on_error, self._update_progress)
 
-    def _update_progress(self, current, total, filename):
+    def _update_progress(self, current, total, filename, action="正在导出"):
         self.progress.configure(maximum=total, value=current)
-        self.status_var.set(f"正在导出 ({current}/{total})：{filename}")
+        self.status_var.set(f"{action} ({current}/{total})：{filename}")
 
     def _reset_busy_state(self):
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
         self.progress.configure(value=0)
         self.progress.grid_remove()
-        self.export_button.config(state="normal")
-        if hasattr(self, "scan_button"):
-            self.scan_button.config(state="normal")
+        self._set_busy_controls(False)
+
+    def _finish_background_error(self, exc, context):
+        log_path = write_error_log(type(exc), exc, exc.__traceback__, context=context)
+        self._finish_with_error(str(exc), log_path)
 
     def _finish_with_error(self, message, log_path=None):
         self._reset_busy_state()

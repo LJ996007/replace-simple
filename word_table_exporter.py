@@ -17,9 +17,6 @@ from docx.oxml.text.paragraph import CT_P
 from docx.oxml.ns import qn
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
 
 TABLE_OUTPUT_SUFFIX = "_表格"
@@ -136,13 +133,13 @@ def batch_scan_word_tables(
             progress_callback(index + 1, len(file_paths), filename)
 
         if os.path.splitext(file_path)[1].lower() != ".docx":
-            skipped[filename] = "不支持的文件格式"
+            skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
             continue
 
         try:
             file_items = scan_word_tables(file_path)
             if not file_items:
-                skipped[filename] = "未找到表格"
+                skipped[_result_key(skipped, filename, file_path)] = "未找到表格"
                 continue
             items.extend(file_items)
         except Exception as exc:
@@ -161,6 +158,8 @@ def export_word_tables_to_excel(
     Returns the number of exported tables. If the document has no body tables,
     no workbook is written and 0 is returned.
     """
+    from openpyxl import Workbook
+
     document = Document(docx_path)
     tables = _body_tables(document)
     if table_indexes is not None:
@@ -209,7 +208,7 @@ def batch_export_word_tables(
             progress_callback(index + 1, len(file_paths), filename)
 
         if os.path.splitext(file_path)[1].lower() != ".docx":
-            skipped[filename] = "不支持的文件格式"
+            skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
             continue
 
         try:
@@ -217,16 +216,16 @@ def batch_export_word_tables(
             if selected_tables is not None:
                 table_indexes = selected_tables.get(_file_identity(file_path), [])
                 if not table_indexes:
-                    skipped[filename] = "未选择表格"
+                    skipped[_result_key(skipped, filename, file_path)] = "未选择表格"
                     continue
 
             output_path = get_table_export_output_path(file_path, output_dir)
             table_count = export_word_tables_to_excel(file_path, output_path, table_indexes=table_indexes)
             if table_count == 0:
-                skipped[filename] = "未找到表格"
+                skipped[_result_key(skipped, filename, file_path)] = "未找到表格"
                 continue
 
-            results[filename] = {
+            results[_result_key(results, filename, file_path)] = {
                 "tables": table_count,
                 "output_path": output_path,
             }
@@ -238,6 +237,19 @@ def batch_export_word_tables(
 
 def _file_identity(path: str) -> str:
     return os.path.normcase(os.path.abspath(os.path.realpath(os.fspath(path))))
+
+
+def _result_key(items: Dict[str, object], filename: str, file_path: str) -> str:
+    if filename not in items:
+        return filename
+
+    parent = os.path.dirname(file_path)
+    candidate = f"{filename} ({parent})"
+    index = 2
+    while candidate in items:
+        candidate = f"{filename} ({parent}, {index})"
+        index += 1
+    return candidate
 
 
 def _iter_body_blocks(document):
@@ -454,6 +466,8 @@ def _cell_text(tc, table) -> str:
 
 
 def _write_table_to_worksheet(worksheet, table: ExportedTable) -> None:
+    from openpyxl.styles import Alignment
+
     border = _thin_border()
     alignment = Alignment(wrap_text=True, vertical="top")
 
@@ -488,12 +502,16 @@ def _write_table_to_worksheet(worksheet, table: ExportedTable) -> None:
     _fit_columns(worksheet, table)
 
 
-def _thin_border() -> Border:
+def _thin_border():
+    from openpyxl.styles import Border, Side
+
     side = Side(style="thin", color="808080")
     return Border(left=side, right=side, top=side, bottom=side)
 
 
 def _fit_columns(worksheet, table: ExportedTable) -> None:
+    from openpyxl.utils import get_column_letter
+
     widths = {column: MIN_COLUMN_WIDTH for column in range(1, max(table.column_count, 1) + 1)}
 
     for exported_cell in table.cells:

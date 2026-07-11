@@ -8,9 +8,6 @@ import shutil
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
-from docx import Document
-from openpyxl import load_workbook
-
 warnings.filterwarnings("ignore", message="Data Validation extension is not supported")
 
 SAFE_OUTPUT_SUFFIX = "_已替换"
@@ -28,6 +25,8 @@ def load_replacement_rules(excel_path: str) -> List[Tuple[str, str]]:
     """从 Excel 第一张工作表读取两列替换规则。"""
     if os.path.splitext(excel_path)[1].lower() == ".xls":
         return _load_xls_replacement_rules(excel_path)
+
+    from openpyxl import load_workbook
 
     rules = []
     seen = set()
@@ -274,6 +273,8 @@ def _apply_rules_to_paragraph(paragraph, prepared_rules: List[Dict[str, str]]) -
 
 
 def replace_in_docx(file_path: str, rules: List[Tuple[str, str]], output_path: str) -> int:
+    from docx import Document
+
     doc = Document(file_path)
     prepared_rules = _prepare_rules(rules)
     total_count = 0
@@ -322,6 +323,8 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
 
 
 def replace_in_xlsx(file_path: str, rules: List[Tuple[str, str]], output_path: str) -> int:
+    from openpyxl import load_workbook
+
     if os.path.abspath(file_path) != os.path.abspath(output_path):
         shutil.copy2(file_path, output_path)
 
@@ -396,18 +399,29 @@ def _with_safe_output_suffix(filename: str) -> str:
     return f"{stem}{SAFE_OUTPUT_SUFFIX}{ext}"
 
 
+def _with_output_index(path: str, index: int) -> str:
+    directory, filename = os.path.split(path)
+    stem, ext = os.path.splitext(filename)
+    return os.path.join(directory, f"{stem}_{index}{ext}")
+
+
 def _same_file_path(first: str, second: str) -> bool:
     return os.path.normcase(os.path.abspath(os.path.realpath(first))) == os.path.normcase(
         os.path.abspath(os.path.realpath(second))
     )
 
 
+def _file_identity(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.realpath(os.fspath(path))))
+
+
 def get_output_path(
     file_path: str,
     rules: Optional[List[Tuple[str, str]]] = None,
     output_dir: Optional[str] = None,
+    reserved_output_paths: Optional[set] = None,
 ) -> str:
-    """生成输出路径：文件名按规则替换；若会覆盖源文件则自动加安全后缀。"""
+    """生成不覆盖源文件、已有文件或同批任务文件的输出路径。"""
     dir_path = output_dir or os.path.dirname(file_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -420,7 +434,28 @@ def get_output_path(
     if _same_file_path(file_path, output_path):
         output_path = os.path.join(dir_path, _with_safe_output_suffix(filename))
 
-    return output_path
+    reserved = reserved_output_paths if reserved_output_paths is not None else set()
+    candidate = output_path
+    index = 1
+    while _file_identity(candidate) in reserved or os.path.exists(candidate):
+        candidate = _with_output_index(output_path, index)
+        index += 1
+
+    reserved.add(_file_identity(candidate))
+    return candidate
+
+
+def _result_key(results: Dict[str, int], filename: str, file_path: str) -> str:
+    if filename not in results:
+        return filename
+
+    parent = os.path.dirname(file_path)
+    candidate = f"{filename} ({parent})"
+    index = 2
+    while candidate in results:
+        candidate = f"{filename} ({parent}, {index})"
+        index += 1
+    return candidate
 
 
 def _format_processing_error(exc: Exception) -> str:
@@ -438,6 +473,7 @@ def batch_replace(
     """批量处理 Office 文件，返回替换结果和错误信息。"""
     results = {}
     errors = []
+    reserved_output_paths = set()
 
     for index, file_path in enumerate(file_paths):
         filename = os.path.basename(file_path)
@@ -445,7 +481,12 @@ def batch_replace(
             progress_callback(index + 1, len(file_paths), filename)
 
         try:
-            output_path = get_output_path(file_path, rules, output_dir)
+            output_path = get_output_path(
+                file_path,
+                rules,
+                output_dir,
+                reserved_output_paths=reserved_output_paths,
+            )
             ext = os.path.splitext(file_path)[1].lower()
 
             if ext == ".docx":
@@ -458,7 +499,7 @@ def batch_replace(
                 errors.append(f"{filename}: 不支持的文件格式")
                 continue
 
-            results[filename] = count
+            results[_result_key(results, filename, file_path)] = count
         except Exception as exc:
             errors.append(f"{filename}: {_format_processing_error(exc)}")
 
