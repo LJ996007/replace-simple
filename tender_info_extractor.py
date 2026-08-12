@@ -9,21 +9,50 @@ from docx import Document
 
 
 FIELD_DEFINITIONS: Sequence[Tuple[str, str, Sequence[str]]] = (
-    ("项目名称", "{项目名称}", ("项目名称", "采购项目名称", "招标项目名称")),
-    ("项目编号", "{项目编号}", ("项目编号", "采购项目编号", "招标编号", "采购编号")),
-    ("采购人", "{采购人}", ("采购人", "采购人名称", "采购单位", "采购单位名称", "招标人", "招标人名称", "建设单位", "建设单位名称")),
-    ("采购代理机构", "{采购代理机构}", ("采购代理机构", "采购代理机构名称", "代理机构", "代理机构名称", "招标代理机构", "招标代理机构名称", "采购代理")),
-    ("预算金额", "{预算金额}", ("预算金额", "项目预算", "项目预算金额", "采购预算", "采购预算金额", "预算价")),
-    ("最高限价", "{最高限价}", ("最高限价", "最高投标限价", "最高限价金额")),
-    ("采购方式", "{采购方式}", ("采购方式", "招标方式")),
-    ("合同履行期限", "{合同履行期限}", ("合同履行期限", "履约期限", "服务期限", "交付期限", "工期")),
-    ("提交投标文件截止时间", "{提交投标文件截止时间}", ("提交投标文件截止时间", "投标截止时间", "递交投标文件截止时间")),
-    ("开标时间", "{开标时间}", ("开标时间", "开启时间")),
-    ("开标地点", "{开标地点}", ("开标地点", "开启地点")),
+    ("项目名称", "[项目名称]", ("项目名称", "采购项目名称", "招标项目名称")),
+    ("项目编号", "[项目编号]", ("项目编号", "采购项目编号", "招标编号", "采购编号")),
+    ("标的名称", "[标的名称]", ("标的名称", "采购标的名称")),
+    (
+        "采购人名称",
+        "[采购人名称]",
+        ("采购人名称", "采购人", "采购单位名称", "采购单位", "招标人名称", "招标人", "建设单位名称", "建设单位"),
+    ),
+    ("采购人联系人", "[采购人联系人]", ("采购人联系人", "采购联系人", "采购人项目联系人")),
+    ("采购人电话", "[采购人电话]", ("采购人电话", "采购人联系电话", "采购人联系方式")),
+    (
+        "开标时间",
+        "[开标时间]",
+        (
+            "提交投标文件截止时间、开标时间",
+            "提交投标文件截止时间和开标时间",
+            "提交投标文件截止时间及开标时间",
+            "投标截止时间、开标时间",
+            "投标截止时间和开标时间",
+            "提交投标文件截止时间",
+            "递交投标文件截止时间",
+            "投标截止时间",
+            "开标时间",
+            "开启时间",
+        ),
+    ),
+    ("开标日期", "[开标日期]", ("开标日期", "开启日期")),
+    ("招标公告日期", "[招标公告日期]", ("招标公告日期", "公告日期")),
+    ("开标地点", "[开标地点]", ("开标地点", "开启地点")),
+    ("报名人数", "[报名人数]", ()),
+    ("采购人地址", "[采购人地址]", ("采购人地址", "采购人联系地址", "采购单位地址")),
 )
 
-MAX_VALUE_LENGTH = 160
-CONTEXT_NAME_ALIASES = ("名称", "名 称", "单位名称", "机构名称")
+MAX_VALUE_LENGTH = 500
+PROCUREMENT_CONTEXT_FIELDS: Sequence[Tuple[str, Sequence[str]]] = (
+    ("采购人名称", ("名称", "名 称", "单位名称", "机构名称")),
+    ("采购人联系人", ("联系人", "联 系 人", "项目联系人")),
+    ("采购人电话", ("联系方式", "联系电话", "联系号码", "电话", "电 话")),
+    ("采购人地址", ("地址", "地 址", "联系地址")),
+)
+
+DATE_PATTERN = re.compile(
+    r"(?<!\d)(?:\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d))"
+)
 
 
 def _clean_text(value) -> str:
@@ -59,7 +88,7 @@ def _trim_value(value: str) -> str:
     text = _clean_text(value)
     text = re.sub(r"^[：:；;\s]+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:MAX_VALUE_LENGTH].strip()
+    return text[:MAX_VALUE_LENGTH].strip(" \t\r\n:：;；。")
 
 
 def _looks_like_key(text: str, aliases: Iterable[str]) -> bool:
@@ -74,6 +103,9 @@ def _looks_like_any_key(text: str) -> bool:
     for _field_name, _placeholder, aliases in FIELD_DEFINITIONS:
         if any(_key_matches_alias(normalized, alias) for alias in aliases):
             return True
+    for _field_name, aliases in PROCUREMENT_CONTEXT_FIELDS:
+        if any(_key_matches_alias(normalized, alias) for alias in aliases):
+            return True
     return False
 
 
@@ -84,7 +116,7 @@ def _value_from_labeled_text(text: str, aliases: Iterable[str]) -> Optional[str]
 
     prefix = r"^(?:[（(]?[一二三四五六七八九十\d]+[）)、.．]\s*)?"
     for alias in aliases:
-        alias_pattern = re.escape(alias)
+        alias_pattern = r"\s*".join(re.escape(character) for character in alias)
         key_pattern = rf"{alias_pattern}(?:[（(][^）)]{{1,12}}[）)])*"
         patterns = (
             rf"{prefix}{key_pattern}\s*[:：]\s*(.+)$",
@@ -125,17 +157,56 @@ def _field_name_from_context(text: str) -> Optional[str]:
         "采购代理信息",
     )
     if any(item in normalized for item in agency_contexts):
-        return "采购代理机构"
+        return "agency"
     if any(item in normalized for item in procurement_contexts):
-        return "采购人"
+        return "procurement"
     return None
 
 
-def _value_from_context_labeled_text(text: str) -> Optional[str]:
-    return _value_from_labeled_text(text, CONTEXT_NAME_ALIASES)
+def _extract_procurement_context_value(text: str, found: Dict[str, str]) -> bool:
+    extracted = False
+    for field_name, aliases in PROCUREMENT_CONTEXT_FIELDS:
+        value = _value_from_labeled_text(text, aliases)
+        if value:
+            _set_if_missing(found, field_name, value)
+            extracted = True
+    return extracted
+
+
+def _extract_tender_item_names_from_table(table, found: Dict[str, str]) -> None:
+    """Read every non-empty value below a 标的名称 table header."""
+    if "标的名称" in found:
+        return
+
+    aliases = next(aliases for name, _placeholder, aliases in FIELD_DEFINITIONS if name == "标的名称")
+    rows = list(table.rows)
+    for header_row_index, row in enumerate(rows):
+        cells = [_clean_text(cell.text) for cell in row.cells]
+        for column_index, cell_text in enumerate(cells):
+            if not _looks_like_key(cell_text, aliases):
+                continue
+
+            names: List[str] = []
+            normalized_names = set()
+            for data_row in rows[header_row_index + 1:]:
+                if column_index >= len(data_row.cells):
+                    continue
+                value = _trim_value(data_row.cells[column_index].text)
+                normalized = _normalize_key(value)
+                if not normalized or _looks_like_key(value, aliases):
+                    continue
+                if normalized in normalized_names:
+                    continue
+                normalized_names.add(normalized)
+                names.append(value)
+
+            if names:
+                _set_if_missing(found, "标的名称", "；".join(names))
+                return
 
 
 def _extract_from_table(table, found: Dict[str, str]) -> None:
+    _extract_tender_item_names_from_table(table, found)
     active_context: Optional[str] = None
     for row in table.rows:
         cells = [_clean_text(cell.text) for cell in row.cells]
@@ -146,22 +217,28 @@ def _extract_from_table(table, found: Dict[str, str]) -> None:
             context_field = _field_name_from_context(cell_text)
             if context_field:
                 active_context = context_field
+                if active_context == "procurement":
+                    _extract_procurement_context_value(cell_text, found)
+                    for field_name, _placeholder, aliases in FIELD_DEFINITIONS:
+                        _set_if_missing(found, field_name, _value_from_labeled_text(cell_text, aliases))
                 continue
 
-            if active_context:
-                value = _value_from_context_labeled_text(cell_text)
-                if value:
-                    _set_if_missing(found, active_context, value)
-                elif _looks_like_key(cell_text, CONTEXT_NAME_ALIASES):
+            if active_context == "procurement":
+                _extract_procurement_context_value(cell_text, found)
+                for field_name, aliases in PROCUREMENT_CONTEXT_FIELDS:
+                    if not _looks_like_key(cell_text, aliases):
+                        continue
                     for next_text in cells[index + 1:]:
                         if not next_text:
                             continue
                         if _looks_like_any_key(next_text):
                             break
-                        _set_if_missing(found, active_context, next_text)
+                        _set_if_missing(found, field_name, next_text)
                         break
 
             for field_name, _placeholder, aliases in FIELD_DEFINITIONS:
+                if field_name == "标的名称":
+                    continue
                 value = _value_from_labeled_text(cell_text, aliases)
                 if value:
                     _set_if_missing(found, field_name, value)
@@ -175,7 +252,7 @@ def _extract_from_table(table, found: Dict[str, str]) -> None:
                         continue
                     if _looks_like_any_key(next_text):
                         break
-                    if active_context and _value_from_context_labeled_text(next_text):
+                    if active_context == "procurement" and _extract_procurement_context_value(next_text, found):
                         break
                     else:
                         _set_if_missing(found, field_name, next_text)
@@ -188,24 +265,37 @@ def _extract_from_table(table, found: Dict[str, str]) -> None:
 
 def _extract_from_paragraphs(paragraphs, found: Dict[str, str]) -> None:
     active_context: Optional[str] = None
+    in_opening_section = False
     for paragraph in paragraphs:
         text = _clean_text(paragraph.text)
         if not text:
             continue
 
+        normalized = _normalize_key(text)
+        is_opening_heading = (
+            "开标时间" in normalized
+            and "地点" in normalized
+            and ("提交投标文件截止时间" in normalized or "投标截止时间" in normalized)
+        )
+        if is_opening_heading:
+            in_opening_section = True
+        elif in_opening_section and re.match(r"^[一二三四五六七八九十]+[、.．]", normalized):
+            in_opening_section = False
+
+        if in_opening_section:
+            _set_if_missing(found, "开标地点", _value_from_labeled_text(text, ("地点",)))
+
         context_field = _field_name_from_context(text)
         if context_field:
             active_context = context_field
-            value = _value_from_context_labeled_text(text)
-            if value:
-                _set_if_missing(found, active_context, value)
+            if active_context == "procurement":
+                _extract_procurement_context_value(text, found)
+                for field_name, _placeholder, aliases in FIELD_DEFINITIONS:
+                    _set_if_missing(found, field_name, _value_from_labeled_text(text, aliases))
             continue
 
-        if active_context:
-            value = _value_from_context_labeled_text(text)
-            if value:
-                _set_if_missing(found, active_context, value)
-                active_context = None
+        if active_context == "procurement":
+            _extract_procurement_context_value(text, found)
 
         for field_name, _placeholder, aliases in FIELD_DEFINITIONS:
             _set_if_missing(found, field_name, _value_from_labeled_text(text, aliases))
@@ -215,6 +305,83 @@ def _extract_from_document_part(part, found: Dict[str, str]) -> None:
     _extract_from_paragraphs(part.paragraphs, found)
     for table in part.tables:
         _extract_from_table(table, found)
+
+
+def _date_from_text(text: str) -> Optional[str]:
+    compact = (text or "").translate(str.maketrans("０１２３４５６７８９－／．", "0123456789-/."))
+    compact = re.sub(r"\s+", "", compact)
+    match = DATE_PATTERN.search(compact)
+    if not match:
+        return None
+    value = match.group(0)
+    if "年" in value:
+        year, month, day = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})日", value).groups()
+        return f"{int(year)}年{int(month)}月{int(day)}日"
+    year, month, day = re.split(r"[-/.]", value)
+    return f"{int(year)}年{int(month)}月{int(day)}日"
+
+
+def _clean_opening_time(value: str) -> str:
+    value = re.sub(
+        r"\s*[（(]\s*北\s*京\s*时\s*间\s*[）)]\s*",
+        "",
+        value or "",
+    )
+    return _trim_value(value)
+
+
+def _split_procurement_contact_and_phone(found: Dict[str, str]) -> None:
+    """Split values such as “刘老师，010-82314928” into two fields."""
+    phone_value = found.get("采购人电话", "")
+    phone_parts = re.split(r"[,，]", phone_value, maxsplit=1)
+    if len(phone_parts) == 2 and all(part.strip() for part in phone_parts):
+        contact, phone = (_trim_value(part) for part in phone_parts)
+        if "采购人联系人" not in found:
+            found["采购人联系人"] = contact
+        found["采购人电话"] = phone
+        return
+
+    contact_value = found.get("采购人联系人", "")
+    contact_parts = re.split(r"[,，]", contact_value, maxsplit=1)
+    if len(contact_parts) == 2 and all(part.strip() for part in contact_parts):
+        contact, phone = (_trim_value(part) for part in contact_parts)
+        found["采购人联系人"] = contact
+        if "采购人电话" not in found:
+            found["采购人电话"] = phone
+
+
+def _extract_announcement_signature_date(document) -> Optional[str]:
+    """Return the final date before chapter two in the first tender chapter."""
+    in_first_chapter = False
+    latest_in_chapter: Optional[str] = None
+    result: Optional[str] = None
+
+    for paragraph in document.paragraphs:
+        text = _clean_text(paragraph.text)
+        normalized = _normalize_key(text)
+        if not normalized:
+            continue
+
+        is_first_chapter = bool(re.search(r"第[一1]章", normalized))
+        if is_first_chapter:
+            in_first_chapter = True
+            latest_in_chapter = None
+            continue
+
+        if in_first_chapter and re.search(r"第[二2]章", normalized):
+            if latest_in_chapter:
+                result = latest_in_chapter
+            in_first_chapter = False
+            continue
+
+        if in_first_chapter:
+            date = _date_from_text(text)
+            if date:
+                latest_in_chapter = date
+
+    if in_first_chapter and latest_in_chapter:
+        result = latest_in_chapter
+    return result
 
 
 def extract_project_info(docx_path: str) -> Dict[str, str]:
@@ -227,15 +394,29 @@ def extract_project_info(docx_path: str) -> Dict[str, str]:
         _extract_from_document_part(section.header, found)
         _extract_from_document_part(section.footer, found)
 
+    _split_procurement_contact_and_phone(found)
+
+    if "开标时间" in found:
+        opening_date = _date_from_text(found["开标时间"])
+        if opening_date:
+            found.setdefault("开标日期", opening_date)
+        found["开标时间"] = _clean_opening_time(found["开标时间"])
+
+    signature_date = _extract_announcement_signature_date(document)
+    if signature_date:
+        found["招标公告日期"] = signature_date
+
     return found
 
 
 def extract_project_info_rules(docx_path: str) -> List[Tuple[str, str]]:
-    """Return replacement rules using stable placeholders as the source text."""
+    """Return all requested placeholders in stable display order."""
     info = extract_project_info(docx_path)
-    rules: List[Tuple[str, str]] = []
-    for field_name, placeholder, _aliases in FIELD_DEFINITIONS:
-        value = info.get(field_name)
-        if value:
-            rules.append((placeholder, value))
-    return rules
+    if not info.get("开标日期"):
+        opening_date = _date_from_text(info.get("开标时间", ""))
+        if opening_date:
+            info["开标日期"] = opening_date
+    return [
+        (placeholder, info.get(field_name, ""))
+        for field_name, placeholder, _aliases in FIELD_DEFINITIONS
+    ]

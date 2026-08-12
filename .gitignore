@@ -3,9 +3,11 @@ __pycache__/
 *$py.class
 
 .pytest_cache/
+.workbuddy/
 
 build/
 dist/
+version_info.txt
 
 *.log
 *.tmp
