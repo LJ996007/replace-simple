@@ -1,13 +1,18 @@
+import datetime
 import sys
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import unittest
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from tkinter import ttk
 
 import xlwt
 from docx import Document
+from docx.oxml import parse_xml
+from docx.oxml.ns import qn
 from openpyxl import Workbook, load_workbook
 from pptx import Presentation
 
@@ -18,9 +23,11 @@ from main import (
     BackgroundTaskRunner,
     CappedScrollbarModel,
     DEFAULT_PRESETS,
+    OUTPUT_DIR_HINT,
     ReplaceSimpleApp,
     append_presets_to_rule_rows,
     collect_supported_files,
+    elide_middle,
     normalize_rule_rows,
     normalize_presets,
     presets_from_settings,
@@ -196,6 +203,102 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertGreaterEqual(len(data), 3)
             self.assertEqual(list(data[0]), ["", ""])
         finally:
+            root.destroy()
+
+    def test_elide_middle_keeps_head_and_tail_within_width(self):
+        root = create_hidden_root()
+        try:
+            font = tkfont.Font(root, family="Microsoft YaHei UI", size=10)
+            text = "C:/Users/LJ/WPSDrive/1154674488/WPS云盘/前期资料-公开招标"
+            fitted = elide_middle(text, font, 180)
+            self.assertIn("...", fitted)
+            self.assertTrue(fitted.startswith("C:/"))
+            self.assertTrue(fitted.endswith("招标"))
+            self.assertLessEqual(font.measure(fitted), 180)
+            self.assertEqual(elide_middle("abc", font, 1000), "abc")
+        finally:
+            root.destroy()
+
+    def test_long_output_dir_does_not_push_start_button_away(self):
+        root = create_hidden_root()
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            root.update_idletasks()
+            long_dir = (
+                "C:/Users/LJ/WPSDrive/1154674488/WPS云盘/"
+                "#北航2026/BUAAZB20260105-北京航空航天大学软件学院高性能服务器/"
+                "前期资料-公开招标"
+            )
+            app._apply_output_dir(long_dir)
+            app.status_var.set("已选择输出目录")
+            app._refresh_output_and_status_layout()
+            root.update_idletasks()
+
+            shown = app.output_label.cget("text")
+            self.assertEqual(app.output_dir, long_dir)
+            self.assertLessEqual(len(shown), len(long_dir))
+            self.assertNotIn(long_dir, app.status_var.get())
+            self.assertEqual(app.status_var.get(), "已选择输出目录")
+            self.assertLessEqual(app.output_label.winfo_reqheight(), 70)
+            self.assertGreater(app.start_button.winfo_reqwidth(), 50)
+            wraplength = int(float(app.output_label.cget("wraplength") or 0))
+            self.assertGreaterEqual(wraplength, 200)
+            self.assertLessEqual(
+                app.body_font.measure(shown),
+                wraplength * 2 + 8,
+            )
+            self.assertNotEqual(shown, OUTPUT_DIR_HINT)
+        finally:
+            root.destroy()
+
+    def test_long_status_and_progress_filename_do_not_cover_start_button(self):
+        root = create_hidden_root()
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            root.update_idletasks()
+            long_name = "BUAAZB20260105-北京航空航天大学软件学院高性能服务器公开招标文件" * 3 + ".docx"
+            app.status_var.set(f"正在处理 (1/8)：{long_name}")
+            app._refresh_output_and_status_layout()
+            root.update_idletasks()
+
+            shown = app.status_label.cget("text")
+            self.assertLess(len(shown), len(app.status_var.get()))
+            self.assertIn("...", shown)
+            self.assertGreater(app.start_button.winfo_reqwidth(), 50)
+            self.assertLessEqual(app.status_label.winfo_reqheight(), 40)
+        finally:
+            root.destroy()
+
+    def test_table_exporter_long_path_and_status_stay_on_one_line(self):
+        root = create_hidden_root()
+        app = None
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app.open_word_table_exporter()
+            root.update_idletasks()
+            exporter = app.table_export_window
+            long_dir = (
+                "C:/Users/LJ/WPSDrive/1154674488/WPS云盘/"
+                "#北航2026/BUAAZB20260105-北京航空航天大学软件学院高性能服务器/"
+                "前期资料-公开招标"
+            )
+            exporter.output_dir = long_dir
+            exporter._output_path.set_text(long_dir, foreground="green")
+            exporter.status_var.set(
+                "正在导出 (1/2)：BUAAZB20260105-北京航空航天大学软件学院高性能服务器招标文件.docx"
+            )
+            exporter._refresh_constrained_texts()
+            root.update_idletasks()
+
+            self.assertLess(len(exporter.output_label.cget("text")), len(long_dir))
+            self.assertIn("...", exporter.output_label.cget("text"))
+            self.assertLessEqual(exporter.output_label.winfo_reqheight(), 40)
+            self.assertLess(len(exporter.status_label.cget("text")), len(exporter.status_var.get()))
+            self.assertGreater(exporter.export_button.winfo_reqwidth(), 50)
+            exporter.close()
+        finally:
+            if app is not None and app.table_export_window is not None:
+                app.table_export_window.close()
             root.destroy()
 
     def test_app_uses_flat_sections_without_label_frames(self):
@@ -1149,6 +1252,390 @@ class SimpleReplacementTests(unittest.TestCase):
         output_path = get_table_export_output_path(r"C:\work\sample.docx")
 
         self.assertEqual(Path(output_path).name, "sample_表格.xlsx")
+
+    # ---------- 单遍替换：不再跨规则连锁 ----------
+
+    def test_replacement_does_not_cascade_across_rules(self):
+        from string_replacer import _prepare_rules, _replace_text_with_rules
+
+        replaced, count = _replace_text_with_rules(
+            "采购人名单",
+            _prepare_rules([("采购人", "建设单位"), ("单位", "公司")]),
+        )
+
+        self.assertEqual(replaced, "建设单位名单")
+        self.assertEqual(count, 1)
+
+    def test_simultaneous_rules_replace_original_text_only(self):
+        from string_replacer import _prepare_rules, _replace_text_with_rules
+
+        # 原文的 A 和 B 各自按规则替换，B 不会被 A 的结果再改写
+        replaced, count = _replace_text_with_rules(
+            "AB",
+            _prepare_rules([("A", "B"), ("B", "C")]),
+        )
+
+        self.assertEqual(replaced, "BC")
+        self.assertEqual(count, 2)
+
+    def test_docx_replacement_does_not_cascade_across_rules(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "source.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+
+            document = Document()
+            document.add_paragraph("采购人名单")
+            document.save(source_path)
+
+            count = replace_in_docx(
+                str(source_path),
+                [("采购人", "建设单位"), ("单位", "公司")],
+                str(output_path),
+            )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(Document(output_path).paragraphs[0].text, "建设单位名单")
+
+    def test_xlsx_replacement_does_not_cascade_across_rules(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "cascade.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = "采购人名单"
+            workbook.save(source_path)
+
+            results, error = batch_replace(
+                [str(source_path)],
+                [("采购人", "建设单位"), ("单位", "公司")],
+                output_dir=None,
+            )
+            output_wb = load_workbook(source_path)
+            try:
+                value = output_wb.active["A1"].value
+            finally:
+                output_wb.close()
+
+        self.assertIsNone(error)
+        self.assertEqual(results, {"cascade.xlsx": 1})
+        self.assertEqual(value, "建设单位名单")
+
+    # ---------- 规则表日期单元格 ----------
+
+    def test_load_replacement_rules_formats_date_cells_without_time_suffix(self):
+        with TemporaryDirectory() as tmp_dir:
+            rules_path = Path(tmp_dir) / "rules.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet["A1"] = "开标日期"
+            worksheet["B1"] = datetime.date(2026, 7, 20)
+            worksheet["A2"] = "评审时间"
+            worksheet["B2"] = datetime.datetime(2026, 7, 20, 9, 30)
+            workbook.save(rules_path)
+
+            rules = load_replacement_rules(str(rules_path))
+
+        self.assertEqual(rules, [
+            ("开标日期", "2026-07-20"),
+            ("评审时间", "2026-07-20 09:30:00"),
+        ])
+
+    # ---------- Excel 数值单元格 ----------
+
+    def test_batch_replace_replaces_numeric_excel_cells(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "numbers.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = 20260001
+            workbook.save(source_path)
+
+            results, error = batch_replace(
+                [str(source_path)],
+                [("20260001", "XYZ-2026")],
+                output_dir=None,
+            )
+            output_wb = load_workbook(source_path)
+            try:
+                value = output_wb.active["A1"].value
+            finally:
+                output_wb.close()
+
+        self.assertIsNone(error)
+        self.assertEqual(results, {"numbers.xlsx": 1})
+        self.assertEqual(value, "XYZ-2026")
+
+    def test_batch_replace_keeps_formula_cells_untouched(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "formula.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = "=SUM(B1:B2)"
+            workbook.save(source_path)
+
+            results, error = batch_replace(
+                [str(source_path)],
+                [("SUM", "ADD")],
+                output_dir=None,
+            )
+            output_wb = load_workbook(source_path)
+            try:
+                value = output_wb.active["A1"].value
+            finally:
+                output_wb.close()
+
+        self.assertIsNone(error)
+        self.assertEqual(results, {"formula.xlsx": 0})
+        self.assertEqual(value, "=SUM(B1:B2)")
+
+    # ---------- Word 覆盖范围：超链接 / 嵌套表格 / 文本框 / 内容控件 / 首页页眉 / 脚注 ----------
+
+    def test_docx_replaces_text_inside_hyperlink(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "hyperlink.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+
+            document = Document()
+            paragraph = document.add_paragraph()
+            hyperlink = paragraph._p.makeelement(qn("w:hyperlink"), {qn("r:id"): "rId1"})
+            run = hyperlink.makeelement(qn("w:r"), {})
+            run_text = run.makeelement(qn("w:t"), {})
+            run_text.text = "采购人"
+            run.append(run_text)
+            hyperlink.append(run)
+            paragraph._p.append(hyperlink)
+            document.save(source_path)
+
+            count = replace_in_docx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            output_xml = Document(output_path).paragraphs[0]._p.xml
+            self.assertEqual(count, 1)
+            self.assertIn("建设单位", output_xml)
+            self.assertNotIn("采购人", output_xml)
+
+    def test_docx_replaces_text_in_nested_table(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "nested.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+
+            document = Document()
+            outer = document.add_table(rows=1, cols=1)
+            inner = outer.cell(0, 0).add_table(rows=1, cols=1)
+            inner.cell(0, 0).text = "采购人"
+            document.save(source_path)
+
+            count = replace_in_docx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            inner_text = (
+                Document(output_path).tables[0].cell(0, 0).tables[0].cell(0, 0).text
+            )
+            self.assertEqual(count, 1)
+            self.assertEqual(inner_text, "建设单位")
+
+    def test_docx_replaces_text_in_textbox(self):
+        textbox_run = (
+            '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:v="urn:schemas-microsoft-com:vml">'
+            '<w:pict><v:shape style="width:100pt;height:20pt"><v:textbox>'
+            '<w:txbxContent><w:p><w:r><w:t>采购人专用章</w:t></w:r></w:p></w:txbxContent>'
+            "</v:textbox></v:shape></w:pict></w:r>"
+        )
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "textbox.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+
+            document = Document()
+            document.add_paragraph()._p.append(parse_xml(textbox_run))
+            document.save(source_path)
+
+            count = replace_in_docx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            output_xml = Document(output_path).element.xml
+            self.assertEqual(count, 1)
+            self.assertIn("建设单位专用章", output_xml)
+            self.assertNotIn("采购人专用章", output_xml)
+
+    def test_docx_replaces_text_inside_content_control(self):
+        content_control = (
+            '<w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:sdtContent><w:p><w:r><w:t>采购人在此</w:t></w:r></w:p></w:sdtContent></w:sdt>"
+        )
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "sdt.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+
+            document = Document()
+            document.element.body.insert(0, parse_xml(content_control))
+            document.save(source_path)
+
+            count = replace_in_docx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            output_xml = Document(output_path).element.xml
+            self.assertEqual(count, 1)
+            self.assertIn("建设单位在此", output_xml)
+            self.assertNotIn("采购人在此", output_xml)
+
+    def test_docx_replaces_first_page_header_text(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "first-page-header.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+
+            document = Document()
+            section = document.sections[0]
+            section.different_first_page_header_footer = True
+            section.first_page_header.paragraphs[0].text = "采购人专用页眉"
+            document.save(source_path)
+
+            count = replace_in_docx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            header_text = (
+                Document(output_path).sections[0].first_page_header.paragraphs[0].text
+            )
+            self.assertEqual(count, 1)
+            self.assertEqual(header_text, "建设单位专用页眉")
+
+    def _write_docx_with_footnote(self, path: Path, footnote_text: str) -> None:
+        document = Document()
+        document.add_paragraph("正文")
+        document.save(path)
+
+        with zipfile.ZipFile(path) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist()}
+        entries["word/footnotes.xml"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f'<w:footnote w:id="1"><w:p><w:r><w:t>{footnote_text}</w:t></w:r></w:p></w:footnote>'
+            "</w:footnotes>"
+        ).encode("utf-8")
+        relationships = entries["word/_rels/document.xml.rels"].decode("utf-8")
+        entries["word/_rels/document.xml.rels"] = relationships.replace(
+            "</Relationships>",
+            '<Relationship Id="rIdFnTest" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" '
+            'Target="footnotes.xml"/></Relationships>',
+        ).encode("utf-8")
+        content_types = entries["[Content_Types].xml"].decode("utf-8")
+        entries["[Content_Types].xml"] = content_types.replace(
+            "</Types>",
+            '<Override PartName="/word/footnotes.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>',
+        ).encode("utf-8")
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in entries.items():
+                archive.writestr(name, data)
+
+    def test_docx_replaces_footnote_text(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "footnote.docx"
+            output_path = Path(tmp_dir) / "output.docx"
+            self._write_docx_with_footnote(source_path, "脚注：采购人")
+
+            count = replace_in_docx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            with zipfile.ZipFile(output_path) as archive:
+                footnotes_xml = archive.read("word/footnotes.xml").decode("utf-8")
+            self.assertEqual(count, 1)
+            self.assertIn("脚注：建设单位", footnotes_xml)
+            Document(output_path)
+
+    # ---------- PPT 备注页 ----------
+
+    def test_pptx_replaces_notes_text(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "notes.pptx"
+            output_path = Path(tmp_dir) / "output.pptx"
+
+            presentation = Presentation()
+            slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+            slide.notes_slide.notes_text_frame.text = "采购人备注"
+            presentation.save(source_path)
+
+            count = replace_in_pptx(str(source_path), [("采购人", "建设单位")], str(output_path))
+
+            notes = Presentation(output_path).slides[0].notes_slide.notes_text_frame.text
+            self.assertEqual(count, 1)
+            self.assertEqual(notes, "建设单位备注")
+
+    # ---------- Word 表格导出：嵌套表格 ----------
+
+    def test_export_word_tables_includes_nested_table_content(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "nested-tables.docx"
+            output_path = Path(tmp_dir) / "nested-tables.xlsx"
+
+            document = Document()
+            outer = document.add_table(rows=1, cols=1)
+            outer.cell(0, 0).text = "外层"
+            inner = outer.cell(0, 0).add_table(rows=1, cols=2)
+            inner.cell(0, 0).text = "嵌套甲"
+            inner.cell(0, 1).text = "嵌套乙"
+            document.save(source_path)
+
+            export_word_tables_to_excel(str(source_path), str(output_path))
+            workbook = load_workbook(output_path)
+            try:
+                value = workbook["表格1"]["A1"].value
+            finally:
+                workbook.close()
+
+        self.assertIn("外层", value)
+        self.assertIn("嵌套甲", value)
+        self.assertIn("嵌套乙", value)
+
+    # ---------- 招标信息提取准确性 ----------
+
+    def test_extract_keeps_labeled_announcement_date_over_signature_date(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "notice.docx"
+
+            document = Document()
+            document.add_paragraph("第一章 投标邀请")
+            document.add_paragraph("招标公告日期：2026年7月2日")
+            document.add_paragraph("2026年7月1日")
+            document.add_paragraph("第二章 投标人须知")
+            document.save(source_path)
+
+            info = extract_project_info(str(source_path))
+
+        self.assertEqual(info.get("招标公告日期"), "2026年7月2日")
+
+    def test_extract_skips_junk_tender_item_rows(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "items.docx"
+
+            document = Document()
+            table = document.add_table(rows=4, cols=1)
+            table.cell(0, 0).text = "标的名称"
+            table.cell(1, 0).text = "中控室大屏"
+            table.cell(2, 0).text = "备注"
+            table.cell(3, 0).text = "合计"
+            document.save(source_path)
+
+            info = extract_project_info(str(source_path))
+
+        self.assertEqual(info.get("标的名称"), "中控室大屏")
+
+    def test_extract_drops_reference_only_opening_time_values(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "reference.docx"
+
+            document = Document()
+            document.add_paragraph("开标时间：详见第六章")
+            document.add_paragraph("开标地点：另行通知")
+            document.save(source_path)
+
+            info = extract_project_info(str(source_path))
+
+        self.assertNotIn("开标时间", info)
+        self.assertNotIn("开标地点", info)
+
+    def test_extract_keeps_opening_time_with_reference_note_but_real_date(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "with-date.docx"
+
+            document = Document()
+            document.add_paragraph("开标时间：2026年7月20日09:30（场地安排详见附件）")
+            document.save(source_path)
+
+            info = extract_project_info(str(source_path))
+
+        self.assertIn("2026年7月20日09:30", info.get("开标时间", ""))
 
 
 if __name__ == "__main__":

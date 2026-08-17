@@ -462,7 +462,37 @@ def _cell_text(tc, table) -> str:
             if text_node.text:
                 text_parts.append(text_node.text)
         text = "".join(text_parts)
+    nested_lines = _nested_table_lines(tc)
+    if nested_lines:
+        nested_text = "\n".join(nested_lines)
+        text = f"{text}\n{nested_text}" if text else nested_text
     return text.replace("\r\a", "").replace("\a", "").replace("\x07", "")
+
+
+def _nested_table_lines(tc) -> List[str]:
+    """把单元格内的嵌套表格按行展开为文本行，内容不再丢失。
+
+    只取当前单元格的直接子表格；更深层的嵌套由内层单元格递归处理，
+    每张表格只展开一次。
+    """
+    lines: List[str] = []
+    for tbl in tc.findall(qn("w:tbl")):
+        for tr in tbl.findall(qn("w:tr")):
+            row_parts = []
+            for nested_tc in tr.findall(qn("w:tc")):
+                try:
+                    part_text = _Cell(nested_tc, tbl).text
+                except Exception:
+                    part_text = "".join(
+                        node.text or "" for node in nested_tc.iter(qn("w:t"))
+                    )
+                inner_lines = _nested_table_lines(nested_tc)
+                if inner_lines:
+                    inner_text = "\n".join(inner_lines)
+                    part_text = f"{part_text}\n{inner_text}" if part_text else inner_text
+                row_parts.append(part_text.replace("\x07", ""))
+            lines.append("\t".join(row_parts))
+    return lines
 
 
 def _write_table_to_worksheet(worksheet, table: ExportedTable) -> None:

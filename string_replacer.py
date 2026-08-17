@@ -3,6 +3,7 @@
 支持 Word (.docx)、Excel (.xlsx/.xlsm)、PowerPoint (.pptx) 文件。
 """
 
+import datetime
 import os
 import shutil
 import warnings
@@ -36,6 +37,15 @@ _WINDOWS_RESERVED_FILENAME_STEMS = {
 def _clean_text(value) -> str:
     if value is None:
         return ""
+    if isinstance(value, datetime.datetime):
+        # Excel 日期单元格：无时间部分时只输出日期，避免 "2026-07-20 00:00:00"
+        if (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0):
+            return value.strftime("%Y-%m-%d")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, datetime.date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime.time):
+        return value.strftime("%H:%M:%S")
     if isinstance(value, float) and value.is_integer():
         return str(int(value)).strip()
     return str(value).strip()
@@ -83,11 +93,17 @@ def _load_xls_replacement_rules(excel_path: str) -> List[Tuple[str, str]]:
     wb = xlrd.open_workbook(excel_path)
     ws = wb.sheet_by_index(0)
 
+    def _cell_value(row_idx: int, col_idx: int):
+        if col_idx >= ws.ncols:
+            return ""
+        if ws.cell_type(row_idx, col_idx) == xlrd.XL_CELL_DATE:
+            # .xls 日期是序列数浮点，先还原成 datetime 再走 _clean_text
+            return xlrd.xldate_as_datetime(ws.cell_value(row_idx, col_idx), wb.datemode)
+        return ws.cell_value(row_idx, col_idx)
+
     for row_idx in range(ws.nrows):
-        old_value = ws.cell_value(row_idx, 0) if ws.ncols >= 1 else ""
-        new_value = ws.cell_value(row_idx, 1) if ws.ncols >= 2 else ""
-        old_text = _clean_text(old_value)
-        new_text = _clean_text(new_value)
+        old_text = _clean_text(_cell_value(row_idx, 0))
+        new_text = _clean_text(_cell_value(row_idx, 1))
         if not old_text:
             continue
 
@@ -115,27 +131,59 @@ def _prepare_rules(rules: List[Tuple[str, str]]) -> List[Dict[str, str]]:
     return sorted(prepared, key=lambda rule: (-len(rule["old"]), rule["order"]))
 
 
+def _find_rule_regions(text: str, prepared_rules: List[Dict[str, str]]) -> List[Tuple[int, int, str]]:
+    """在原文上单遍扫描，返回 [(start, end, new_text)] 匹配区间。
+
+    同一位置优先命中更长的原文（规则已按长度降序排列）。所有区间都基于
+    原文计算，替换结果不会再被任何规则（包括其它规则）二次扫描，
+    避免「A→B、B→C」式连锁替换把前一条的结果再改写一遍。
+    """
+    if not text:
+        return []
+
+    present_chars = set(text)
+    buckets: Dict[str, List[Dict[str, str]]] = {}
+    for rule in prepared_rules:
+        if rule["first_char"] in present_chars:
+            buckets.setdefault(rule["first_char"], []).append(rule)
+
+    regions: List[Tuple[int, int, str]] = []
+    scan = 0
+    length = len(text)
+    while scan < length:
+        bucket = buckets.get(text[scan])
+        if bucket is None:
+            scan += 1
+            continue
+        for rule in bucket:
+            if not text.startswith(rule["old"], scan):
+                continue
+            end = scan + len(rule["old"])
+            if not _is_occurrence_inside_replacement(text, scan, rule["old"], rule["new"]):
+                regions.append((scan, end, rule["new"]))
+            scan = end
+            break
+        else:
+            scan += 1
+    return regions
+
+
 def _replace_text_with_rules(text: str, prepared_rules: List[Dict[str, str]]) -> Tuple[str, int]:
     if not text:
         return text, 0
 
-    replaced = text
-    total_count = 0
-    present_chars = set(text)
+    regions = _find_rule_regions(text, prepared_rules)
+    if not regions:
+        return text, 0
 
-    for rule in prepared_rules:
-        if rule["first_char"] not in present_chars:
-            continue
-
-        old_text = rule["old"]
-        if old_text not in replaced:
-            continue
-
-        replaced, replaced_count = _replace_text_with_rule(replaced, old_text, rule["new"])
-        total_count += replaced_count
-        present_chars = set(replaced)
-
-    return replaced, total_count
+    parts = []
+    cursor = 0
+    for start, end, new_text in regions:
+        parts.append(text[cursor:start])
+        parts.append(new_text)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts), len(regions)
 
 
 def _build_run_spans(runs) -> List[Dict[str, object]]:
@@ -163,18 +211,6 @@ def _find_span_for_position(spans: List[Dict[str, object]], position: int) -> Op
     return None
 
 
-def _find_occurrences(text: str, needle: str) -> List[int]:
-    positions = []
-    start = 0
-
-    while True:
-        index = text.find(needle, start)
-        if index == -1:
-            return positions
-        positions.append(index)
-        start = index + len(needle)
-
-
 def _is_occurrence_inside_replacement(text: str, start: int, old_text: str, new_text: str) -> bool:
     """判断当前位置的 old_text 是否已经属于完整 new_text，避免重复追加。
 
@@ -196,35 +232,6 @@ def _is_occurrence_inside_replacement(text: str, start: int, old_text: str, new_
         offset = new_text.find(old_text, offset + 1)
 
     return False
-
-
-def _replace_text_with_rule(text: str, old_text: str, new_text: str) -> Tuple[str, int]:
-    if not text or not old_text or old_text not in text:
-        return text, 0
-
-    parts = []
-    count = 0
-    cursor = 0
-    search_start = 0
-
-    while True:
-        index = text.find(old_text, search_start)
-        if index == -1:
-            parts.append(text[cursor:])
-            break
-
-        end = index + len(old_text)
-        if _is_occurrence_inside_replacement(text, index, old_text, new_text):
-            parts.append(text[cursor:end])
-        else:
-            parts.append(text[cursor:index])
-            parts.append(new_text)
-            count += 1
-
-        cursor = end
-        search_start = end
-
-    return "".join(parts), count
 
 
 def _replace_range_in_runs(runs, spans: List[Dict[str, object]], start: int, end: int, new_text: str) -> None:
@@ -256,39 +263,143 @@ def _replace_range_in_runs(runs, spans: List[Dict[str, object]], start: int, end
     end_run.text = suffix
 
 
-def _apply_rules_to_paragraph(paragraph, prepared_rules: List[Dict[str, str]]) -> int:
-    runs = paragraph.runs
+def _apply_rules_to_runs(runs, prepared_rules: List[Dict[str, str]]) -> int:
+    """对一组具有 .text 属性的 run（docx run 元素或 pptx Run 对象）单遍替换。"""
     if not runs:
         return 0
 
+    full_text = "".join(run.text or "" for run in runs)
+    regions = _find_rule_regions(full_text, prepared_rules)
+    if not regions:
+        return 0
+
+    spans = _build_run_spans(runs)
+    for start, end, new_text in reversed(regions):
+        _replace_range_in_runs(runs, spans, start, end, new_text)
+    return len(regions)
+
+
+def _apply_rules_to_paragraph(paragraph, prepared_rules: List[Dict[str, str]]) -> int:
+    return _apply_rules_to_runs(paragraph.runs, prepared_rules)
+
+
+_MC_NAMESPACE = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_MC_ALTERNATE_CONTENT_TAG = "{%s}AlternateContent" % _MC_NAMESPACE
+_MC_FALLBACK_TAG = "{%s}Fallback" % _MC_NAMESPACE
+
+
+def _has_ancestor_tag(element, tag: str) -> bool:
+    parent = element.getparent()
+    while parent is not None:
+        if parent.tag == tag:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+def _docx_paragraph_runs(p_element) -> List[object]:
+    """按文档顺序收集段落中的 run 元素。
+
+    覆盖超链接、智能标记、修订（w:ins）和行内内容控件里的 run；
+    不进入 run 元素内部，文本框等嵌套结构由段落级遍历单独处理。
+    """
+    from docx.oxml.ns import qn
+
+    run_tag = qn("w:r")
+    container_tags = {
+        qn("w:hyperlink"),
+        qn("w:smartTag"),
+        qn("w:ins"),
+        qn("w:sdt"),
+        qn("w:sdtContent"),
+        qn("w:fldSimple"),
+    }
+    runs: List[object] = []
+
+    def walk(element) -> None:
+        for child in element:
+            if child.tag == run_tag:
+                runs.append(child)
+            elif child.tag in container_tags:
+                walk(child)
+
+    walk(p_element)
+    return runs
+
+
+def _iter_docx_paragraphs(element):
+    """产出 XML 子树内的全部段落，含表格单元格、内容控件和文本框。
+
+    AlternateContent 的 Fallback 分支与 Choice 分支内容相同，跳过
+    Fallback，避免同一段文字被处理两次。
+    """
+    from docx.oxml.ns import qn
+
+    has_alternate_content = element.find(f".//{_MC_ALTERNATE_CONTENT_TAG}") is not None
+    for p_element in element.iter(qn("w:p")):
+        if has_alternate_content and _has_ancestor_tag(p_element, _MC_FALLBACK_TAG):
+            continue
+        yield p_element
+
+
+def _apply_rules_to_docx_element(element, prepared_rules: List[Dict[str, str]]) -> int:
     total_count = 0
+    for p_element in _iter_docx_paragraphs(element):
+        total_count += _apply_rules_to_runs(_docx_paragraph_runs(p_element), prepared_rules)
+    return total_count
 
-    for rule in prepared_rules:
-        old_text = rule["old"]
-        full_text = "".join(run.text or "" for run in runs)
-        if not full_text or rule["first_char"] not in set(full_text) or old_text not in full_text:
+
+def _apply_rules_to_docx_headers_footers(document, prepared_rules: List[Dict[str, str]]) -> int:
+    """处理各节的默认、首页和偶数页页眉页脚。
+
+    is_linked_to_previous 为 True 时没有自己的定义（内容继承上一节，
+    上一节会单独处理），跳过以免重复替换或凭空创建空页眉。
+    """
+    total_count = 0
+    for section in document.sections:
+        for container in (
+            section.header,
+            section.footer,
+            section.first_page_header,
+            section.first_page_footer,
+            section.even_page_header,
+            section.even_page_footer,
+        ):
+            if container.is_linked_to_previous:
+                continue
+            total_count += _apply_rules_to_docx_element(container._element, prepared_rules)
+    return total_count
+
+
+_DOCX_AUX_PART_SUFFIXES = ("/footnotes.xml", "/endnotes.xml", "/comments.xml")
+
+
+def _apply_rules_to_docx_aux_parts(document, prepared_rules: List[Dict[str, str]]) -> int:
+    """处理脚注、尾注和批注：python-docx 没有对应 API，直接解析 part 内容。"""
+    from lxml import etree
+
+    from docx.oxml import parse_xml
+
+    total_count = 0
+    for part in document.part.package.iter_parts():
+        if not str(part.partname).endswith(_DOCX_AUX_PART_SUFFIXES):
             continue
 
-        occurrences = [
-            start
-            for start in _find_occurrences(full_text, old_text)
-            if not _is_occurrence_inside_replacement(full_text, start, old_text, rule["new"])
-        ]
-        if not occurrences:
+        element = getattr(part, "element", None)
+        if element is not None:
+            total_count += _apply_rules_to_docx_element(element, prepared_rules)
             continue
 
-        spans = _build_run_spans(runs)
-
-        for start in reversed(occurrences):
-            _replace_range_in_runs(
-                runs,
-                spans,
-                start,
-                start + len(old_text),
-                rule["new"],
+        blob = getattr(part, "blob", None)
+        if not blob:
+            continue
+        root = parse_xml(blob)
+        replaced = _apply_rules_to_docx_element(root, prepared_rules)
+        if replaced:
+            part._blob = etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8", standalone=True
             )
-            total_count += 1
-
+        total_count += replaced
     return total_count
 
 
@@ -297,29 +408,34 @@ def replace_in_docx(file_path: str, rules: List[Tuple[str, str]], output_path: s
 
     doc = Document(file_path)
     prepared_rules = _prepare_rules(rules)
-    total_count = 0
 
-    for paragraph in doc.paragraphs:
-        total_count += _apply_rules_to_paragraph(paragraph, prepared_rules)
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    total_count += _apply_rules_to_paragraph(paragraph, prepared_rules)
-
-    for section in doc.sections:
-        for container in (section.header, section.footer):
-            for paragraph in container.paragraphs:
-                total_count += _apply_rules_to_paragraph(paragraph, prepared_rules)
-            for table in container.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        for paragraph in cell.paragraphs:
-                            total_count += _apply_rules_to_paragraph(paragraph, prepared_rules)
+    # 直接遍历 body XML 子树：正文、表格（含嵌套）、内容控件、文本框一次覆盖
+    total_count = _apply_rules_to_docx_element(doc.element.body, prepared_rules)
+    total_count += _apply_rules_to_docx_headers_footers(doc, prepared_rules)
+    total_count += _apply_rules_to_docx_aux_parts(doc, prepared_rules)
 
     doc.save(output_path)
     return total_count
+
+
+def _workbook_cell_text(value) -> Optional[str]:
+    """把单元格值转成可参与文本替换的字符串；不适合替换的返回 None。
+
+    公式格跳过（改文本会破坏公式）；日期/时间格跳过（显示格式由
+    number_format 决定，直接替换底层值会改变显示内容）；数值格按
+    Excel 的常规显示转成文本，规则原文与其显示内容一致时也能替换。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        return None if value.startswith("=") else value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return str(int(value)) if value.is_integer() else str(value)
+    return None
 
 
 def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
@@ -329,12 +445,11 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
     for worksheet in workbook.worksheets:
         for row in worksheet.iter_rows():
             for cell in row:
-                if not isinstance(cell.value, str) or not cell.value:
-                    continue
-                if cell.value.startswith("="):
+                text = _workbook_cell_text(cell.value)
+                if not text:
                     continue
 
-                new_value, replaced_count = _replace_text_with_rules(cell.value, prepared_rules)
+                new_value, replaced_count = _replace_text_with_rules(text, prepared_rules)
                 if replaced_count:
                     cell.value = new_value
                     total_count += replaced_count
@@ -401,6 +516,10 @@ def replace_in_pptx(file_path: str, rules: List[Tuple[str, str]], output_path: s
             total_count += _visit_ppt_shape(
                 shape,
                 lambda text_frame: _replace_in_ppt_text_frame(text_frame, prepared_rules),
+            )
+        if slide.has_notes_slide:
+            total_count += _replace_in_ppt_text_frame(
+                slide.notes_slide.notes_text_frame, prepared_rules
             )
 
     presentation.save(output_path)

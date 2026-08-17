@@ -47,6 +47,8 @@ COMPRESSED_SHEET_HEIGHT = 210      # 基准规则表像素高度（默认窗口�
 MIN_SHEET_HEIGHT = 120             # 窗口较矮或系统缩放较大时，优先保住底部操作区
 TASK_POLL_INTERVAL_MS = 40
 FOLDER_SCAN_PROGRESS_INTERVAL = 100
+OUTPUT_DIR_HINT = "未选择则输出到原文件目录；文件名按规则同步替换，同名时直接覆盖原文件"
+OUTPUT_DIR_MAX_LINES = 2           # 长路径最多占两行，避免把「开始替换」顶出可视区
 
 # 网格线配色（护眼浅色版）：略降亮度与冷蓝感，长时间观看更柔和。
 # tksheet 网格线宽度硬编码 1px，靠颜色保持可辨。
@@ -66,6 +68,193 @@ def error_log_path():
 
 def settings_path():
     return os.path.join(_app_data_dir("APPDATA"), SETTINGS_NAME)
+
+
+def elide_middle(text, font, max_width, ellipsis="..."):
+    """把文本中间省略，使像素宽度不超过 max_width。路径会多留尾部目录名。"""
+    if not text or max_width <= 0:
+        return text
+    if font.measure(text) <= max_width:
+        return text
+
+    ellipsis_w = font.measure(ellipsis)
+    if ellipsis_w >= max_width:
+        for index in range(len(ellipsis), 0, -1):
+            piece = ellipsis[:index]
+            if font.measure(piece) <= max_width:
+                return piece
+        return ""
+
+    low, high = 0, len(text)
+    best = ellipsis
+    while low <= high:
+        keep = (low + high) // 2
+        if keep <= 0:
+            candidate = ellipsis
+        else:
+            head = max(1, keep * 2 // 5)
+            tail = keep - head
+            candidate = text[:head] + ellipsis + text[-tail:] if tail > 0 else text[:keep] + ellipsis
+        if font.measure(candidate) <= max_width:
+            best = candidate
+            low = keep + 1
+        else:
+            high = keep - 1
+    return best
+
+
+class HoverTooltip:
+    """鼠标悬停时显示完整文本，仅在控件展示内容被截断时出现。"""
+
+    def __init__(self, widget, text_getter, font, *, wraplength=480, fg="#2B2F36", shown_getter=None):
+        self.widget = widget
+        self.text_getter = text_getter
+        self.shown_getter = shown_getter
+        self.font = font
+        self.wraplength = wraplength
+        self.fg = fg
+        self._tip = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Destroy>", lambda _event: self._hide(), add="+")
+
+    def _shown_text(self):
+        if self.shown_getter is not None:
+            try:
+                return str(self.shown_getter() or "")
+            except Exception:
+                return ""
+        try:
+            return str(self.widget.cget("text") or "")
+        except Exception:
+            return ""
+
+    def _show(self, _event=None):
+        self._hide()
+        try:
+            full = self.text_getter()
+        except Exception:
+            return
+        if not full:
+            return
+        if self._shown_text() == full:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        tk.Label(
+            tip,
+            text=full,
+            justify="left",
+            background="#FFF8DC",
+            foreground=self.fg,
+            relief="solid",
+            borderwidth=1,
+            font=self.font,
+            wraplength=self.wraplength,
+            padx=8,
+            pady=5,
+        ).pack()
+        try:
+            x = self.widget.winfo_rootx()
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            tip.geometry(f"+{x}+{y}")
+        except Exception:
+            tip.destroy()
+            return
+        self._tip = tip
+
+    def _hide(self, _event=None):
+        tip = self._tip
+        self._tip = None
+        if tip is None:
+            return
+        try:
+            tip.destroy()
+        except Exception:
+            pass
+
+    def hide(self):
+        self._hide()
+
+
+class ElidedTextController:
+    """把 Label 上的长文本限制在可用宽度内，避免把同行按钮挤出窗口。"""
+
+    def __init__(
+        self,
+        label,
+        font,
+        width_getter,
+        *,
+        max_lines=1,
+        tooltip=False,
+        tooltip_font=None,
+        tooltip_fg=None,
+        fallback_width=360,
+    ):
+        self.label = label
+        self.font = font
+        self.width_getter = width_getter
+        self.max_lines = max(1, int(max_lines))
+        self.fallback_width = fallback_width
+        self.full_text = str(label.cget("text") or "")
+        self._tooltip = None
+        if tooltip:
+            self._tooltip = HoverTooltip(
+                label,
+                lambda: self.full_text,
+                tooltip_font or font,
+                fg=tooltip_fg or "#2B2F36",
+            )
+
+    def attach_var(self, var):
+        """让 StringVar 的每次写入都自动按宽度省略显示。"""
+        var.trace_add("write", lambda *_args: self.set_text(var.get()))
+        self.set_text(var.get())
+        return self
+
+    def set_text(self, text, **label_kwargs):
+        self.full_text = "" if text is None else str(text)
+        if label_kwargs:
+            try:
+                self.label.configure(**label_kwargs)
+            except tk.TclError:
+                return
+        self.refresh()
+
+    def refresh(self):
+        try:
+            if not self.label.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            width = int(self.width_getter() or 0)
+        except Exception:
+            width = 0
+        if width <= 1:
+            width = self.fallback_width
+        if self.max_lines > 1:
+            try:
+                current = int(float(self.label.cget("wraplength") or 0))
+            except (TypeError, ValueError, tk.TclError):
+                current = 0
+            if current != width:
+                self.label.configure(wraplength=width)
+        displayed = elide_middle(self.full_text, self.font, width * self.max_lines)
+        try:
+            if str(self.label.cget("text") or "") != displayed:
+                self.label.configure(text=displayed)
+        except tk.TclError:
+            pass
+
+    def hide_tooltip(self):
+        if self._tooltip is not None:
+            self._tooltip.hide()
 
 
 def center_window_on_parent(window, parent, width=None, height=None):
@@ -485,6 +674,7 @@ class ReplaceSimpleApp:
         self.recent_word_files = []
         self.output_dir = None
         self._last_output_dir_to_open = None
+        self._rules_resize_after = None
         self.table_export_window = None
         self.presets = presets_from_settings(load_settings()) if restore_session else list(DEFAULT_PRESETS)
         self.preset_popup = None
@@ -732,6 +922,7 @@ class ReplaceSimpleApp:
         self.progress.grid()
         self.progress.start(12)
         self.status_var.set(status)
+        self._refresh_output_and_status_layout()
 
     def _begin_determinate_task(self, status, maximum):
         self._set_busy_controls(True)
@@ -739,6 +930,7 @@ class ReplaceSimpleApp:
         self.progress.configure(mode="determinate", maximum=maximum, value=0)
         self.progress.grid()
         self.status_var.set(status)
+        self._refresh_output_and_status_layout()
 
     def _handle_background_error(self, exc, context):
         log_path = write_error_log(type(exc), exc, exc.__traceback__, context=context)
@@ -850,7 +1042,7 @@ class ReplaceSimpleApp:
             text="双击单元格可编辑；可从 Excel、招标 Word 或预设添加规则；执行时按原文长度长词优先。",
             style="Hint.TLabel",
         )
-        self.rules_hint.grid(row=1, column=0, sticky="w", pady=(4, 6))
+        self.rules_hint.grid(row=1, column=0, sticky="ew", pady=(4, 6))
 
         # 规则表 —— 用 tksheet 取代 ttk.Treeview：
         # ttk.Treeview 在 Windows 上画不出单元格网格线（Tk/Ttk 的硬限制），
@@ -964,21 +1156,35 @@ class ReplaceSimpleApp:
         ttk.Label(output_header, text="3  输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
         self._create_busy_button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
 
-        # 输出路径/说明单独占整行，避免被右侧按钮挤掉；超长路径自动换行
+        # 输出路径/说明单独占整行；按面板宽度换行，且最多两行（中间省略），
+        # 避免超长目录把下方「开始替换」顶出可视区。
         self.output_label = ttk.Label(
-            bottom_frame, text="未选择则输出到原文件目录；文件名按规则同步替换，同名时直接覆盖原文件",
-            style="Muted.TLabel", wraplength=820, justify="left",
+            bottom_frame, text=OUTPUT_DIR_HINT,
+            style="Muted.TLabel", wraplength=800, justify="left",
         )
-        self.output_label.grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.output_label.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self._output_path = ElidedTextController(
+            self.output_label,
+            self.body_font,
+            self._bottom_wraplength,
+            max_lines=OUTPUT_DIR_MAX_LINES,
+            tooltip=True,
+            tooltip_font=self.small_font,
+            tooltip_fg=self.text_fg,
+            fallback_width=800,
+        )
 
         ttk.Separator(bottom_frame, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=8)
 
-        # 状态行：状态文字 + 进度条（空闲隐藏）+ 主按钮
-        action_row = ttk.Frame(bottom_frame, style="Toolbar.TFrame")
+        # 状态行：状态文字单行省略，右侧主按钮列宽固定，不会被长文案挤走
+        self.action_row = ttk.Frame(bottom_frame, style="Toolbar.TFrame")
+        action_row = self.action_row
         action_row.grid(row=3, column=0, sticky="ew")
-        action_row.columnconfigure(1, weight=1)
+        action_row.columnconfigure(0, weight=1)
+        action_row.columnconfigure(2, minsize=118)
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(action_row, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        self.status_label = ttk.Label(action_row, text="就绪", style="Status.TLabel")
+        self.status_label.grid(row=0, column=0, sticky="ew")
         self.progress = ttk.Progressbar(action_row, mode="determinate", length=220)
         self.progress.grid(row=0, column=1, sticky="ew", padx=(14, 12))
         self.progress.grid_remove()   # 空闲时隐藏，避免显示成一根灰槽；开始替换时再显示
@@ -986,17 +1192,26 @@ class ReplaceSimpleApp:
             action_row, text="开始替换", command=self.start_replace, width=14, style="Accent.TButton",
         )
         self.start_button.grid(row=0, column=2, sticky="e")
+        self._status_elide = ElidedTextController(
+            self.status_label,
+            self.body_font,
+            self._status_wraplength,
+            max_lines=1,
+            fallback_width=360,
+        ).attach_var(self.status_var)
 
-        ttk.Label(
+        self.footer_hint = ttk.Label(
             bottom_frame,
             text="规则表第一列为原文、第二列为替换文；招标文件导入会生成 [项目名称] 等占位符规则。",
             style="Hint.TLabel",
-        ).grid(row=4, column=0, sticky="w", pady=(7, 0))
+        )
+        self.footer_hint.grid(row=4, column=0, sticky="ew", pady=(7, 0))
 
         # 监听窗口高度变化，动态调整规则表高度：规则表吃掉剩余高度，
         # 底部「输出目录 / 开始替换」区域始终完整保留在可视区。
         self._rules_resize_after = None
         self.root.bind("<Configure>", self._on_window_configure)
+        self.root.after_idle(self._refresh_output_and_status_layout)
 
         # tksheet 在 Windows / 高 DPI 下偶尔会在首帧拿到不完整的内部画布尺寸，
         # 导致表头和网格暂时不绘制，用户点击后才恢复。窗口完成布局后主动刷新几次，
@@ -1007,7 +1222,7 @@ class ReplaceSimpleApp:
 
     # ---------- 列宽自适应 ----------
     def _on_window_configure(self, event=None):
-        """窗口尺寸变化时节流刷新规则表高度。"""
+        """窗口尺寸变化时节流刷新路径换行和规则表高度。"""
         if event is not None and event.widget is not self.root:
             return  # 只处理 root 自身的 Configure，忽略子组件的
         if self._rules_resize_after is not None:
@@ -1015,7 +1230,12 @@ class ReplaceSimpleApp:
                 self.root.after_cancel(self._rules_resize_after)
             except Exception:
                 pass
-        self._rules_resize_after = self.root.after(16, self._resize_rules_sheet)
+        self._rules_resize_after = self.root.after(16, self._after_window_configure)
+
+    def _after_window_configure(self):
+        self._rules_resize_after = None
+        self._refresh_output_and_status_layout()
+        self._resize_rules_sheet()
 
     def _resize_rules_sheet(self):
         """根据当前窗口实际剩余高度动态设定规则表高度。
@@ -1024,7 +1244,6 @@ class ReplaceSimpleApp:
         恢复上次窗口尺寸或主题控件请求高度变化时，底部操作区可能被挤出窗口。
         这里改为先测量顶部、文件区、底部区和规则区固定控件，再把剩余高度给表格。
         """
-        self._rules_resize_after = None
         try:
             self.root.update_idletasks()
         except Exception:
@@ -1082,6 +1301,51 @@ class ReplaceSimpleApp:
         if len(parts) >= 4:
             return parts[1] + parts[3]
         return 0
+
+    def _bottom_wraplength(self):
+        try:
+            width = self.bottom_frame.winfo_width()
+        except Exception:
+            width = 0
+        if width <= 1:
+            return 800
+        return max(width - 28, 200)
+
+    def _status_wraplength(self):
+        try:
+            row_width = self.action_row.winfo_width()
+            button_width = self.start_button.winfo_reqwidth()
+        except Exception:
+            return 360
+        extra = 20
+        try:
+            if self.progress.winfo_ismapped():
+                extra += int(self.progress.winfo_reqwidth()) + 26
+        except Exception:
+            pass
+        return max(row_width - button_width - extra, 120)
+
+    def _refresh_output_and_status_layout(self):
+        """按当前面板宽度限制路径、状态和提示文案，避免挤走操作按钮。"""
+        if hasattr(self, "_output_path"):
+            self._output_path.refresh()
+        if hasattr(self, "_status_elide"):
+            self._status_elide.refresh()
+        wrap = self._bottom_wraplength()
+        try:
+            self.rules_hint.configure(wraplength=wrap)
+            self.footer_hint.configure(wraplength=wrap)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _apply_output_dir(self, directory):
+        self.output_dir = directory
+        if directory:
+            self._output_path.set_text(directory, foreground="green")
+        else:
+            self._output_path.set_text(OUTPUT_DIR_HINT, foreground=self.muted_fg)
+        self._refresh_output_and_status_layout()
+        self._resize_rules_sheet()
 
     def _current_sheet_height(self):
         try:
@@ -1163,8 +1427,7 @@ class ReplaceSimpleApp:
 
         output_dir = settings.get("output_dir")
         if isinstance(output_dir, str) and output_dir:
-            self.output_dir = output_dir
-            self.output_label.config(text=output_dir, foreground="green")
+            self._apply_output_dir(output_dir)
 
     def _save_session(self):
         if not self.restore_session:
@@ -1188,6 +1451,8 @@ class ReplaceSimpleApp:
             return
         try:
             try:
+                if hasattr(self, "_output_path"):
+                    self._output_path.hide_tooltip()
                 self._save_session()
             except Exception:
                 pass
@@ -1415,7 +1680,9 @@ class ReplaceSimpleApp:
                     cursor="hand2",
                 )
 
-                def draw_item(canvas=item, value=preset, selected=False):
+                def draw_item(canvas=item, value=preset, selected=None):
+                    if selected is None:
+                        selected = variable.get()
                     background = "#E3EDF8" if selected else self.surface_bg
                     foreground = self.accent_fg if selected else self.text_fg
                     canvas.configure(bg=background)
@@ -1434,9 +1701,10 @@ class ReplaceSimpleApp:
                             capstyle="round",
                             joinstyle="round",
                         )
+                    text_width = max(int(canvas.winfo_width()) - 40, 80)
                     canvas.create_text(
                         32, 16,
-                        text=value,
+                        text=elide_middle(value, self.body_font, text_width),
                         anchor="w",
                         font=self.body_font,
                         fill=foreground,
@@ -1451,6 +1719,7 @@ class ReplaceSimpleApp:
 
                 draw_item()
                 item.bind("<Button-1>", toggle_item)
+                item.bind("<Configure>", lambda _event, canvas=item, value=preset: draw_item(canvas, value))
                 self._bind_vertical_mousewheel(choices_canvas, item)
                 item.pack(fill="x", anchor="w")
                 self._preset_vars.append((preset, variable))
@@ -1540,7 +1809,8 @@ class ReplaceSimpleApp:
             body,
             text="选中一项后可修改内容；系统初始预设同样可以编辑或删除。",
             style="Hint.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 9))
+            wraplength=520,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 9))
 
         list_border = tk.Frame(body, bg=self.border_color, bd=0)
         list_border.grid(row=2, column=0, columnspan=2, sticky="nsew")
@@ -1849,9 +2119,9 @@ class ReplaceSimpleApp:
         if not directory:
             return
 
-        self.output_dir = directory
-        self.output_label.config(text=directory, foreground="green")
-        self.status_var.set(f"已选择输出目录：{directory}")
+        self._apply_output_dir(directory)
+        self.status_var.set("已选择输出目录")
+        self._refresh_output_and_status_layout()
 
     # ---------- 替换执行 ----------
     def start_replace(self):
@@ -1897,6 +2167,7 @@ class ReplaceSimpleApp:
         self.progress.configure(value=0)
         self.progress.grid_remove()
         self._set_busy_controls(False)
+        self._refresh_output_and_status_layout()
 
     def _finish_with_warning(self, message):
         self._reset_busy_state()
@@ -2136,6 +2407,8 @@ class WordTableExportWindow:
             except tk.TclError:
                 pass
             self._scan_separator_after = None
+        if hasattr(self, "_output_path"):
+            self._output_path.hide_tooltip()
         self.app.table_export_window = None
         self.window.destroy()
 
@@ -2159,6 +2432,7 @@ class WordTableExportWindow:
         self.progress.grid()
         self.progress.start(12)
         self.status_var.set(status)
+        self._refresh_constrained_texts()
 
     def _begin_determinate_task(self, status, maximum):
         self._set_busy_controls(True)
@@ -2166,6 +2440,7 @@ class WordTableExportWindow:
         self.progress.configure(mode="determinate", maximum=maximum, value=0)
         self.progress.grid()
         self.status_var.set(status)
+        self._refresh_constrained_texts()
 
     def _create_widgets(self):
         body = ttk.Frame(self.window, padding=12, style="App.TFrame")
@@ -2176,11 +2451,12 @@ class WordTableExportWindow:
         header = ttk.Frame(body, style="App.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(header, text="提取 Word 表格到 Excel", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
+        self.header_hint = ttk.Label(
             header,
             text="选择 .docx 文件；每个 Word 生成一个 Excel，每张表格对应一个工作表。",
             style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        )
+        self.header_hint.pack(anchor="w", pady=(2, 0))
 
         file_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
         file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -2338,31 +2614,45 @@ class WordTableExportWindow:
         self.detail_text.configure(state="disabled")
 
         self.scan_label = ttk.Label(scan_frame, text="请先添加 Word 文件并扫描表格", style="Muted.TLabel")
-        self.scan_label.grid(row=3, column=0, sticky="w", pady=(5, 0))
+        self.scan_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
 
-        output_frame = ttk.Frame(body, padding=(12, 6), style="Surface.TFrame")
+        self.output_frame = ttk.Frame(body, padding=(12, 6), style="Surface.TFrame")
+        output_frame = self.output_frame
         output_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         output_frame.columnconfigure(1, weight=1)
 
-        # 单行：标题 + 路径说明 + 选择按钮，压缩上下占用
+        # 单行：标题 + 路径说明 + 选择按钮；长路径中间省略，保持一行高度
         ttk.Label(output_frame, text="输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
         self.output_label = ttk.Label(
             output_frame,
             text="未选择则输出到原 Word 文件所在目录",
             style="Muted.TLabel",
-            wraplength=700,
             justify="left",
         )
         self.output_label.grid(row=0, column=1, sticky="ew", padx=(10, 10))
         self._create_busy_button(output_frame, text="选择目录", command=self.select_output_dir, width=12).grid(
             row=0, column=2, sticky="e"
         )
+        self._output_path = ElidedTextController(
+            self.output_label,
+            self.app.body_font,
+            self._output_path_width,
+            max_lines=1,
+            tooltip=True,
+            tooltip_font=self.app.small_font,
+            tooltip_fg=self.app.text_fg,
+            fallback_width=700,
+        )
+        output_frame.bind("<Configure>", self._on_output_frame_configure)
 
-        action_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
+        self.action_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
+        action_frame = self.action_frame
         action_frame.grid(row=4, column=0, sticky="ew")
-        action_frame.columnconfigure(1, weight=1)
+        action_frame.columnconfigure(0, weight=1)
+        action_frame.columnconfigure(2, minsize=118)
 
-        ttk.Label(action_frame, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        self.status_label = ttk.Label(action_frame, text="就绪", style="Status.TLabel")
+        self.status_label.grid(row=0, column=0, sticky="ew")
         self.progress = ttk.Progressbar(action_frame, mode="determinate", length=220)
         self.progress.grid(row=0, column=1, sticky="ew", padx=(14, 12))
         self.progress.grid_remove()
@@ -2375,6 +2665,15 @@ class WordTableExportWindow:
             style="Accent.TButton",
         )
         self.export_button.grid(row=0, column=2, sticky="e")
+        self._status_elide = ElidedTextController(
+            self.status_label,
+            self.app.body_font,
+            self._status_width,
+            max_lines=1,
+            fallback_width=400,
+        ).attach_var(self.status_var)
+        self.window.bind("<Configure>", self._on_window_configure)
+        self.window.after_idle(self._refresh_constrained_texts)
 
     def _scan_tree_xview(self, *args):
         self.scan_tree.xview(*args)
@@ -2780,13 +3079,59 @@ class WordTableExportWindow:
         self.detail_text.insert("1.0", text)
         self.detail_text.configure(state="disabled")
 
+    def _on_window_configure(self, event=None):
+        if event is not None and event.widget is not self.window:
+            return
+        self._refresh_constrained_texts()
+
+    def _on_output_frame_configure(self, event=None):
+        if event is not None and event.widget is not self.output_frame:
+            return
+        self._refresh_constrained_texts()
+
+    def _output_path_width(self):
+        try:
+            frame_w = self.output_frame.winfo_width()
+        except Exception:
+            return 0
+        if frame_w <= 1:
+            return 0
+        return max(frame_w - 80 - 110 - 40, 120)
+
+    def _status_width(self):
+        try:
+            row_width = self.action_frame.winfo_width()
+            button_width = self.export_button.winfo_reqwidth()
+        except Exception:
+            return 0
+        extra = 20
+        try:
+            if self.progress.winfo_ismapped():
+                extra += int(self.progress.winfo_reqwidth()) + 26
+        except Exception:
+            pass
+        return max(row_width - button_width - extra, 120)
+
+    def _refresh_constrained_texts(self):
+        if hasattr(self, "_output_path"):
+            self._output_path.refresh()
+        if hasattr(self, "_status_elide"):
+            self._status_elide.refresh()
+        try:
+            wrap = max(self.window.winfo_width() - 48, 200)
+            self.header_hint.configure(wraplength=wrap)
+            self.scan_label.configure(wraplength=wrap)
+        except (AttributeError, tk.TclError):
+            pass
+
     def select_output_dir(self):
         directory = filedialog.askdirectory(title="选择输出目录", parent=self.window)
         if not directory:
             return
         self.output_dir = directory
-        self.output_label.config(text=directory, foreground="green")
-        self.status_var.set(f"已选择输出目录：{directory}")
+        self._output_path.set_text(directory, foreground="green")
+        self.status_var.set("已选择输出目录")
+        self._refresh_constrained_texts()
 
     def start_export(self):
         if not self.file_paths:
@@ -2839,6 +3184,7 @@ class WordTableExportWindow:
     def _update_progress(self, current, total, filename, action="正在导出"):
         self.progress.configure(maximum=total, value=current)
         self.status_var.set(f"{action} ({current}/{total})：{filename}")
+        self._refresh_constrained_texts()
 
     def _reset_busy_state(self):
         self.progress.stop()
@@ -2846,6 +3192,7 @@ class WordTableExportWindow:
         self.progress.configure(value=0)
         self.progress.grid_remove()
         self._set_busy_controls(False)
+        self._refresh_constrained_texts()
 
     def _finish_background_error(self, exc, context):
         log_path = write_error_log(type(exc), exc, exc.__traceback__, context=context)

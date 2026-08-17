@@ -43,6 +43,13 @@ FIELD_DEFINITIONS: Sequence[Tuple[str, str, Sequence[str]]] = (
 )
 
 MAX_VALUE_LENGTH = 500
+
+# 标的名称表格列里不应视为标的的占位行
+_JUNK_TENDER_ITEM_VALUES = {"备注", "说明", "合计", "小计", "总计"}
+_JUNK_TENDER_ITEM_PREFIXES = ("注：", "注:", "备注", "以上")
+
+# 「详见第八章」「另行通知」这类引用性值不是真实开标信息
+_REFERENCE_VALUE_PATTERN = re.compile(r"详见|参见|见第|另行(?:通知|公告)")
 PROCUREMENT_CONTEXT_FIELDS: Sequence[Tuple[str, Sequence[str]]] = (
     ("采购人名称", ("名称", "名 称", "单位名称", "机构名称")),
     ("采购人联系人", ("联系人", "联 系 人", "项目联系人")),
@@ -194,6 +201,11 @@ def _extract_tender_item_names_from_table(table, found: Dict[str, str]) -> None:
                 value = _trim_value(data_row.cells[column_index].text)
                 normalized = _normalize_key(value)
                 if not normalized or _looks_like_key(value, aliases):
+                    continue
+                if (
+                    normalized in _JUNK_TENDER_ITEM_VALUES
+                    or normalized.startswith(_JUNK_TENDER_ITEM_PREFIXES)
+                ):
                     continue
                 if normalized in normalized_names:
                     continue
@@ -384,6 +396,20 @@ def _extract_announcement_signature_date(document) -> Optional[str]:
     return result
 
 
+def _is_reference_only_value(value: str) -> bool:
+    """判断是否为「详见第八章」式引用文本：不含数字且较短时视为无效值。"""
+    if not _REFERENCE_VALUE_PATTERN.search(value or ""):
+        return False
+    return not any(char.isdigit() for char in value) and len(value) <= 40
+
+
+def _drop_reference_only_opening_values(found: Dict[str, str]) -> None:
+    for field_name in ("开标时间", "开标日期", "开标地点"):
+        value = found.get(field_name)
+        if value and _is_reference_only_value(value):
+            del found[field_name]
+
+
 def extract_project_info(docx_path: str) -> Dict[str, str]:
     """Return common tender project fields extracted from a .docx file."""
     document = Document(docx_path)
@@ -395,6 +421,7 @@ def extract_project_info(docx_path: str) -> Dict[str, str]:
         _extract_from_document_part(section.footer, found)
 
     _split_procurement_contact_and_phone(found)
+    _drop_reference_only_opening_values(found)
 
     if "开标时间" in found:
         opening_date = _date_from_text(found["开标时间"])
@@ -402,9 +429,10 @@ def extract_project_info(docx_path: str) -> Dict[str, str]:
             found.setdefault("开标日期", opening_date)
         found["开标时间"] = _clean_opening_time(found["开标时间"])
 
+    # 落款日期只是兜底推断：按「公告日期」标签提取到的值优先
     signature_date = _extract_announcement_signature_date(document)
     if signature_date:
-        found["招标公告日期"] = signature_date
+        found.setdefault("招标公告日期", signature_date)
 
     return found
 
