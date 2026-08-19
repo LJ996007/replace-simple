@@ -39,6 +39,9 @@ DEFAULT_PRESETS = (
     "[采购人地址]",
 )
 SUPPORTED_EXTENSIONS = (".docx", ".xlsx", ".xlsm", ".pptx")
+# 指标参数提取的默认符号，与 symbol_clause_extractor.DEFAULT_SYMBOL_CHARS 保持一致。
+# 这里单独定义一份是为了避免启动时加载 docx 依赖（symbol_clause_extractor 会引入它）。
+DEFAULT_SYMBOL_CHARS = "★#△▲"
 APP_STATE_DIR_NAME = "replace-simple"
 ERROR_LOG_NAME = "error.log"
 SETTINGS_NAME = "settings.json"
@@ -257,6 +260,118 @@ class ElidedTextController:
             self._tooltip.hide()
 
 
+class CanvasCheckbox:
+    """手绘复选框：方框 + 蓝色对勾。
+
+    ttk 的 clam 主题不支持自定义选中标记（画出来是叉 ✕），与「预设」
+    下拉面板保持一致，全部用 Canvas 自绘对勾 ✓。variable 变化时自动
+    重绘，外部直接改 var 也能同步显示。
+    """
+
+    def __init__(
+        self,
+        parent,
+        text,
+        variable,
+        app,
+        command=None,
+        font=None,
+        background=None,
+        padx=10,
+        pady=7,
+        box_size=14,
+    ):
+        self.text = text
+        self.variable = variable
+        self.app = app
+        self.command = command
+        self.box_size = box_size
+        self.padx = padx
+        self.background = background or app.surface_bg
+        self.font = font or app.body_font
+
+        try:
+            text_width = self.font.measure(text)
+            line_space = self.font.metrics("linespace")
+        except tk.TclError:
+            text_width = 60
+            line_space = 18
+        self.height = max(box_size + 2 * pady, line_space + 2 * pady)
+
+        self.canvas = tk.Canvas(
+            parent,
+            width=padx + box_size + 8 + text_width + padx,
+            height=self.height,
+            bg=self.background,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self._hover = False
+        variable.trace_add("write", lambda *_args: self.redraw())
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Enter>", lambda _event: self._set_hover(True))
+        self.canvas.bind("<Leave>", lambda _event: self._set_hover(False))
+        self.redraw()
+
+    def _set_hover(self, hover):
+        if self._hover != hover:
+            self._hover = hover
+            self.redraw()
+
+    def _on_click(self, _event=None):
+        self.variable.set(not self.variable.get())
+        if self.command:
+            self.command()
+
+    def toggle(self):
+        self._on_click()
+
+    def redraw(self):
+        canvas = self.canvas
+        selected = bool(self.variable.get())
+        if selected:
+            background = "#E3EDF8"
+        elif self._hover:
+            background = "#EDF1F6"
+        else:
+            background = self.background
+        try:
+            canvas.configure(bg=background)
+        except tk.TclError:
+            return
+
+        box = self.box_size
+        x0 = self.padx
+        y0 = (self.height - box) // 2
+        canvas.delete("all")
+        canvas.create_rectangle(
+            x0, y0, x0 + box, y0 + box,
+            outline=self.app.accent_fg if selected else "#6F7B88",
+            width=1,
+            fill="#F7F8FA",
+        )
+        if selected:
+            # 对勾三个点按 13px 方框的比例缩放，加圆角端点
+            scale = box / 13.0
+            canvas.create_line(
+                x0 + 3 * scale, y0 + 6 * scale,
+                x0 + 6.5 * scale, y0 + 10 * scale,
+                x0 + 11 * scale, y0 + 3 * scale,
+                fill=self.app.accent_fg,
+                width=2,
+                capstyle="round",
+                joinstyle="round",
+            )
+        canvas.create_text(
+            x0 + box + 8, self.height // 2,
+            text=self.text,
+            anchor="w",
+            font=self.font,
+            fill=self.app.text_fg,
+        )
+
+
 def center_window_on_parent(window, parent, width=None, height=None):
     """把子窗口放到父窗口可视区域正中央，避免默认落在屏幕左上角。
 
@@ -398,6 +513,14 @@ def presets_from_settings(settings):
     if isinstance(settings, dict) and isinstance(settings.get("presets"), list):
         return normalize_presets(settings["presets"])
     return list(DEFAULT_PRESETS)
+
+
+def symbol_chars_from_settings(settings):
+    """读取自定义提取符号；保存时已清洗过，这里只做基本类型校验。"""
+    value = settings.get("symbol_chars") if isinstance(settings, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value
+    return DEFAULT_SYMBOL_CHARS
 
 
 def append_presets_to_rule_rows(rows, selected_presets):
@@ -677,6 +800,7 @@ class ReplaceSimpleApp:
         self._rules_resize_after = None
         self.table_export_window = None
         self.presets = presets_from_settings(load_settings()) if restore_session else list(DEFAULT_PRESETS)
+        self.symbol_chars = symbol_chars_from_settings(load_settings()) if restore_session else DEFAULT_SYMBOL_CHARS
         self.preset_popup = None
 
         self._setup_fonts()
@@ -950,9 +1074,9 @@ class ReplaceSimpleApp:
         ttk.Label(header_top, text="批量文本替换", style="Title.TLabel").pack(side="left", anchor="w")
         self.table_export_button = self._create_busy_button(
             header_top,
-            text="提取 Word 表格",
+            text="提取信息",
             command=self.open_word_table_exporter,
-            width=14,
+            width=10,
         )
         self.version_info_button = ttk.Button(
             header_top,
@@ -1437,6 +1561,7 @@ class ReplaceSimpleApp:
             "output_dir": self.output_dir,
             "rules": self.get_rules_from_table(),
             "presets": self.presets,
+            "symbol_chars": self.symbol_chars,
         }
         save_settings(data)
 
@@ -1542,7 +1667,7 @@ class ReplaceSimpleApp:
             messagebox.showinfo(
                 "选择招标文件",
                 "已检测到多个 Word 文件。\n\n"
-                "请在主文件列表或「提取 Word 表格」窗口中选中一个招标文件，"
+                "请在主文件列表或「提取信息」窗口中选中一个招标文件，"
                 "或者在接下来的窗口中重新选择。",
             )
 
@@ -2328,23 +2453,26 @@ class ReplaceSimpleApp:
 
 
 class WordTableExportWindow:
-    WINDOW_WIDTH = 1180
-    WINDOW_HEIGHT = 800
+    WINDOW_WIDTH = 1240
+    WINDOW_HEIGHT = 920
+    MIN_WIDTH = 1020
+    MIN_HEIGHT = 740
 
     def __init__(self, app, initial_files=None):
         self.app = app
         self.window = tk.Toplevel(app.root)
         self._task_runner = BackgroundTaskRunner(self.window)
         self._busy_widgets = []
-        self.window.title("提取 Word 表格到 Excel")
+        self.window.title("提取信息")
         # Give the scan list enough room on first open.  The result list is the
         # primary workspace in this window, so it should not start out cramped
         # by the fixed-height sections around it.
-        self.window.minsize(900, 640)
         self.window.configure(bg=app.app_bg)
         self.window.transient(app.root)
         # 先藏起来，排完布局再相对主窗口居中显示，避免闪到屏幕左上角
         self.window.withdraw()
+        width, height, min_w, min_h = self._fitted_window_size()
+        self.window.minsize(min_w, min_h)
         try:
             self.window.iconphoto(True, app._icon_photo)
         except Exception:
@@ -2355,6 +2483,7 @@ class WordTableExportWindow:
         self.table_item_by_iid = {}
         self.selected_table_keys = set()
         self.output_dir = None
+        self.extract_symbols_var = tk.BooleanVar(value=False)
         self._last_output_dir_to_open = None
         self._scan_separator_after = None
         self.status_var = tk.StringVar(value="就绪")
@@ -2368,21 +2497,47 @@ class WordTableExportWindow:
         geometry = center_window_on_parent(
             self.window,
             app.root,
-            width=self.WINDOW_WIDTH,
-            height=self.WINDOW_HEIGHT,
+            width=width,
+            height=height,
         )
         self.window.deiconify()
         if geometry:
             self.window.geometry(geometry)
+            # Windows 上 withdraw 后再显示，偶发丢掉刚才写入的尺寸，idle 后再钉一次
+            self.window.after_idle(lambda g=geometry: self._reapply_geometry(g))
         else:
             center_window_on_parent(
                 self.window,
                 app.root,
-                width=self.WINDOW_WIDTH,
-                height=self.WINDOW_HEIGHT,
+                width=width,
+                height=height,
             )
         self.window.lift()
         self.window.focus_force()
+
+    def _fitted_window_size(self):
+        """按屏幕可用区域收敛默认尺寸，避免超出任务栏或小屏显示器。"""
+        width, height = self.WINDOW_WIDTH, self.WINDOW_HEIGHT
+        min_w, min_h = self.MIN_WIDTH, self.MIN_HEIGHT
+        try:
+            screen_w = int(self.window.winfo_screenwidth())
+            screen_h = int(self.window.winfo_screenheight())
+        except Exception:
+            return width, height, min_w, min_h
+        if screen_w > 1:
+            width = min(width, max(screen_w - 48, 800))
+            min_w = min(min_w, width)
+        if screen_h > 1:
+            height = min(height, max(screen_h - 88, 600))
+            min_h = min(min_h, height)
+        return width, height, min_w, min_h
+
+    def _reapply_geometry(self, geometry):
+        try:
+            if self.window.winfo_exists() and geometry:
+                self.window.geometry(geometry)
+        except tk.TclError:
+            pass
 
     def exists(self):
         try:
@@ -2450,10 +2605,11 @@ class WordTableExportWindow:
 
         header = ttk.Frame(body, style="App.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(header, text="提取 Word 表格到 Excel", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text="提取信息", style="Title.TLabel").pack(anchor="w")
         self.header_hint = ttk.Label(
             header,
-            text="选择 .docx 文件；每个 Word 生成一个 Excel，每张表格对应一个工作表。",
+            text="选择 .docx 文件；导出 Word 表格到 Excel（每张表格一个工作表）；"
+                 "也可提取 ★ ▲ △ # 等带符号的指标参数条款（符号可自定义）。",
             style="Subtitle.TLabel",
         )
         self.header_hint.pack(anchor="w", pady=(2, 0))
@@ -2507,7 +2663,9 @@ class WordTableExportWindow:
         scan_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
         scan_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
         scan_frame.columnconfigure(0, weight=1)
+        # 扫描表吃掉中间全部弹性空间；明细栏保持可读高度，窗口再拉高时表继续长
         scan_frame.rowconfigure(1, weight=1)
+        scan_frame.rowconfigure(2, weight=0)
 
         scan_header = ttk.Frame(scan_frame, style="Toolbar.TFrame")
         scan_header.grid(row=0, column=0, sticky="ew")
@@ -2533,18 +2691,18 @@ class WordTableExportWindow:
             show="headings",
             selectmode="extended",
             style="Scan.Treeview",
-            height=10,
+            height=14,
         )
         self.scan_tree.heading("selected", text="导出")
         self.scan_tree.heading("file", text="文件")
         self.scan_tree.heading("section", text="所在章节")
         self.scan_tree.heading("table", text="表格")
         self.scan_tree.heading("size", text="行列")
-        self.scan_tree.column("selected", width=68, minwidth=60, anchor="center", stretch=False)
-        self.scan_tree.column("file", width=250, minwidth=160, stretch=False)
-        self.scan_tree.column("section", width=600, minwidth=280)
-        self.scan_tree.column("table", width=70, minwidth=62, anchor="center", stretch=False)
-        self.scan_tree.column("size", width=72, minwidth=62, anchor="center", stretch=False)
+        self.scan_tree.column("selected", width=64, minwidth=56, anchor="center", stretch=False)
+        self.scan_tree.column("file", width=220, minwidth=140, stretch=False)
+        self.scan_tree.column("section", width=480, minwidth=240)
+        self.scan_tree.column("table", width=68, minwidth=58, anchor="center", stretch=False)
+        self.scan_tree.column("size", width=68, minwidth=58, anchor="center", stretch=False)
         self.scan_tree.grid(row=0, column=0, sticky="nsew")
         y_scrollbar = FlatScrollbar(
             tree_frame,
@@ -2559,7 +2717,7 @@ class WordTableExportWindow:
             command=self._scan_tree_xview,
             style="Scan.Horizontal.TScrollbar",
         )
-        self.scan_x_scrollbar.grid(row=1, column=0, sticky="ew")
+        # 横向滚动条只在列宽超出可见区域时再出现，避免空表也占掉一行高度
         self.scan_tree.configure(
             yscrollcommand=y_scrollbar.set,
             xscrollcommand=self._on_scan_tree_xscroll,
@@ -2595,30 +2753,72 @@ class WordTableExportWindow:
         self._schedule_scan_tree_column_separators()
 
         detail_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
-        detail_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
         self.detail_text = tk.Text(
             detail_frame,
-            height=2,
+            height=7,
             wrap="word",
-            font=self.app.small_font,
+            font=self.app.body_font,
             bg="#F1F3F6",
             fg=self.app.text_fg,
             relief="solid",
             borderwidth=1,
-            padx=8,
-            pady=4,
+            padx=10,
+            pady=6,
         )
-        self.detail_text.grid(row=0, column=0, sticky="ew")
+        self.detail_text.grid(row=0, column=0, sticky="nsew")
+        self.detail_scrollbar = FlatScrollbar(
+            detail_frame,
+            orient="vertical",
+            command=self.detail_text.yview,
+            style="Flat.Vertical.TScrollbar",
+        )
+        self.detail_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.detail_text.configure(yscrollcommand=self.detail_scrollbar.set)
+        self.app._bind_vertical_mousewheel(
+            self.detail_text, self.detail_text, self.detail_scrollbar
+        )
         self.detail_text.insert("1.0", "选择扫描结果中的一行，可在这里查看完整章节、表格前文和内容预览。")
         self.detail_text.configure(state="disabled")
 
         self.scan_label = ttk.Label(scan_frame, text="请先添加 Word 文件并扫描表格", style="Muted.TLabel")
         self.scan_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
 
+        # 指标参数提取：独立区块，不与输出目录混在一起
+        symbols_frame = ttk.Frame(body, padding=(12, 8), style="Surface.TFrame")
+        symbols_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        symbols_frame.columnconfigure(0, weight=1)
+
+        symbols_header = ttk.Frame(symbols_frame, style="Toolbar.TFrame")
+        symbols_header.grid(row=0, column=0, sticky="ew")
+        symbols_header.columnconfigure(0, weight=1)
+        ttk.Label(symbols_header, text="指标参数提取", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+        self.customize_symbols_button = self._create_busy_button(
+            symbols_header,
+            text="自定义符号…",
+            command=self.open_symbol_settings,
+            width=12,
+        )
+        self.customize_symbols_button.grid(row=0, column=1, sticky="e")
+
+        symbols_content = ttk.Frame(symbols_frame, style="Toolbar.TFrame")
+        symbols_content.grid(row=1, column=0, sticky="ew", pady=(7, 0))
+        self.extract_symbols_check = CanvasCheckbox(
+            symbols_content,
+            "同时提取带符号的指标参数条款",
+            self.extract_symbols_var,
+            self.app,
+            command=self._on_extract_symbols_toggled,
+        )
+        self.extract_symbols_check.canvas.pack(side="left")
+        self.symbols_label = ttk.Label(symbols_content, text="当前：★ # △ ▲", style="Muted.TLabel")
+        self.symbols_label.pack(side="left", padx=(10, 0))
+
         self.output_frame = ttk.Frame(body, padding=(12, 6), style="Surface.TFrame")
         output_frame = self.output_frame
-        output_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        output_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         output_frame.columnconfigure(1, weight=1)
 
         # 单行：标题 + 路径说明 + 选择按钮；长路径中间省略，保持一行高度
@@ -2647,7 +2847,7 @@ class WordTableExportWindow:
 
         self.action_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
         action_frame = self.action_frame
-        action_frame.grid(row=4, column=0, sticky="ew")
+        action_frame.grid(row=5, column=0, sticky="ew")
         action_frame.columnconfigure(0, weight=1)
         action_frame.columnconfigure(2, minsize=118)
 
@@ -2681,7 +2881,23 @@ class WordTableExportWindow:
 
     def _on_scan_tree_xscroll(self, first, last):
         self.scan_x_scrollbar.set(first, last)
+        self._sync_scan_tree_x_scrollbar(first, last)
         self._schedule_scan_tree_column_separators()
+
+    def _sync_scan_tree_x_scrollbar(self, first, last):
+        """列宽超出可见区域才显示横向滚动条，把垂直空间留给表格行。"""
+        try:
+            overflow = float(first) > 0.001 or float(last) < 0.999
+        except (TypeError, ValueError):
+            overflow = True
+        try:
+            shown = bool(self.scan_x_scrollbar.grid_info())
+        except tk.TclError:
+            return
+        if overflow and not shown:
+            self.scan_x_scrollbar.grid(row=1, column=0, sticky="ew")
+        elif not overflow and shown:
+            self.scan_x_scrollbar.grid_remove()
 
     def _schedule_scan_tree_column_separators(self, event=None):
         if self._scan_separator_after is not None:
@@ -3133,16 +3349,159 @@ class WordTableExportWindow:
         self.status_var.set("已选择输出目录")
         self._refresh_constrained_texts()
 
+    def _on_extract_symbols_toggled(self):
+        if self.extract_symbols_var.get():
+            chars = self.app.symbol_chars or DEFAULT_SYMBOL_CHARS
+            self.status_var.set(f"将同时提取带符号的指标参数条款（{''.join(chars)}），无需扫描表格")
+        else:
+            self.status_var.set("已关闭指标参数提取")
+        self._refresh_constrained_texts()
+
+    def _refresh_symbols_label(self):
+        chars = self.app.symbol_chars or DEFAULT_SYMBOL_CHARS
+        self.symbols_label.config(text=f"当前：{' '.join(chars)}")
+
+    def open_symbol_settings(self):
+        """打开自定义提取符号对话框：勾选/取消常用符号，也可输入其他符号。"""
+        from symbol_clause_extractor import COMMON_SYMBOL_CHOICES, normalize_symbol_chars
+
+        current = normalize_symbol_chars(self.app.symbol_chars) or DEFAULT_SYMBOL_CHARS
+        choices = list(COMMON_SYMBOL_CHOICES) + [
+            char for char in current if char not in COMMON_SYMBOL_CHOICES
+        ]
+
+        dialog = tk.Toplevel(self.window)
+        dialog.title("自定义提取符号")
+        dialog.withdraw()
+        dialog.transient(self.window)
+        dialog.resizable(False, False)
+        dialog.configure(bg=self.app.app_bg)
+        try:
+            dialog.iconphoto(True, self.app._icon_photo)
+        except Exception:
+            pass
+
+        outer = ttk.Frame(dialog, padding=14, style="App.TFrame")
+        outer.pack(fill="both", expand=True)
+        body = ttk.Frame(outer, padding=14, style="Surface.TFrame")
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        ttk.Label(body, text="选择要提取的标记符号", style="SectionTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            body,
+            text="勾选要参与提取的符号（默认 ★ # △ ▲，可取消）；也可以在下方输入其他符号。",
+            style="Hint.TLabel",
+            wraplength=440,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(3, 9))
+
+        grid = ttk.Frame(body, style="Toolbar.TFrame")
+        grid.grid(row=2, column=0, sticky="ew")
+        symbol_vars = {}
+        chips = {}
+        for index, symbol in enumerate(choices):
+            var = tk.BooleanVar(value=symbol in current)
+            symbol_vars[symbol] = var
+            chip = CanvasCheckbox(
+                grid,
+                symbol,
+                var,
+                self.app,
+                command=lambda: refresh_selected(),
+                padx=7,
+                pady=5,
+            )
+            chip.canvas.grid(row=index // 8, column=index % 8, padx=3, pady=2, sticky="w")
+            chips[symbol] = chip
+        dialog._symbol_chips = chips
+
+        ttk.Label(body, text="其他符号（可直接输入多个，追加到勾选项）", style="SectionTitle.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(12, 5)
+        )
+        entry_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=entry_var, width=32)
+        entry.grid(row=4, column=0, sticky="w")
+        ttk.Label(
+            body,
+            text="数字、字母、汉字和空格会被自动忽略；符号须出现在条款开头或序号之后才会命中。",
+            style="Hint.TLabel",
+            wraplength=440,
+            justify="left",
+        ).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+
+        selected_label = ttk.Label(body, text="", style="Muted.TLabel")
+        selected_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
+
+        def selected_chars():
+            chosen = [symbol for symbol, var in symbol_vars.items() if var.get()]
+            chosen += list(normalize_symbol_chars(entry_var.get()))
+            return "".join(dict.fromkeys(chosen))
+
+        def refresh_selected():
+            chars = selected_chars()
+            selected_label.config(
+                text=f"已选 {len(chars)} 个：{' '.join(chars)}" if chars else "已选 0 个：请至少保留一个符号"
+            )
+
+        def reset_default():
+            for symbol, var in symbol_vars.items():
+                var.set(symbol in DEFAULT_SYMBOL_CHARS)
+            entry_var.set("")
+            refresh_selected()
+
+        def save_selection():
+            chars = selected_chars()
+            if not chars:
+                messagebox.showwarning("提示", "请至少选择或输入一个符号。", parent=dialog)
+                return
+            self.app.symbol_chars = chars
+            settings = load_settings()
+            settings["symbol_chars"] = chars
+            save_settings(settings)
+            self._refresh_symbols_label()
+            dialog.destroy()
+            self.status_var.set(f"提取符号已更新为 {''.join(chars)}")
+
+        buttons = ttk.Frame(body, style="Toolbar.TFrame")
+        buttons.grid(row=7, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="恢复默认", command=reset_default, width=10).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="取消", command=dialog.destroy, width=8).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            buttons, text="确定", style="Accent.TButton", command=save_selection, width=10
+        ).pack(side="left")
+
+        entry.bind("<KeyRelease>", lambda _event: refresh_selected())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        refresh_selected()
+
+        # 高度必须按内容自适应：符号块较多时写死高度会把底部按钮裁掉
+        dialog.update_idletasks()
+        center_window_on_parent(
+            dialog,
+            self.window,
+            width=max(520, dialog.winfo_reqwidth()),
+            height=dialog.winfo_reqheight(),
+        )
+        dialog.deiconify()
+        dialog.lift()
+        dialog.focus_force()
+        entry.focus_set()
+
     def start_export(self):
         if not self.file_paths:
             messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
             return
-        if not self.table_items:
-            messagebox.showwarning("提示", "请先点击“扫描表格”，再选择需要导出的表格。", parent=self.window)
-            return
-        if not self.selected_table_keys:
-            messagebox.showwarning("提示", "请先在扫描结果中选择至少一张表格。", parent=self.window)
-            return
+
+        extract_symbols = bool(self.extract_symbols_var.get())
+        if not extract_symbols:
+            if not self.table_items:
+                messagebox.showwarning("提示", "请先点击“扫描表格”，再选择需要导出的表格。", parent=self.window)
+                return
+            if not self.selected_table_keys:
+                messagebox.showwarning("提示", "请先在扫描结果中选择至少一张表格。", parent=self.window)
+                return
 
         selected_tables = {}
         for item in self.table_items:
@@ -3151,30 +3510,76 @@ class WordTableExportWindow:
                 continue
             selected_tables.setdefault(key[0], []).append(item.table_index)
 
-        file_paths = [
+        table_file_paths = [
             file_path
             for file_path in self.file_paths
             if _file_identity(file_path) in selected_tables
         ]
+        symbol_file_paths = list(self.file_paths) if extract_symbols else []
+        if not table_file_paths and not symbol_file_paths:
+            messagebox.showwarning("提示", "请先在扫描结果中选择至少一张表格。", parent=self.window)
+            return
+
         output_dir = self.output_dir
-        self._begin_determinate_task(
-            f"正在导出 {len(self.selected_table_keys)} 张已选表格...",
-            len(file_paths),
-        )
+        total_files = len(table_file_paths) + len(symbol_file_paths)
+        self._begin_determinate_task(f"正在导出 {total_files} 个文件...", total_files)
 
         def work(publish_progress):
+            from symbol_clause_extractor import batch_export_symbol_clauses
             from word_table_exporter import batch_export_word_tables
 
-            return batch_export_word_tables(
-                file_paths,
-                output_dir=output_dir,
-                progress_callback=publish_progress,
-                selected_tables=selected_tables,
+            table_results = {}
+            table_skipped = {}
+            table_error = None
+            symbol_results = None
+            symbol_skipped = {}
+            symbol_error = None
+
+            if table_file_paths:
+                def table_progress(current, total, filename):
+                    publish_progress(current, total_files, filename)
+
+                table_results, table_skipped, table_error = batch_export_word_tables(
+                    table_file_paths,
+                    output_dir=output_dir,
+                    progress_callback=table_progress,
+                    selected_tables=selected_tables or None,
+                )
+
+            if symbol_file_paths:
+                symbol_results = {}
+                table_count = len(table_file_paths)
+
+                def symbol_progress(current, total, filename):
+                    publish_progress(table_count + current, total_files, filename)
+
+                symbol_results, symbol_skipped, symbol_error = batch_export_symbol_clauses(
+                    symbol_file_paths,
+                    output_dir=output_dir,
+                    progress_callback=symbol_progress,
+                    symbols=self.app.symbol_chars,
+                )
+
+            return (
+                table_results,
+                table_skipped,
+                table_error,
+                symbol_results,
+                symbol_skipped,
+                symbol_error,
             )
 
         def on_success(result):
-            results, skipped, error = result
-            self._show_export_result(results, skipped, error, file_paths)
+            table_results, table_skipped, table_error, symbol_results, symbol_skipped, symbol_error = result
+            self._show_export_result(
+                table_results,
+                table_skipped,
+                table_error,
+                table_file_paths,
+                symbol_results=symbol_results,
+                symbol_skipped=symbol_skipped,
+                symbol_error=symbol_error,
+            )
 
         def on_error(exc):
             self._finish_background_error(exc, "Word 表格导出线程")
@@ -3206,40 +3611,74 @@ class WordTableExportWindow:
             detail += f"\n\n错误日志：{log_path}"
         messagebox.showerror("错误", detail, parent=self.window)
 
-    def _show_export_result(self, results, skipped, error, source_files):
+    def _show_export_result(
+        self,
+        results,
+        skipped,
+        error,
+        source_files,
+        symbol_results=None,
+        symbol_skipped=None,
+        symbol_error=None,
+    ):
         self._reset_busy_state()
         total_tables = sum(int(item["tables"]) for item in results.values())
-        lines = [
-            "导出完成。",
-            "",
-            f"成功导出 {len(results)} 个文件，共 {total_tables} 张表格。",
-            "",
-        ]
+        symbol_results = symbol_results or {}
+        symbol_skipped = symbol_skipped or {}
+        total_clauses = sum(int(item["count"]) for item in symbol_results.values())
+
+        lines = ["导出完成。", ""]
+
+        if symbol_results or symbol_skipped or symbol_error:
+            lines.append(f"表格导出：成功 {len(results)} 个文件，共 {total_tables} 张表格。")
+        else:
+            lines.append(f"成功导出 {len(results)} 个文件，共 {total_tables} 张表格。")
 
         if results:
-            lines.append("成功文件：")
             for filename, info in results.items():
                 lines.append(f"  {filename}: {info['tables']} 张表格 -> {info['output_path']}")
 
+        if symbol_results or symbol_skipped or symbol_error:
+            lines.extend([
+                "",
+                f"指标参数提取：成功 {len(symbol_results)} 个文件，共 {total_clauses} 条带符号条款。",
+            ])
+            for filename, info in symbol_results.items():
+                lines.append(f"  {filename}: {info['count']} 条 -> {info['output_path']}")
+            if not symbol_results:
+                lines.append("  （未提取到带符号条款）")
+
         if skipped:
-            lines.extend(["", "跳过文件："])
+            lines.extend(["", "表格导出跳过文件："])
             for filename, reason in skipped.items():
                 lines.append(f"  {filename}: {reason}")
 
-        if error:
-            lines.extend(["", "失败文件：", error])
+        if symbol_skipped:
+            lines.extend(["", "指标参数提取跳过文件："])
+            for filename, reason in symbol_skipped.items():
+                lines.append(f"  {filename}: {reason}")
+
+        if error or symbol_error:
+            lines.extend(["", "失败文件："])
+            if error:
+                lines.append(error)
+            if symbol_error:
+                lines.append(symbol_error)
             self.status_var.set("导出完成（部分失败）")
         else:
             self.status_var.set("导出完成")
 
-        self._last_output_dir_to_open = self._default_output_dir_to_open(results, source_files)
+        self._last_output_dir_to_open = self._default_output_dir_to_open(
+            results, source_files, symbol_results=symbol_results,
+        )
         self._show_result_window("\n".join(lines))
 
-    def _default_output_dir_to_open(self, results=None, source_files=None):
+    def _default_output_dir_to_open(self, results=None, source_files=None, symbol_results=None):
         if self.output_dir:
             return self.output_dir
-        if results:
-            first = next(iter(results.values()), None)
+        outputs = [results, symbol_results]
+        for collected in outputs:
+            first = next(iter(collected.values()), None) if collected else None
             if first and first.get("output_path"):
                 return os.path.dirname(first["output_path"])
         if source_files:

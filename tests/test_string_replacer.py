@@ -401,7 +401,7 @@ class SimpleReplacementTests(unittest.TestCase):
             app = ReplaceSimpleApp(root, restore_session=False)
             root.update_idletasks()
 
-            self.assertEqual(app.table_export_button.cget("text"), "提取 Word 表格")
+            self.assertEqual(app.table_export_button.cget("text"), "提取信息")
             self.assertEqual(app.version_info_button.cget("text"), "版本")
             self.assertEqual(root.title(), simple_main.format_version_title())
 
@@ -420,11 +420,14 @@ class SimpleReplacementTests(unittest.TestCase):
 
             self.assertIsNotNone(app.table_export_window)
             self.assertTrue(app.table_export_window.exists())
-            self.assertEqual(app.table_export_window.window.title(), "提取 Word 表格到 Excel")
+            self.assertEqual(app.table_export_window.window.title(), "提取信息")
             self.assertTrue(hasattr(app.table_export_window, "scan_tree"))
             self.assertEqual(app.table_export_window.scan_button.cget("text"), "扫描表格")
-            self.assertEqual(int(app.table_export_window.scan_tree.cget("height")), 10)
-            self.assertEqual(int(app.table_export_window.detail_text.cget("height")), 2)
+            self.assertGreaterEqual(app.table_export_window.WINDOW_WIDTH, 1200)
+            self.assertGreaterEqual(app.table_export_window.WINDOW_HEIGHT, 880)
+            self.assertGreaterEqual(int(app.table_export_window.scan_tree.cget("height")), 12)
+            self.assertGreaterEqual(int(app.table_export_window.detail_text.cget("height")), 6)
+            self.assertTrue(hasattr(app.table_export_window, "detail_scrollbar"))
             self.assertEqual(
                 app.table_export_window.scan_tree.cget("columns"),
                 ("selected", "file", "section", "table", "size"),
@@ -446,6 +449,22 @@ class SimpleReplacementTests(unittest.TestCase):
             )
             header_height = app.table_export_window._scan_tree_header_height()
             self.assertGreaterEqual(header_height, 20)
+
+            exporter = app.table_export_window
+            fitted_w, fitted_h, min_w, min_h = exporter._fitted_window_size()
+            self.assertGreaterEqual(fitted_w, min_w)
+            self.assertGreaterEqual(fitted_h, min_h)
+            self.assertLessEqual(fitted_w, exporter.WINDOW_WIDTH)
+            self.assertLessEqual(fitted_h, exporter.WINDOW_HEIGHT)
+            exporter._sync_scan_tree_x_scrollbar(0.0, 1.0)
+            exporter.window.update_idletasks()
+            self.assertFalse(bool(exporter.scan_x_scrollbar.grid_info()))
+            exporter._sync_scan_tree_x_scrollbar(0.0, 0.7)
+            exporter.window.update_idletasks()
+            self.assertTrue(bool(exporter.scan_x_scrollbar.grid_info()))
+            exporter._sync_scan_tree_x_scrollbar(0.0, 1.0)
+            exporter.window.update_idletasks()
+            self.assertFalse(bool(exporter.scan_x_scrollbar.grid_info()))
 
             app.table_export_window.close()
             root.update_idletasks()

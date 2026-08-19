@@ -354,7 +354,7 @@ def _shorten(text: str, max_length: int) -> str:
     return text[: max_length - 1] + "…"
 
 
-def _extract_table(table) -> ExportedTable:
+def _extract_table(table, paragraph_text_fn: Optional[Callable] = None) -> ExportedTable:
     cells: List[ExportedTableCell] = []
     active_vertical: Dict[int, ExportedTableCell] = {}
     max_column = 0
@@ -380,7 +380,7 @@ def _extract_table(table) -> ExportedTable:
                         column=column_index,
                         row_span=1,
                         column_span=column_span,
-                        text=_cell_text(tc, table),
+                        text=_cell_text(tc, table, paragraph_text_fn),
                     ))
             else:
                 for offset in range(column_span):
@@ -391,7 +391,7 @@ def _extract_table(table) -> ExportedTable:
                     column=column_index,
                     row_span=1,
                     column_span=column_span,
-                    text=_cell_text(tc, table),
+                    text=_cell_text(tc, table, paragraph_text_fn),
                 )
                 cells.append(cell)
 
@@ -453,23 +453,29 @@ def _find_active_vertical_cell(
     return None
 
 
-def _cell_text(tc, table) -> str:
+def _cell_text(tc, table, paragraph_text_fn: Optional[Callable] = None) -> str:
     try:
-        text = _Cell(tc, table).text
+        if paragraph_text_fn is None:
+            text = _Cell(tc, table).text
+        else:
+            text = "\n".join(
+                paragraph_text_fn(Paragraph(p_el, table))
+                for p_el in tc.findall(qn("w:p"))
+            )
     except Exception:
         text_parts = []
         for text_node in tc.iter(qn("w:t")):
             if text_node.text:
                 text_parts.append(text_node.text)
         text = "".join(text_parts)
-    nested_lines = _nested_table_lines(tc)
+    nested_lines = _nested_table_lines(tc, paragraph_text_fn)
     if nested_lines:
         nested_text = "\n".join(nested_lines)
         text = f"{text}\n{nested_text}" if text else nested_text
     return text.replace("\r\a", "").replace("\a", "").replace("\x07", "")
 
 
-def _nested_table_lines(tc) -> List[str]:
+def _nested_table_lines(tc, paragraph_text_fn: Optional[Callable] = None) -> List[str]:
     """把单元格内的嵌套表格按行展开为文本行，内容不再丢失。
 
     只取当前单元格的直接子表格；更深层的嵌套由内层单元格递归处理，
@@ -481,12 +487,18 @@ def _nested_table_lines(tc) -> List[str]:
             row_parts = []
             for nested_tc in tr.findall(qn("w:tc")):
                 try:
-                    part_text = _Cell(nested_tc, tbl).text
+                    if paragraph_text_fn is None:
+                        part_text = _Cell(nested_tc, tbl).text
+                    else:
+                        part_text = "\n".join(
+                            paragraph_text_fn(Paragraph(p_el, tbl))
+                            for p_el in nested_tc.findall(qn("w:p"))
+                        )
                 except Exception:
                     part_text = "".join(
                         node.text or "" for node in nested_tc.iter(qn("w:t"))
                     )
-                inner_lines = _nested_table_lines(nested_tc)
+                inner_lines = _nested_table_lines(nested_tc, paragraph_text_fn)
                 if inner_lines:
                     inner_text = "\n".join(inner_lines)
                     part_text = f"{part_text}\n{inner_text}" if part_text else inner_text
