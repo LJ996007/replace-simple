@@ -34,18 +34,18 @@ PYINSTALLER_ARGS = [
     "--hidden-import=xlrd",
     "--hidden-import=docx",
     "--hidden-import=pptx",
+    "--hidden-import=win32com.client",
+    "--hidden-import=pythoncom",
+    "--hidden-import=pywintypes",
     "--hidden-import=tksheet",
     "--collect-data=tksheet",   # tksheet 带有内置主题/图标等数据文件，打包时需一并收集
 ]
 
-# 排除程序完全用不到的重型依赖。它们会被传递性拉入，且 pywin32 的
-# run-time hook（pyi_rth_pywintypes / pyi_rth_pythoncom）会在 exe 启动时
-# 强制加载 COM dll，是启动开销与体积的大头。文本替换核心路径
-# （openpyxl 读写单元格、docx/pptx 读写文本）不依赖以下任何模块。
+# 排除程序完全用不到的重型依赖。pywin32 用于处理 .doc/.xls/.ppt，
+# 必须保留；其余文本替换核心路径继续使用 openpyxl/docx/pptx。
 EXCLUDE_MODULES = [
     "numpy", "pandas", "scipy", "matplotlib",
-    "win32com", "pythoncom", "pywintypes", "pywin32",
-    "win32evtlog", "win32evtlogutil", "win32api",
+    "win32evtlog", "win32evtlogutil",
     "bs4", "charset_normalizer", "soupsieve",
     "pyreadline3",
     "lxml.isoschematron", "lxml.html", "lxml.objectify", "lxml.sax",

@@ -10,11 +10,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['openpyxl', 'xlrd', 'docx', 'pptx', 'tksheet'],
+    hiddenimports=['openpyxl', 'xlrd', 'docx', 'pptx', 'win32com.client', 'pythoncom', 'pywintypes', 'tksheet'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['numpy', 'pandas', 'scipy', 'matplotlib', 'win32com', 'pythoncom', 'pywintypes', 'pywin32', 'win32evtlog', 'win32evtlogutil', 'win32api', 'bs4', 'charset_normalizer', 'soupsieve', 'pyreadline3', 'lxml.isoschematron', 'lxml.html', 'lxml.objectify', 'lxml.sax', 'pythonnet', 'clr_loader', 'clr', 'jinja2', 'yaml', 'PyYAML'],
+    excludes=['numpy', 'pandas', 'scipy', 'matplotlib', 'win32evtlog', 'win32evtlogutil', 'bs4', 'charset_normalizer', 'soupsieve', 'pyreadline3', 'lxml.isoschematron', 'lxml.html', 'lxml.objectify', 'lxml.sax', 'pythonnet', 'clr_loader', 'clr', 'jinja2', 'yaml', 'PyYAML'],
     noarchive=False,
     optimize=0,
 )

@@ -8,7 +8,7 @@ openpyxl. It does not require Word, WPS, or Excel to be installed.
 import os
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 from docx import Document
@@ -126,24 +126,43 @@ def batch_scan_word_tables(
     items: List[TableScanItem] = []
     skipped: Dict[str, str] = {}
     errors: List[str] = []
+    legacy_session = None
 
-    for index, file_path in enumerate(file_paths):
-        filename = os.path.basename(file_path)
-        if progress_callback:
-            progress_callback(index + 1, len(file_paths), filename)
+    try:
+        for index, file_path in enumerate(file_paths):
+            filename = os.path.basename(file_path)
+            if progress_callback:
+                progress_callback(index + 1, len(file_paths), filename)
 
-        if os.path.splitext(file_path)[1].lower() != ".docx":
-            skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
-            continue
-
-        try:
-            file_items = scan_word_tables(file_path)
-            if not file_items:
-                skipped[_result_key(skipped, filename, file_path)] = "未找到表格"
+            extension = os.path.splitext(file_path)[1].lower()
+            if extension not in (".doc", ".docx"):
+                skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
                 continue
-            items.extend(file_items)
-        except Exception as exc:
-            errors.append(f"{filename}: {_format_export_error(exc)}")
+
+            try:
+                if extension == ".doc":
+                    from legacy_office import LegacyOfficeSession, temporary_docx_source
+
+                    if legacy_session is None:
+                        candidate_session = LegacyOfficeSession()
+                        candidate_session.__enter__()
+                        legacy_session = candidate_session
+                    with temporary_docx_source(file_path, legacy_session) as readable_path:
+                        file_items = [
+                            replace(item, file_path=file_path, filename=filename)
+                            for item in scan_word_tables(readable_path)
+                        ]
+                else:
+                    file_items = scan_word_tables(file_path)
+                if not file_items:
+                    skipped[_result_key(skipped, filename, file_path)] = "未找到表格"
+                    continue
+                items.extend(file_items)
+            except Exception as exc:
+                errors.append(f"{filename}: {_format_export_error(exc)}")
+    finally:
+        if legacy_session is not None:
+            legacy_session.close()
 
     return items, skipped, "\n".join(errors) if errors else None
 
@@ -201,36 +220,60 @@ def batch_export_word_tables(
     results: Dict[str, Dict[str, object]] = {}
     skipped: Dict[str, str] = {}
     errors: List[str] = []
+    legacy_session = None
 
-    for index, file_path in enumerate(file_paths):
-        filename = os.path.basename(file_path)
-        if progress_callback:
-            progress_callback(index + 1, len(file_paths), filename)
+    try:
+        for index, file_path in enumerate(file_paths):
+            filename = os.path.basename(file_path)
+            if progress_callback:
+                progress_callback(index + 1, len(file_paths), filename)
 
-        if os.path.splitext(file_path)[1].lower() != ".docx":
-            skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
-            continue
-
-        try:
-            table_indexes = None
-            if selected_tables is not None:
-                table_indexes = selected_tables.get(_file_identity(file_path), [])
-                if not table_indexes:
-                    skipped[_result_key(skipped, filename, file_path)] = "未选择表格"
-                    continue
-
-            output_path = get_table_export_output_path(file_path, output_dir)
-            table_count = export_word_tables_to_excel(file_path, output_path, table_indexes=table_indexes)
-            if table_count == 0:
-                skipped[_result_key(skipped, filename, file_path)] = "未找到表格"
+            extension = os.path.splitext(file_path)[1].lower()
+            if extension not in (".doc", ".docx"):
+                skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
                 continue
 
-            results[_result_key(results, filename, file_path)] = {
-                "tables": table_count,
-                "output_path": output_path,
-            }
-        except Exception as exc:
-            errors.append(f"{filename}: {_format_export_error(exc)}")
+            try:
+                table_indexes = None
+                if selected_tables is not None:
+                    table_indexes = selected_tables.get(_file_identity(file_path), [])
+                    if not table_indexes:
+                        skipped[_result_key(skipped, filename, file_path)] = "未选择表格"
+                        continue
+
+                output_path = get_table_export_output_path(file_path, output_dir)
+                if extension == ".doc":
+                    from legacy_office import LegacyOfficeSession, temporary_docx_source
+
+                    if legacy_session is None:
+                        candidate_session = LegacyOfficeSession()
+                        candidate_session.__enter__()
+                        legacy_session = candidate_session
+                    with temporary_docx_source(file_path, legacy_session) as readable_path:
+                        table_count = export_word_tables_to_excel(
+                            readable_path,
+                            output_path,
+                            table_indexes=table_indexes,
+                        )
+                else:
+                    table_count = export_word_tables_to_excel(
+                        file_path,
+                        output_path,
+                        table_indexes=table_indexes,
+                    )
+                if table_count == 0:
+                    skipped[_result_key(skipped, filename, file_path)] = "未找到表格"
+                    continue
+
+                results[_result_key(results, filename, file_path)] = {
+                    "tables": table_count,
+                    "output_path": output_path,
+                }
+            except Exception as exc:
+                errors.append(f"{filename}: {_format_export_error(exc)}")
+    finally:
+        if legacy_session is not None:
+            legacy_session.close()
 
     return results, skipped, "\n".join(errors) if errors else None
 

@@ -1,6 +1,6 @@
 """
 简化版批量文本替换模块。
-支持 Word (.docx)、Excel (.xlsx/.xlsm)、PowerPoint (.pptx) 文件。
+支持 Word (.doc/.docx)、Excel (.xls/.xlsx/.xlsm)、PowerPoint (.ppt/.pptx) 文件。
 """
 
 import datetime
@@ -625,33 +625,64 @@ def batch_replace(
     results = {}
     errors = []
     reserved_output_paths = set()
+    legacy_session = None
 
-    for index, file_path in enumerate(file_paths):
-        filename = os.path.basename(file_path)
-        if progress_callback:
-            progress_callback(index + 1, len(file_paths), filename)
+    try:
+        for index, file_path in enumerate(file_paths):
+            filename = os.path.basename(file_path)
+            if progress_callback:
+                progress_callback(index + 1, len(file_paths), filename)
 
-        try:
-            output_path = get_output_path(
-                file_path,
-                rules,
-                output_dir,
-                reserved_output_paths=reserved_output_paths,
-            )
-            ext = os.path.splitext(file_path)[1].lower()
+            try:
+                output_path = get_output_path(
+                    file_path,
+                    rules,
+                    output_dir,
+                    reserved_output_paths=reserved_output_paths,
+                )
+                ext = os.path.splitext(file_path)[1].lower()
 
-            if ext == ".docx":
-                count = replace_in_docx(file_path, rules, output_path)
-            elif ext in (".xlsx", ".xlsm"):
-                count = replace_in_xlsx(file_path, rules, output_path)
-            elif ext == ".pptx":
-                count = replace_in_pptx(file_path, rules, output_path)
-            else:
-                errors.append(f"{filename}: 不支持的文件格式")
-                continue
+                if ext in (".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx") and os.path.getsize(file_path) == 0:
+                    if not _same_file_path(file_path, output_path):
+                        shutil.copy2(file_path, output_path)
+                    count = 0
+                elif ext == ".docx":
+                    count = replace_in_docx(file_path, rules, output_path)
+                elif ext in (".xlsx", ".xlsm"):
+                    count = replace_in_xlsx(file_path, rules, output_path)
+                elif ext == ".pptx":
+                    count = replace_in_pptx(file_path, rules, output_path)
+                elif ext in (".doc", ".xls", ".ppt"):
+                    from legacy_office import (
+                        LegacyOfficeSession,
+                        replace_in_doc,
+                        replace_in_ppt,
+                        replace_in_xls,
+                    )
 
-            results[_result_key(results, filename, file_path)] = count
-        except Exception as exc:
-            errors.append(f"{filename}: {_format_processing_error(exc)}")
+                    if legacy_session is None:
+                        candidate_session = LegacyOfficeSession()
+                        try:
+                            candidate_session.__enter__()
+                        except Exception:
+                            candidate_session.close()
+                            raise
+                        legacy_session = candidate_session
+                    if ext == ".doc":
+                        count = replace_in_doc(file_path, rules, output_path, legacy_session)
+                    elif ext == ".xls":
+                        count = replace_in_xls(file_path, rules, output_path, legacy_session)
+                    else:
+                        count = replace_in_ppt(file_path, rules, output_path, legacy_session)
+                else:
+                    errors.append(f"{filename}: 不支持的文件格式")
+                    continue
+
+                results[_result_key(results, filename, file_path)] = count
+            except Exception as exc:
+                errors.append(f"{filename}: {_format_processing_error(exc)}")
+    finally:
+        if legacy_session is not None:
+            legacy_session.close()
 
     return results, "\n".join(errors) if errors else None

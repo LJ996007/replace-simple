@@ -12,16 +12,24 @@ from openpyxl import load_workbook
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from symbol_clause_extractor import (
+    DEFAULT_SECTION_KEYWORDS,
     DEFAULT_SYMBOL_CHARS,
     SYMBOL_CLAUSE_HEADERS,
     SYMBOL_SHEET_TITLE,
     batch_export_symbol_clauses,
+    batch_scan_symbol_clause_sections,
     export_symbol_clauses_to_excel,
     extract_symbol_clauses,
     get_symbol_output_path,
     _leading_symbols,
+    _split_symbol_clause_blocks,
+    normalize_section_keywords,
     normalize_symbol_chars,
+    scan_symbol_clause_sections,
+    section_matches_keywords,
+    strip_clause_symbols,
 )
+from word_table_exporter import _file_identity
 
 
 DECIMAL_NUMBERING = (
@@ -117,6 +125,24 @@ class LeadingSymbolRuleTests(unittest.TestCase):
         self.assertEqual(_leading_symbols("★▲双重要求"), ["★", "▲"])
         self.assertEqual(_leading_symbols("★★强调"), ["★"])
 
+    def test_table_cell_text_splits_at_each_marked_clause(self):
+        blocks = _split_symbol_clause_blocks(
+            "2.1.1 离子源和进样方式\n"
+            "# 2.1.1.1 最大耐受流速：≥2.5 mL/min。\n"
+            "（提供彩页或官网证明）\n"
+            "# 2.1.1.2 最高加热温度：≥700℃。\n"
+            "★2.1.1.3 离子源接口：锥孔结构。\n"
+            "2.1.1.4 普通条款不提取\n"
+            "★2.1.3 采用180度U型弯曲碰撞室设计。"
+        )
+
+        self.assertEqual(blocks, [
+            (["#"], "# 2.1.1.1 最大耐受流速：≥2.5 mL/min。\n（提供彩页或官网证明）"),
+            (["#"], "# 2.1.1.2 最高加热温度：≥700℃。"),
+            (["★"], "★2.1.1.3 离子源接口：锥孔结构。"),
+            (["★"], "★2.1.3 采用180度U型弯曲碰撞室设计。"),
+        ])
+
 
 class ExtractBodyParagraphTests(unittest.TestCase):
     def test_body_symbols_extracted_with_full_text(self):
@@ -183,14 +209,46 @@ class ExtractTableTests(unittest.TestCase):
             clauses = extract_symbol_clauses(str(path))
 
         self.assertEqual([clause.symbol for clause in clauses], ["★", "▲", "★"])
-        camera_row = clauses[0].text
-        self.assertIn("1", camera_row.splitlines())
-        self.assertIn("网络摄像机", camera_row.splitlines())
-        self.assertIn("★分辨率不低于400万像素", camera_row.splitlines())
+        camera_rows = clauses[:2]
+        for camera_row in camera_rows:
+            self.assertIn("1", camera_row.text.splitlines())
+            self.assertIn("网络摄像机", camera_row.text.splitlines())
+        self.assertIn("★分辨率不低于400万像素", camera_rows[0].text.splitlines())
+        self.assertNotIn("▲支持H.265编码", camera_rows[0].text)
+        self.assertIn("▲支持H.265编码", camera_rows[1].text.splitlines())
+        self.assertNotIn("★分辨率不低于400万像素", camera_rows[1].text)
         # 无符号行（交换机）不提取
         self.assertNotIn("交换机", "\n".join(clause.text for clause in clauses))
         # 纯符号单元格：整行仍完整提取
         self.assertIn("服务器CPU不低于32核", clauses[2].text)
+
+    def test_multiple_marked_clauses_in_one_cell_export_separately(self):
+        with TemporaryDirectory() as directory:
+            path = _make_docx(
+                Path(directory) / "单元格多条款.docx",
+                table_rows=[(
+                    "技术要求",
+                    "2.1.1 离子源和进样方式\n"
+                    "# 2.1.1.1 最大耐受流速：≥2.5 mL/min。\n"
+                    "证明材料随附\n"
+                    "# 2.1.1.2 最高加热温度：≥700℃。\n"
+                    "★2.1.1.3 离子源接口：锥孔结构。\n"
+                    "2.1.1.4 普通条款\n"
+                    "★2.1.3 采用180度U型弯曲碰撞室设计。",
+                )],
+            )
+            clauses = extract_symbol_clauses(str(path))
+
+        self.assertEqual([clause.symbol for clause in clauses], ["#", "#", "★", "★"])
+        self.assertEqual(
+            [clause.text for clause in clauses],
+            [
+                "技术要求\n# 2.1.1.1 最大耐受流速：≥2.5 mL/min。\n证明材料随附",
+                "技术要求\n# 2.1.1.2 最高加热温度：≥700℃。",
+                "技术要求\n★2.1.1.3 离子源接口：锥孔结构。",
+                "技术要求\n★2.1.3 采用180度U型弯曲碰撞室设计。",
+            ],
+        )
 
     def test_table_cell_auto_numbering_reconstructed(self):
         with TemporaryDirectory() as directory:
@@ -235,6 +293,29 @@ class ExcelExportTests(unittest.TestCase):
             self.assertEqual([worksheet.cell(3, column).value for column in range(1, 4)],
                              ["2", "▲", "3.2、▲指标二"])
 
+    def test_export_can_strip_symbols_from_content_column(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = _make_docx(directory / "去符号导出.docx", paragraphs=[
+                ("★指标一", None, None),
+                ("3.2、▲指标二", None, None),
+            ])
+            output = get_symbol_output_path(str(path), str(directory))
+            count = export_symbol_clauses_to_excel(
+                str(path), output, keep_symbols_in_text=False
+            )
+            self.assertEqual(count, 2)
+            workbook = load_workbook(output)
+            worksheet = workbook.active
+            self.assertEqual(
+                [worksheet.cell(2, column).value for column in range(1, 4)],
+                ["1", "★", "指标一"],
+            )
+            self.assertEqual(
+                [worksheet.cell(3, column).value for column in range(1, 4)],
+                ["2", "▲", "3.2、指标二"],
+            )
+
     def test_output_path_does_not_overwrite(self):
         with TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -268,6 +349,144 @@ class ExcelExportTests(unittest.TestCase):
                 skipped,
                 {"无符号.docx": "未找到带符号条款", "说明.txt": "不支持的文件格式"},
             )
+
+
+class SymbolSectionScanTests(unittest.TestCase):
+    def test_scan_groups_clauses_by_exact_section_with_metadata(self):
+        with TemporaryDirectory() as directory:
+            path = _make_structured_docx(Path(directory) / "分章扫描.docx", [
+                ("p", "第五章 采购需求"),
+                ("p", "一、摄像设备"),
+                ("p", "★分辨率不低于400万像素"),
+                ("p", "▲支持H.265编码"),
+                ("p", "二、存储设备"),
+                ("table", [("1", "存储", "#容量不低于8TB")]),
+            ])
+            items = scan_symbol_clause_sections(str(path))
+
+        self.assertEqual(len(items), 2)
+        self.assertIn("采购需求 / 一、摄像设备", items[0].section)
+        self.assertEqual(items[0].symbols, ("★", "▲"))
+        self.assertEqual(items[0].clause_count, 2)
+        self.assertEqual(items[0].sources, ("正文",))
+        self.assertIn("分辨率", items[0].preview)
+        self.assertIn("采购需求 / 二、存储设备", items[1].section)
+        self.assertEqual(items[1].sources, ("表格1",))
+
+    def test_scan_keeps_unrecognized_section_selectable(self):
+        with TemporaryDirectory() as directory:
+            path = _make_docx(
+                Path(directory) / "无标题.docx",
+                paragraphs=[("★未归入标题的条款", None, None)],
+            )
+            items = scan_symbol_clause_sections(str(path))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].section, "未识别章节")
+
+    def test_batch_scan_reports_files_without_symbol_clauses(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            first = _make_docx(directory / "有符号.docx", paragraphs=[("★条款", None, None)])
+            second = _make_docx(directory / "无符号.docx", paragraphs=[("普通内容", None, None)])
+            items, skipped, error = batch_scan_symbol_clause_sections([str(first), str(second)])
+
+        self.assertIsNone(error)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(skipped, {"无符号.docx": "未找到带符号条款"})
+
+    def test_batch_scan_reports_corrupt_docx_without_losing_other_results(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            valid = _make_docx(directory / "正常.docx", paragraphs=[("★正常条款", None, None)])
+            corrupt = directory / "损坏.docx"
+            corrupt.write_bytes(b"not-a-docx")
+            items, skipped, error = batch_scan_symbol_clause_sections(
+                [str(valid), str(corrupt)]
+            )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(skipped, {})
+        self.assertIn("损坏.docx", error)
+
+    def test_batch_export_uses_exact_sections_independently_per_file(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            first = _make_structured_docx(directory / "甲.docx", [
+                ("p", "第三章 采购需求"),
+                ("p", "★甲需求"),
+                ("p", "第四章 评审办法"),
+                ("p", "★甲引用"),
+            ])
+            second = _make_structured_docx(directory / "乙.docx", [
+                ("p", "第五章 设备技术规范"),
+                ("p", "▲乙规范"),
+                ("p", "第六章 响应格式"),
+                ("p", "▲乙引用"),
+            ])
+            selected = {
+                _file_identity(str(first)): ["第三章 采购需求"],
+                _file_identity(str(second)): ["第五章 设备技术规范"],
+            }
+            results, skipped, error = batch_export_symbol_clauses(
+                [str(first), str(second)],
+                output_dir=str(directory),
+                section_keywords=["不会命中"],
+                selected_sections=selected,
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(skipped, {})
+            self.assertEqual(set(results), {"甲.docx", "乙.docx"})
+            first_book = load_workbook(results["甲.docx"]["output_path"])
+            second_book = load_workbook(results["乙.docx"]["output_path"])
+            try:
+                self.assertEqual(first_book.active["C2"].value, "★甲需求")
+                self.assertEqual(second_book.active["C2"].value, "▲乙规范")
+                self.assertEqual(first_book.active.max_row, 2)
+                self.assertEqual(second_book.active.max_row, 2)
+            finally:
+                first_book.close()
+                second_book.close()
+
+    def test_exact_section_export_handles_duplicate_filenames(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            first_dir = directory / "甲目录"
+            second_dir = directory / "乙目录"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            first = _make_structured_docx(first_dir / "同名.docx", [
+                ("p", "第三章 采购需求"),
+                ("p", "★甲条款"),
+            ])
+            second = _make_structured_docx(second_dir / "同名.docx", [
+                ("p", "第五章 设备技术规范"),
+                ("p", "▲乙条款"),
+            ])
+            selected = {
+                _file_identity(str(first)): ["第三章 采购需求"],
+                _file_identity(str(second)): ["第五章 设备技术规范"],
+            }
+            results, skipped, error = batch_export_symbol_clauses(
+                [str(first), str(second)],
+                output_dir=str(directory),
+                selected_sections=selected,
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(skipped, {})
+            self.assertEqual(len(results), 2)
+            output_paths = [info["output_path"] for info in results.values()]
+            self.assertEqual(len(set(output_paths)), 2)
+            exported_texts = set()
+            for output_path in output_paths:
+                workbook = load_workbook(output_path)
+                try:
+                    exported_texts.add(workbook.active["C2"].value)
+                finally:
+                    workbook.close()
+            self.assertEqual(exported_texts, {"★甲条款", "▲乙条款"})
 
 
 class CustomSymbolSetTests(unittest.TestCase):
@@ -327,6 +546,118 @@ class CustomSymbolSetTests(unittest.TestCase):
     def test_main_default_matches_extractor_default(self):
         from main import DEFAULT_SYMBOL_CHARS as main_default
         self.assertEqual(main_default, DEFAULT_SYMBOL_CHARS)
+
+
+class StripClauseSymbolTests(unittest.TestCase):
+    def test_strips_leading_and_numbered_symbols(self):
+        self.assertEqual(strip_clause_symbols("★分辨率不低于400万像素"), "分辨率不低于400万像素")
+        self.assertEqual(strip_clause_symbols("3.2、▲支持H.265"), "3.2、支持H.265")
+        self.assertEqual(strip_clause_symbols("1.★支持夜视"), "1.支持夜视")
+        self.assertEqual(strip_clause_symbols("（★）实质性要求"), "实质性要求")
+        self.assertEqual(strip_clause_symbols("【▲】关键指标"), "关键指标")
+
+    def test_strips_multiple_clause_start_symbols_but_keeps_mid_sentence(self):
+        self.assertEqual(
+            strip_clause_symbols("★支持A功能；▲支持B功能"),
+            "支持A功能；支持B功能",
+        )
+        self.assertEqual(
+            strip_clause_symbols("该参数为★级，仅供参考"),
+            "该参数为★级，仅供参考",
+        )
+
+    def test_extract_can_drop_symbols_from_body_and_table_text(self):
+        with TemporaryDirectory() as directory:
+            path = _make_docx(
+                Path(directory) / "去符号.docx",
+                paragraphs=[("3.2、▲支持H.265编码，码率可调", None, None)],
+                table_rows=[("1", "网络摄像机", "★分辨率不低于400万像素")],
+            )
+            clauses = extract_symbol_clauses(str(path), keep_symbols_in_text=False)
+
+        self.assertEqual([c.symbol for c in clauses], ["▲", "★"])
+        self.assertEqual(clauses[0].text, "3.2、支持H.265编码，码率可调")
+        self.assertNotIn("★", clauses[1].text)
+        self.assertIn("分辨率不低于400万像素", clauses[1].text)
+        self.assertIn("网络摄像机", clauses[1].text)
+
+
+class SectionKeywordTests(unittest.TestCase):
+    def test_normalize_section_keywords(self):
+        self.assertEqual(
+            normalize_section_keywords("采购需求，技术要求、 技术规格"),
+            ["采购需求", "技术要求", "技术规格"],
+        )
+        self.assertEqual(normalize_section_keywords([" 采购需求 ", "采购需求", "求"]), ["采购需求"])
+        self.assertEqual(normalize_section_keywords(""), [])
+
+    def test_default_keywords_keep_requirement_chapters_and_drop_scoring(self):
+        keywords = list(DEFAULT_SECTION_KEYWORDS)
+        self.assertTrue(section_matches_keywords("第五章 采购需求", keywords))
+        self.assertTrue(section_matches_keywords("第五章 采购需求 / 一、技术规格", keywords))
+        self.assertFalse(section_matches_keywords("第六章 评标办法", keywords))
+        self.assertFalse(section_matches_keywords("第六章 评标办法 / 技术参数评分", keywords))
+        self.assertFalse(section_matches_keywords("第七章 投标文件格式 / 采购需求偏离表", keywords))
+        self.assertFalse(section_matches_keywords("未识别章节", keywords))
+        self.assertTrue(section_matches_keywords("任何章节", None))
+
+    def test_explicit_scoring_keyword_overrides_exclude(self):
+        self.assertTrue(
+            section_matches_keywords("第六章 评标办法", ["评标办法"])
+        )
+
+    def test_extract_filters_to_requirement_chapters(self):
+        with TemporaryDirectory() as directory:
+            path = _make_structured_docx(Path(directory) / "分章.docx", [
+                ("p", "第五章 采购需求"),
+                ("p", "★分辨率不低于400万像素"),
+                ("table", [("1", "摄像机", "▲支持H.265")]),
+                ("p", "第六章 评标办法"),
+                ("p", "★带星号的为实质性要求，见采购需求"),
+                ("table", [("★", "评分引用", "见采购需求")]),
+            ])
+            all_clauses = extract_symbol_clauses(str(path))
+            filtered = extract_symbol_clauses(
+                str(path),
+                section_keywords=list(DEFAULT_SECTION_KEYWORDS),
+            )
+
+        self.assertEqual(len(all_clauses), 4)
+        self.assertEqual([c.symbol for c in filtered], ["★", "▲"])
+        self.assertIn("采购需求", filtered[0].section)
+        self.assertNotIn("评标办法", "\n".join(c.section for c in filtered))
+
+    def test_batch_reports_section_miss_separately(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = _make_docx(directory / "仅评标.docx", paragraphs=[
+                ("第六章 评标办法", None, None),
+                ("★实质性要求见采购需求", None, None),
+            ])
+            results, skipped, error = batch_export_symbol_clauses(
+                [str(path)],
+                output_dir=str(directory),
+                keep_symbols_in_text=False,
+                section_keywords=list(DEFAULT_SECTION_KEYWORDS),
+            )
+            self.assertIsNone(error)
+            self.assertEqual(results, {})
+            self.assertEqual(skipped, {"仅评标.docx": "未找到指定章节中的带符号条款"})
+
+
+def _make_structured_docx(path, blocks):
+    document = Document()
+    for kind, payload in blocks:
+        if kind == "p":
+            document.add_paragraph(payload)
+            continue
+        rows = payload
+        table = document.add_table(rows=len(rows), cols=len(rows[0]))
+        for row_index, row in enumerate(rows):
+            for column_index, value in enumerate(row):
+                table.cell(row_index, column_index).paragraphs[0].text = value
+    document.save(path)
+    return path
 
 
 if __name__ == "__main__":

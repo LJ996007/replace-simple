@@ -9,9 +9,10 @@
 Word/WPS/Excel。
 """
 
+import contextlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 from docx import Document
@@ -26,6 +27,7 @@ from word_table_exporter import (
     _display_width,
     _extract_table,
     _format_export_error,
+    _file_identity,
     _iter_body_blocks,
     _result_key,
     _section_text,
@@ -38,6 +40,7 @@ SYMBOL_OUTPUT_SUFFIX = "_指标参数"
 SYMBOL_SHEET_TITLE = "指标参数"
 SYMBOL_CLAUSE_HEADERS = ("数量序号", "符号", "详细内容（带序号）")
 MAX_SECTION_TEXT_LENGTH = 80
+MAX_SECTION_PREVIEW_LENGTH = 180
 
 # 默认只提取这 4 个符号；需要在「自定义符号」里增删时改这里即可。
 DEFAULT_SYMBOL_CHARS = "★#△▲"
@@ -46,6 +49,33 @@ DEFAULT_SYMBOL_CHARS = "★#△▲"
 COMMON_SYMBOL_CHOICES = (
     "★", "#", "△", "▲",
     "☆", "▽", "▼", "◆", "◇", "●", "○", "■", "□", "※", "◎", "＊", "＃",
+)
+
+# 默认只抽取这些章节标题里的条款（招标文件里 ★ 条款通常集中在采购需求/技术规格）。
+DEFAULT_SECTION_KEYWORDS = (
+    "采购需求",
+    "技术要求",
+    "技术规格",
+    "技术参数",
+    "服务要求",
+    "货物需求",
+    "参数要求",
+)
+
+# 选择章节对话框里可勾选的常用关键词；前若干项即默认关键词。
+COMMON_SECTION_CHOICES = DEFAULT_SECTION_KEYWORDS + (
+    "采购标的",
+    "商务要求",
+)
+
+# 「仅提取指定章节」开启时，默认排除这些标题，避免把评标办法里的引用条款一并抽出。
+# 用户把某词主动加进章节关键词后，对应排除项不再生效。
+DEFAULT_SECTION_EXCLUDE_KEYWORDS = (
+    "评标",
+    "评审",
+    "评分",
+    "投标文件格式",
+    "响应文件格式",
 )
 
 _CN_NUMERAL = "零一二三四五六七八九"
@@ -68,6 +98,18 @@ _SYMBOL_POSITION_TEMPLATE = (
 )
 _symbol_pattern_cache: Dict[str, "re.Pattern"] = {}
 
+# 表格单元格里常把多条参数连续写在一起。遇到不带符号的新编号条款时，
+# 它应结束前一条带符号条款，但本身不应被误并入导出内容。这里的规则比
+# _CLAUSE_NUMBER_PREFIX 更严格：普通行首数字（如“700℃”）不算新条款。
+_NUMBERED_CLAUSE_START = re.compile(
+    r"^\s*(?:"
+    rf"第\s*{_NUM_CHAR}+\s*[章节条款部分项]?"
+    rf"|[（(]\s*{_NUM_CHAR}+(?:\s*[.．、]\s*{_NUM_CHAR}+)*\s*[)）]"
+    rf"|{_NUM_CHAR}+(?:\s*[.．]\s*{_NUM_CHAR}+)+"
+    rf"|{_NUM_CHAR}+\s*[、.．:：)）]"
+    r")"
+)
+
 
 def normalize_symbol_chars(text: str) -> str:
     """清理自定义符号输入：去掉空白、数字、字母和汉字，按顺序去重。
@@ -82,6 +124,93 @@ def normalize_symbol_chars(text: str) -> str:
         if char not in result:
             result.append(char)
     return "".join(result)
+
+
+def normalize_section_keywords(values) -> List[str]:
+    """清理章节关键词：去空白、按逗号/顿号拆分、去掉过短项、按顺序去重。"""
+    if values is None:
+        parts: List[str] = []
+    elif isinstance(values, str):
+        parts = re.split(r"[,，、;；\n/／|]+", values)
+    elif isinstance(values, (list, tuple)):
+        parts = []
+        for item in values:
+            if isinstance(item, str):
+                parts.extend(re.split(r"[,，、;；\n/／|]+", item))
+            elif item is not None:
+                parts.append(str(item))
+    else:
+        parts = [str(values)]
+
+    result: List[str] = []
+    seen = set()
+    for part in parts:
+        text = re.sub(r"\s+", "", part or "")
+        if len(text) < 2 or text in seen:
+            continue
+        result.append(text)
+        seen.add(text)
+    return result
+
+
+def section_matches_keywords(
+    section: str,
+    keywords: Optional[List[str]],
+    exclude_keywords: Optional[List[str]] = None,
+) -> bool:
+    """判断条款所在章节是否应提取。
+
+    keywords 为 None 表示不过滤（全文提取）。
+    否则章节标题须包含至少一个关键词；默认再排除评标/评分等章节，
+    除非用户把排除词自己写进了关键词。
+    """
+    if keywords is None:
+        return True
+    normalized = normalize_section_keywords(keywords)
+    if not normalized:
+        return False
+    text = section or ""
+    if not any(keyword in text for keyword in normalized):
+        return False
+    if exclude_keywords is None:
+        excludes = list(DEFAULT_SECTION_EXCLUDE_KEYWORDS)
+    else:
+        excludes = normalize_section_keywords(exclude_keywords)
+    active_excludes = [
+        item
+        for item in excludes
+        if not any(item in keyword or keyword in item for keyword in normalized)
+    ]
+    return not any(item and item in text for item in active_excludes)
+
+
+def strip_clause_symbols(text: str, symbols: Optional[str] = None) -> str:
+    """去掉条款起始位置的标记符号，保留序号和正文。
+
+    只处理与提取规则相同的位置（行首或序号之后），句子中间出现的符号不动。
+    """
+    if not text:
+        return text
+    pattern = _symbol_pattern(symbols)
+    empty_wrappers = (
+        (r"[（(]\s*[)）]", ""),
+        (r"[【\[]\s*[】\]]", ""),
+        (r"[{〈「『]\s*[}〉」』]", ""),
+    )
+
+    def strip_line(line: str) -> str:
+        def replacer(match: "re.Match") -> str:
+            full = match.group(0)
+            symbol_start = match.start(1) - match.start()
+            symbol_end = match.end(1) - match.start()
+            return full[:symbol_start] + full[symbol_end:]
+
+        stripped = pattern.sub(replacer, line)
+        for wrapper_pattern, replacement in empty_wrappers:
+            stripped = re.sub(wrapper_pattern, replacement, stripped)
+        return stripped
+
+    return "\n".join(strip_line(line) for line in text.splitlines())
 
 
 def _symbol_pattern(symbols: Optional[str]) -> "re.Pattern":
@@ -103,12 +232,158 @@ def _leading_symbols(line: str, symbols: Optional[str] = None) -> List[str]:
     return active
 
 
+def _split_symbol_clause_blocks(
+    text: str,
+    symbols: Optional[str] = None,
+) -> List[Tuple[List[str], str]]:
+    """Split one table cell into independently marked clause blocks.
+
+    A new marker starts a new block. Unmarked continuation lines stay with the
+    active block, while an unmarked numbered clause closes it. Text before the
+    first marker is cell context rather than a marked clause and is omitted.
+    """
+    blocks: List[Tuple[List[str], str]] = []
+    active_symbols: List[str] = []
+    active_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal active_symbols, active_lines
+        block_text = _clean_clause_text("\n".join(active_lines))
+        if active_symbols and block_text:
+            blocks.append((active_symbols, block_text))
+        active_symbols = []
+        active_lines = []
+
+    for line in _clean_clause_text(text).splitlines():
+        line_symbols = _leading_symbols(line, symbols)
+        if line_symbols:
+            flush()
+            active_symbols = line_symbols
+            active_lines = [line]
+            continue
+
+        if not active_lines:
+            continue
+        if _NUMBERED_CLAUSE_START.match(line):
+            flush()
+            continue
+        active_lines.append(line)
+
+    flush()
+    return blocks
+
+
 @dataclass
 class SymbolClause:
     symbol: str
     text: str
     section: str = ""
     source: str = ""
+
+
+@dataclass
+class SymbolSectionScanItem:
+    """One selectable group of symbol clauses in a document section."""
+
+    file_path: str
+    filename: str
+    section: str
+    symbols: Tuple[str, ...]
+    clause_count: int
+    sources: Tuple[str, ...]
+    preview: str
+
+
+def scan_symbol_clause_sections(
+    docx_path: str,
+    symbols: Optional[str] = None,
+) -> List[SymbolSectionScanItem]:
+    """Scan all matching symbol clauses and group them by exact section path."""
+    clauses = extract_symbol_clauses(
+        docx_path,
+        symbols=symbols,
+        keep_symbols_in_text=True,
+        section_keywords=None,
+    )
+    grouped: Dict[str, List[SymbolClause]] = {}
+    for clause in clauses:
+        grouped.setdefault(clause.section or "未识别章节", []).append(clause)
+
+    filename = os.path.basename(docx_path)
+    items: List[SymbolSectionScanItem] = []
+    for section, section_clauses in grouped.items():
+        active_symbols: List[str] = []
+        sources: List[str] = []
+        previews: List[str] = []
+        for clause in section_clauses:
+            if clause.symbol not in active_symbols:
+                active_symbols.append(clause.symbol)
+            if clause.source and clause.source not in sources:
+                sources.append(clause.source)
+            preview_text = _clean_clause_text(clause.text)
+            if preview_text and preview_text not in previews:
+                previews.append(preview_text)
+
+        items.append(SymbolSectionScanItem(
+            file_path=docx_path,
+            filename=filename,
+            section=section,
+            symbols=tuple(active_symbols),
+            clause_count=len(section_clauses),
+            sources=tuple(sources),
+            preview=_shorten(" / ".join(previews[:3]), MAX_SECTION_PREVIEW_LENGTH),
+        ))
+    return items
+
+
+def batch_scan_symbol_clause_sections(
+    file_paths: List[str],
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    symbols: Optional[str] = None,
+) -> Tuple[List[SymbolSectionScanItem], Dict[str, str], Optional[str]]:
+    """Scan symbol-bearing sections from multiple Word files."""
+    items: List[SymbolSectionScanItem] = []
+    skipped: Dict[str, str] = {}
+    errors: List[str] = []
+    legacy_session = None
+
+    try:
+        for index, file_path in enumerate(file_paths):
+            filename = os.path.basename(file_path)
+            if progress_callback:
+                progress_callback(index + 1, len(file_paths), filename)
+
+            extension = os.path.splitext(file_path)[1].lower()
+            if extension not in (".doc", ".docx"):
+                skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
+                continue
+
+            try:
+                if extension == ".doc":
+                    from legacy_office import LegacyOfficeSession, temporary_docx_source
+
+                    if legacy_session is None:
+                        candidate_session = LegacyOfficeSession()
+                        candidate_session.__enter__()
+                        legacy_session = candidate_session
+                    with temporary_docx_source(file_path, legacy_session) as readable_path:
+                        file_items = [
+                            replace(item, file_path=file_path, filename=filename)
+                            for item in scan_symbol_clause_sections(readable_path, symbols=symbols)
+                        ]
+                else:
+                    file_items = scan_symbol_clause_sections(file_path, symbols=symbols)
+                if not file_items:
+                    skipped[_result_key(skipped, filename, file_path)] = "未找到带符号条款"
+                    continue
+                items.extend(file_items)
+            except Exception as exc:
+                errors.append(f"{filename}: {_format_export_error(exc)}")
+    finally:
+        if legacy_session is not None:
+            legacy_session.close()
+
+    return items, skipped, "\n".join(errors) if errors else None
 
 
 def get_symbol_output_path(docx_path: str, output_dir: Optional[str] = None) -> str:
@@ -129,10 +404,15 @@ def get_symbol_output_path(docx_path: str, output_dir: Optional[str] = None) -> 
 def extract_symbol_clauses(
     docx_path: str,
     symbols: Optional[str] = None,
+    keep_symbols_in_text: bool = True,
+    section_keywords: Optional[List[str]] = None,
 ) -> List[SymbolClause]:
     """Extract symbol-marked clauses from body paragraphs and tables in order.
 
     symbols 是参与匹配的符号集合字符串；缺省时只匹配默认的 ★#△▲。
+    keep_symbols_in_text 为 False 时，条款正文不再保留标记符号，符号只出现在
+    导出的「符号」列。section_keywords 为 None 时全文提取；传入列表则只保留
+    章节标题命中这些关键词的条款。
     """
     document = Document(docx_path)
     tracker = _NumberingTracker(document)
@@ -167,14 +447,26 @@ def extract_symbol_clauses(
                 continue
 
             section = _section_text(headings)
-            clause_text = _clean_clause_text(text)
+            if not section_matches_keywords(section, section_keywords):
+                continue
+            clause_text = _finalize_clause_text(text, symbols, keep_symbols_in_text)
+            if not clause_text:
+                continue
             for symbol in symbols_found:
                 clauses.append(SymbolClause(symbol, clause_text, section, "正文"))
             continue
 
         table_index += 1
         clauses.extend(
-            _extract_table_clauses(block, tracker, headings, table_index, symbols)
+            _extract_table_clauses(
+                block,
+                tracker,
+                headings,
+                table_index,
+                symbols,
+                keep_symbols_in_text=keep_symbols_in_text,
+                section_keywords=section_keywords,
+            )
         )
 
     return clauses
@@ -185,6 +477,8 @@ def export_symbol_clauses_to_excel(
     output_path: str,
     clauses: Optional[List[SymbolClause]] = None,
     symbols: Optional[str] = None,
+    keep_symbols_in_text: bool = True,
+    section_keywords: Optional[List[str]] = None,
 ) -> int:
     """Export symbol clauses of one .docx file to one 3-column .xlsx workbook.
 
@@ -196,7 +490,12 @@ def export_symbol_clauses_to_excel(
     from openpyxl.utils import get_column_letter
 
     if clauses is None:
-        clauses = extract_symbol_clauses(docx_path, symbols=symbols)
+        clauses = extract_symbol_clauses(
+            docx_path,
+            symbols=symbols,
+            keep_symbols_in_text=keep_symbols_in_text,
+            section_keywords=section_keywords,
+        )
     if not clauses:
         return 0
 
@@ -246,43 +545,87 @@ def batch_export_symbol_clauses(
     output_dir: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     symbols: Optional[str] = None,
+    keep_symbols_in_text: bool = True,
+    section_keywords: Optional[List[str]] = None,
+    selected_sections: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[Dict[str, Dict[str, object]], Dict[str, str], Optional[str]]:
     """Batch export symbol clauses.
 
     Returns (results, skipped, error_text). results maps original filenames to
     {"count": int, "output_path": str}; skipped maps filenames to a reason.
+    selected_sections maps normalized file identities to exact section paths;
+    when provided, only those per-file sections are exported and the legacy
+    section_keywords filter is ignored.
     """
     results: Dict[str, Dict[str, object]] = {}
     skipped: Dict[str, str] = {}
     errors: List[str] = []
+    legacy_session = None
 
-    for index, file_path in enumerate(file_paths):
-        filename = os.path.basename(file_path)
-        if progress_callback:
-            progress_callback(index + 1, len(file_paths), filename)
+    try:
+        for index, file_path in enumerate(file_paths):
+            filename = os.path.basename(file_path)
+            if progress_callback:
+                progress_callback(index + 1, len(file_paths), filename)
 
-        if os.path.splitext(file_path)[1].lower() != ".docx":
-            skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
-            continue
-
-        try:
-            clauses = extract_symbol_clauses(file_path, symbols=symbols)
-            if not clauses:
-                skipped[_result_key(skipped, filename, file_path)] = "未找到带符号条款"
+            extension = os.path.splitext(file_path)[1].lower()
+            if extension not in (".doc", ".docx"):
+                skipped[_result_key(skipped, filename, file_path)] = "不支持的文件格式"
                 continue
 
-            output_path = get_symbol_output_path(file_path, output_dir)
-            count = export_symbol_clauses_to_excel(file_path, output_path, clauses)
-            if count == 0:
-                skipped[_result_key(skipped, filename, file_path)] = "未找到带符号条款"
-                continue
+            try:
+                exact_sections = None
+                if selected_sections is not None:
+                    exact_sections = set(selected_sections.get(_file_identity(file_path), []))
+                    if not exact_sections:
+                        skipped[_result_key(skipped, filename, file_path)] = "未选择符号章节"
+                        continue
 
-            results[_result_key(results, filename, file_path)] = {
-                "count": count,
-                "output_path": output_path,
-            }
-        except Exception as exc:
-            errors.append(f"{filename}: {_format_export_error(exc)}")
+                readable_path = file_path
+                readable_context = contextlib.nullcontext(file_path)
+                if extension == ".doc":
+                    from legacy_office import LegacyOfficeSession, temporary_docx_source
+
+                    if legacy_session is None:
+                        candidate_session = LegacyOfficeSession()
+                        candidate_session.__enter__()
+                        legacy_session = candidate_session
+                    readable_context = temporary_docx_source(file_path, legacy_session)
+
+                with readable_context as readable_path:
+                    clauses = extract_symbol_clauses(
+                        readable_path,
+                        symbols=symbols,
+                        keep_symbols_in_text=keep_symbols_in_text,
+                        section_keywords=None if exact_sections is not None else section_keywords,
+                    )
+                if exact_sections is not None:
+                    clauses = [clause for clause in clauses if clause.section in exact_sections]
+                if not clauses:
+                    skipped[_result_key(skipped, filename, file_path)] = (
+                        "未找到所选章节中的带符号条款"
+                        if exact_sections is not None
+                        else "未找到指定章节中的带符号条款"
+                        if section_keywords is not None
+                        else "未找到带符号条款"
+                    )
+                    continue
+
+                output_path = get_symbol_output_path(file_path, output_dir)
+                count = export_symbol_clauses_to_excel(file_path, output_path, clauses)
+                if count == 0:
+                    skipped[_result_key(skipped, filename, file_path)] = "未找到带符号条款"
+                    continue
+
+                results[_result_key(results, filename, file_path)] = {
+                    "count": count,
+                    "output_path": output_path,
+                }
+            except Exception as exc:
+                errors.append(f"{filename}: {_format_export_error(exc)}")
+    finally:
+        if legacy_session is not None:
+            legacy_session.close()
 
     return results, skipped, "\n".join(errors) if errors else None
 
@@ -294,14 +637,32 @@ def _clean_clause_text(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _finalize_clause_text(
+    text: str,
+    symbols: Optional[str],
+    keep_symbols_in_text: bool,
+) -> str:
+    cleaned = _clean_clause_text(text)
+    if keep_symbols_in_text:
+        return cleaned
+    return _clean_clause_text(strip_clause_symbols(cleaned, symbols))
+
+
 def _extract_table_clauses(
     table,
     tracker: "_NumberingTracker",
     headings: Dict[int, str],
     table_index: int,
     symbols: Optional[str] = None,
+    keep_symbols_in_text: bool = True,
+    section_keywords: Optional[List[str]] = None,
 ) -> List[SymbolClause]:
-    """Extract whole table rows that carry leading marker symbols in any cell."""
+    """Extract independently marked clause blocks from table rows.
+
+    Plain cells in the same row (such as sequence number and item name) are
+    retained as context. When one cell contains multiple marked clauses, each
+    clause becomes its own result instead of duplicating the whole cell.
+    """
     # 先按文档顺序把表格内（含嵌套表格）所有段落喂给编号跟踪器，
     # 得到“段落 -> 带重建序号文本”的映射，之后提取时只做查找。
     numbered: Dict[object, str] = {}
@@ -323,19 +684,37 @@ def _extract_table_clauses(
     clauses: List[SymbolClause] = []
     for row_index in sorted(rows):
         cell_texts = rows[row_index]
-        row_symbols: List[str] = []
-        for cell_text in cell_texts:
-            for line in cell_text.splitlines():
-                for symbol in _leading_symbols(line, symbols):
-                    if symbol not in row_symbols:
-                        row_symbols.append(symbol)
-
-        if not row_symbols:
+        cell_blocks = [
+            _split_symbol_clause_blocks(cell_text, symbols)
+            for cell_text in cell_texts
+        ]
+        if not any(cell_blocks):
+            continue
+        if not section_matches_keywords(section, section_keywords):
             continue
 
-        row_text = "\n".join(cell_texts)
-        for symbol in row_symbols:
-            clauses.append(SymbolClause(symbol, row_text, section, f"表格{table_index}"))
+        for marked_cell_index, blocks in enumerate(cell_blocks):
+            for block_symbols, block_text in blocks:
+                parts: List[str] = []
+                for cell_index, cell_text in enumerate(cell_texts):
+                    if cell_index == marked_cell_index:
+                        parts.append(block_text)
+                    elif not cell_blocks[cell_index]:
+                        # 序号、名称等不含符号的同排单元格是每条参数的公共上下文。
+                        parts.append(cell_text)
+
+                clause_text = _finalize_clause_text(
+                    "\n".join(parts), symbols, keep_symbols_in_text
+                )
+                if not clause_text:
+                    continue
+                for symbol in block_symbols:
+                    clauses.append(SymbolClause(
+                        symbol,
+                        clause_text,
+                        section,
+                        f"表格{table_index}",
+                    ))
 
     return clauses
 

@@ -2,5 +2,6 @@ python-docx
 openpyxl
 xlrd
 python-pptx
+pywin32; sys_platform == "win32"
 pyinstaller
 tksheet

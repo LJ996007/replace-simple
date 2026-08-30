@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from tkinter import ttk
+from types import SimpleNamespace
 
 import xlwt
 from docx import Document
@@ -28,6 +29,7 @@ from main import (
     append_presets_to_rule_rows,
     collect_supported_files,
     elide_middle,
+    keep_clause_symbols_from_settings,
     normalize_rule_rows,
     normalize_presets,
     presets_from_settings,
@@ -42,7 +44,9 @@ from string_replacer import (
     replace_in_pptx,
 )
 from tender_info_extractor import extract_project_info, extract_project_info_rules
+from symbol_clause_extractor import SymbolSectionScanItem
 from word_table_exporter import (
+    TableScanItem,
     batch_export_word_tables,
     export_word_tables_to_excel,
     get_table_export_output_path,
@@ -70,6 +74,10 @@ class SimpleReplacementTests(unittest.TestCase):
         self.assertIn("[采购人地址]", DEFAULT_PRESETS)
         self.assertEqual(presets_from_settings({}), list(DEFAULT_PRESETS))
         self.assertEqual(presets_from_settings({"presets": []}), [])
+
+    def test_symbol_extract_settings_defaults(self):
+        self.assertFalse(keep_clause_symbols_from_settings({}))
+        self.assertTrue(keep_clause_symbols_from_settings({"keep_clause_symbols": 1}))
 
     def test_normalize_presets_trims_and_dedupes(self):
         self.assertEqual(
@@ -290,10 +298,19 @@ class SimpleReplacementTests(unittest.TestCase):
             exporter._refresh_constrained_texts()
             root.update_idletasks()
 
-            self.assertLess(len(exporter.output_label.cget("text")), len(long_dir))
-            self.assertIn("...", exporter.output_label.cget("text"))
+            shown_path = exporter.output_label.cget("text")
+            self.assertNotIn("\n", shown_path)
+            self.assertLessEqual(
+                app.body_font.measure(shown_path),
+                exporter._output_path_width(),
+            )
             self.assertLessEqual(exporter.output_label.winfo_reqheight(), 40)
-            self.assertLess(len(exporter.status_label.cget("text")), len(exporter.status_var.get()))
+            shown_status = exporter.status_label.cget("text")
+            self.assertNotIn("\n", shown_status)
+            self.assertLessEqual(
+                app.body_font.measure(shown_status),
+                exporter._status_width(),
+            )
             self.assertGreater(exporter.export_button.winfo_reqwidth(), 50)
             exporter.close()
         finally:
@@ -422,17 +439,32 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertTrue(app.table_export_window.exists())
             self.assertEqual(app.table_export_window.window.title(), "提取信息")
             self.assertTrue(hasattr(app.table_export_window, "scan_tree"))
-            self.assertEqual(app.table_export_window.scan_button.cget("text"), "扫描表格")
+            self.assertEqual(app.table_export_window.scan_button.cget("text"), "扫描表格和符号")
+            self.assertTrue(hasattr(app.table_export_window, "keep_symbols_check"))
+            self.assertFalse(app.table_export_window.keep_symbols_var.get())
+            self.assertFalse(hasattr(app.table_export_window, "filter_sections_check"))
+            self.assertFalse(hasattr(app.table_export_window, "customize_sections_button"))
             self.assertGreaterEqual(app.table_export_window.WINDOW_WIDTH, 1200)
-            self.assertGreaterEqual(app.table_export_window.WINDOW_HEIGHT, 880)
-            self.assertGreaterEqual(int(app.table_export_window.scan_tree.cget("height")), 12)
-            self.assertGreaterEqual(int(app.table_export_window.detail_text.cget("height")), 6)
+            self.assertGreaterEqual(app.table_export_window.WINDOW_HEIGHT, 1000)
+            self.assertGreaterEqual(int(app.table_export_window.scan_tree.cget("height")), 18)
+            self.assertGreaterEqual(int(app.table_export_window.detail_text.cget("height")), 10)
+            self.assertEqual(app.table_export_window.window.resizable(), (1, 1))
+            self.assertFalse(bool(app.table_export_window.window.transient()))
             self.assertTrue(hasattr(app.table_export_window, "detail_scrollbar"))
             self.assertEqual(
                 app.table_export_window.scan_tree.cget("columns"),
-                ("selected", "file", "section", "table", "size"),
+                ("selected", "file", "type", "section", "item", "quantity"),
             )
-            self.assertEqual(app.table_export_window.scan_tree.heading("section", "text"), "所在章节")
+            self.assertEqual(app.table_export_window.scan_tree.heading("section", "text"), "所在章节 ▼")
+            self.assertTrue(all(
+                "▼" in app.table_export_window.scan_tree.heading(column, "text")
+                for column in app.table_export_window.scan_tree.cget("columns")
+            ))
+            self.assertTrue(app.table_export_window.scan_tree.bind("<B1-Motion>"))
+            self.assertEqual(
+                app.table_export_window.toggle_visible_selection_button.cget("text"),
+                "筛选结果全选",
+            )
             self.assertNotIn("hint", app.table_export_window.scan_tree.cget("columns"))
             self.assertEqual(
                 len(app.table_export_window._scan_column_separators),
@@ -460,15 +492,131 @@ class SimpleReplacementTests(unittest.TestCase):
             exporter.window.update_idletasks()
             self.assertFalse(bool(exporter.scan_x_scrollbar.grid_info()))
             exporter._sync_scan_tree_x_scrollbar(0.0, 0.7)
-            exporter.window.update_idletasks()
             self.assertTrue(bool(exporter.scan_x_scrollbar.grid_info()))
             exporter._sync_scan_tree_x_scrollbar(0.0, 1.0)
-            exporter.window.update_idletasks()
             self.assertFalse(bool(exporter.scan_x_scrollbar.grid_info()))
 
             app.table_export_window.close()
             root.update_idletasks()
             self.assertIsNone(app.table_export_window)
+        finally:
+            if app is not None and app.table_export_window is not None:
+                app.table_export_window.close()
+            root.destroy()
+
+    def test_combined_scan_rows_start_unselected_and_recommend_tables_only(self):
+        root = create_hidden_root()
+        app = None
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app.open_word_table_exporter()
+            root.update_idletasks()
+            exporter = app.table_export_window
+            file_path = str(Path("C:/fixtures/招标文件.docx"))
+            exporter.file_paths = [file_path]
+            table_item = TableScanItem(
+                file_path=file_path,
+                filename="招标文件.docx",
+                table_index=1,
+                section="第二章 资格审查",
+                context="资格审查表",
+                preview="序号 | 条件",
+                row_count=5,
+                column_count=3,
+                hint="建议关注：资格审查（命中：资格审查）",
+            )
+            symbol_item = SymbolSectionScanItem(
+                file_path=file_path,
+                filename="招标文件.docx",
+                section="第五章 设备技术规范",
+                symbols=("★", "▲"),
+                clause_count=6,
+                sources=("正文", "表格2"),
+                preview="★关键参数 / ▲重要指标",
+            )
+
+            exporter._show_scan_result(
+                [table_item], {}, None, [symbol_item], {}, None
+            )
+            self.assertEqual(len(exporter.scan_tree.get_children()), 2)
+            self.assertEqual(exporter.selected_scan_keys, set())
+            self.assertEqual(exporter.scan_tree.item("1", "values")[2], "表格")
+            self.assertEqual(exporter.scan_tree.item("2", "values")[2], "符号条款")
+
+            root.update_idletasks()
+            heading_y = max(2, exporter._scan_tree_header_height() // 2)
+            type_x = (
+                int(exporter.scan_tree.column("selected", "width"))
+                + int(exporter.scan_tree.column("file", "width"))
+                + int(exporter.scan_tree.column("type", "width")) // 2
+            )
+            self.assertEqual(exporter.scan_tree.identify_region(type_x, heading_y), "heading")
+            exporter._open_scan_filter_from_heading(SimpleNamespace(
+                x=type_x,
+                y=heading_y,
+                x_root=exporter.scan_tree.winfo_rootx() + type_x,
+                y_root=exporter.scan_tree.winfo_rooty() + heading_y,
+            ))
+            self.assertIsNotNone(exporter._filter_popup)
+
+            def walk(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from walk(child)
+
+            filter_listboxes = [
+                child for child in walk(exporter._filter_popup)
+                if isinstance(child, tk.Listbox)
+            ]
+            self.assertEqual(len(filter_listboxes), 1)
+            self.assertEqual(filter_listboxes[0].cget("selectmode"), "multiple")
+            exporter._close_scan_filter_popup()
+
+            exporter._update_scan_tree_column_separators()
+            first_separator = exporter._scan_column_separators[0]
+            old_place = first_separator.place_info()
+            self.assertEqual(
+                int(old_place["height"]),
+                exporter.scan_tree.winfo_height(),
+            )
+            old_x = int(old_place["x"])
+            exporter.scan_tree.column("selected", width=90)
+            exporter._update_scan_tree_column_separators(SimpleNamespace())
+            self.assertGreater(int(first_separator.place_info()["x"]), old_x)
+
+            exporter._set_scan_filter("type", ["符号条款"])
+            self.assertEqual(len(exporter.scan_tree.get_children()), 1)
+            self.assertIn("[筛]", exporter.scan_tree.heading("type", "text"))
+            self.assertEqual(
+                exporter._available_scan_filter_values("type"),
+                ["表格", "符号条款"],
+            )
+            self.assertEqual(
+                exporter.toggle_visible_selection_button.cget("text"),
+                "筛选结果全选",
+            )
+            exporter.toggle_visible_selection_button.invoke()
+            self.assertEqual(exporter.selected_scan_keys, {exporter._scan_key("symbol", symbol_item)})
+            self.assertEqual(
+                exporter.toggle_visible_selection_button.cget("text"),
+                "筛选结果全不选",
+            )
+            exporter.toggle_visible_selection_button.invoke()
+            self.assertEqual(exporter.selected_scan_keys, set())
+            exporter.toggle_visible_selection_button.invoke()
+
+            exporter._set_scan_filter("type", ["表格", "符号条款"])
+            self.assertEqual(len(exporter.scan_tree.get_children()), 2)
+            self.assertNotIn("[筛]", exporter.scan_tree.heading("type", "text"))
+
+            symbol_key = exporter._scan_key("symbol", symbol_item)
+            exporter.selected_scan_keys.add(symbol_key)
+            exporter.select_recommended_tables()
+            self.assertIn(symbol_key, exporter.selected_scan_keys)
+            self.assertIn(exporter._scan_key("table", table_item), exporter.selected_scan_keys)
+
+            exporter.clear_scan_selection()
+            self.assertEqual(exporter.selected_scan_keys, set())
         finally:
             if app is not None and app.table_export_window is not None:
                 app.table_export_window.close()
@@ -793,6 +941,65 @@ class SimpleReplacementTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(results, {"sample.xlsx": 1})
         self.assertEqual(source_value, "建设单位名单")
+
+    def test_batch_replace_outputs_unchanged_file_when_no_content_matches(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            source_dir.mkdir()
+            source_path = source_dir / "sample.docx"
+            document = Document()
+            document.add_paragraph("没有需要替换的内容")
+            document.save(source_path)
+
+            results, error = batch_replace(
+                [str(source_path)],
+                [("采购人", "建设单位")],
+                output_dir=str(output_dir),
+            )
+
+            output_path = output_dir / "sample.docx"
+            output_document = Document(output_path)
+
+            self.assertIsNone(error)
+            self.assertEqual(results, {"sample.docx": 0})
+            self.assertTrue(output_path.exists())
+            self.assertEqual(output_document.paragraphs[0].text, "没有需要替换的内容")
+
+    def test_batch_replace_copies_empty_supported_files_to_output_dir(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            source_dir.mkdir()
+            filenames = [
+                "empty.doc",
+                "empty.docx",
+                "empty.xls",
+                "empty.xlsx",
+                "empty.xlsm",
+                "empty.ppt",
+                "empty.pptx",
+            ]
+            source_paths = []
+            for filename in filenames:
+                source_path = source_dir / filename
+                source_path.touch()
+                source_paths.append(str(source_path))
+
+            results, error = batch_replace(
+                source_paths,
+                [("采购人", "建设单位")],
+                output_dir=str(output_dir),
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(results, {filename: 0 for filename in filenames})
+            for filename in filenames:
+                output_path = output_dir / filename
+                self.assertTrue(output_path.exists())
+                self.assertEqual(output_path.stat().st_size, 0)
 
     def test_batch_replace_uses_distinct_outputs_for_same_filename(self):
         with TemporaryDirectory() as tmp_dir:
