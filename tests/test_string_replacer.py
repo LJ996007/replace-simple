@@ -657,9 +657,10 @@ class SimpleReplacementTests(unittest.TestCase):
             ]
             app.add_selected_presets()
             self.assertEqual(
-                app.get_rules_from_table(),
+                normalize_rule_rows(app.rules_sheet.get_sheet_data()),
                 [("[项目名称]", ""), ("[项目编号]", "")],
             )
+            self.assertEqual(app.get_rules_from_table(), [])
         finally:
             root.destroy()
 

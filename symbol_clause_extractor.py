@@ -292,11 +292,13 @@ class SymbolSectionScanItem:
     clause_count: int
     sources: Tuple[str, ...]
     preview: str
+    clauses: Tuple[SymbolClause, ...] = ()
 
 
 def scan_symbol_clause_sections(
     docx_path: str,
     symbols: Optional[str] = None,
+    document=None,
 ) -> List[SymbolSectionScanItem]:
     """Scan all matching symbol clauses and group them by exact section path."""
     clauses = extract_symbol_clauses(
@@ -304,6 +306,7 @@ def scan_symbol_clause_sections(
         symbols=symbols,
         keep_symbols_in_text=True,
         section_keywords=None,
+        document=document,
     )
     grouped: Dict[str, List[SymbolClause]] = {}
     for clause in clauses:
@@ -332,6 +335,7 @@ def scan_symbol_clause_sections(
             clause_count=len(section_clauses),
             sources=tuple(sources),
             preview=_shorten(" / ".join(previews[:3]), MAX_SECTION_PREVIEW_LENGTH),
+            clauses=tuple(section_clauses),
         ))
     return items
 
@@ -406,6 +410,7 @@ def extract_symbol_clauses(
     symbols: Optional[str] = None,
     keep_symbols_in_text: bool = True,
     section_keywords: Optional[List[str]] = None,
+    document=None,
 ) -> List[SymbolClause]:
     """Extract symbol-marked clauses from body paragraphs and tables in order.
 
@@ -414,7 +419,8 @@ def extract_symbol_clauses(
     导出的「符号」列。section_keywords 为 None 时全文提取；传入列表则只保留
     章节标题命中这些关键词的条款。
     """
-    document = Document(docx_path)
+    if document is None:
+        document = Document(docx_path)
     tracker = _NumberingTracker(document)
     clauses: List[SymbolClause] = []
     headings: Dict[int, str] = {}
@@ -519,6 +525,7 @@ def export_symbol_clauses_to_excel(
             values = (str(row_index - 1), clause.symbol, clause.text)
             for column, value in enumerate(values, start=1):
                 cell = worksheet.cell(row=row_index, column=column, value=value)
+                cell.data_type = "s"
                 cell.number_format = "@"
                 cell.alignment = center_top if column < 3 else wrap_top
                 cell.border = border

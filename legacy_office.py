@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from file_io import atomic_output_path
 
 
 LEGACY_EXTENSIONS = (".doc", ".xls", ".ppt")
@@ -230,28 +231,11 @@ class LegacyOfficeSession:
 @contextlib.contextmanager
 def _atomic_editable_copy(file_path: str, output_path: str) -> Iterator[str]:
     """在同目录同扩展名临时副本中修改，成功后原子替换最终文件。"""
-    output_path = os.path.abspath(output_path)
-    output_dir = os.path.dirname(output_path)
-    os.makedirs(output_dir, exist_ok=True)
-    suffix = os.path.splitext(output_path)[1]
-    descriptor, temporary_path = tempfile.mkstemp(
-        prefix=".replace-simple-",
-        suffix=suffix,
-        dir=output_dir,
-    )
-    os.close(descriptor)
-    try:
+    with atomic_output_path(output_path) as temporary_path:
         shutil.copy2(file_path, temporary_path)
         yield temporary_path
         if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) == 0:
             raise OfficeSaveError("Office 未生成有效的输出文件")
-        os.replace(temporary_path, output_path)
-    finally:
-        try:
-            if os.path.exists(temporary_path):
-                os.remove(temporary_path)
-        except OSError:
-            pass
 
 
 def _prepared_rules(rules: Sequence[Tuple[str, str]]):
@@ -440,6 +424,7 @@ def _replace_in_excel_workbook(workbook, rules: Sequence[Tuple[str, str]]) -> in
                     continue
                 new_value, replaced_count = _replace_text_with_rules(text, prepared)
                 if replaced_count:
+                    cell.NumberFormat = "@"
                     cell.Value = new_value
                     total_count += replaced_count
             except LegacyOfficeError:

@@ -1,791 +1,53 @@
-"""
-replace-simple GUI 入口。
-只保留批量文本替换功能。
-"""
+"""批量替换主窗口与程序入口。"""
 
 import ctypes
-import json
 import os
-import queue
-import sys
-import threading
 import tkinter as tk
 import tkinter.font as tkfont
-import traceback
-from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
-
 from tksheet import Sheet
-
 from app_info import format_changelog, format_version_title
-
-# string_replacer 会拖入 openpyxl(~290ms)+ docx(~100ms)，合计约 400ms。
-# 改为按需延迟导入：仅在「导入 Excel」或「开始替换」时加载，让窗口瞬间弹出。
-
-
-DEFAULT_BLANK_RULE_ROWS = 4
-DEFAULT_PRESETS = (
-    "[项目名称]",
-    "[项目编号]",
-    "[标的名称]",
-    "[采购人名称]",
-    "[采购人联系人]",
-    "[采购人电话]",
-    "[开标时间]",
-    "[开标日期]",
-    "[招标公告日期]",
-    "[开标地点]",
-    "[报名人数]",
-    "[采购人地址]",
+from app_settings import load_settings, save_settings
+from replacement_rules import DELETE_MARKER, normalize_rule_rows, validate_rules
+from ui_common import (
+    DEFAULT_BLANK_RULE_ROWS,
+    DEFAULT_PRESETS,
+    SUPPORTED_EXTENSIONS,
+    WORD_EXTENSIONS,
+    DEFAULT_SYMBOL_CHARS,
+    COMPRESSED_SHEET_HEIGHT,
+    MIN_SHEET_HEIGHT,
+    TASK_POLL_INTERVAL_MS,
+    FOLDER_SCAN_PROGRESS_INTERVAL,
+    OUTPUT_DIR_HINT,
+    OUTPUT_DIR_MAX_LINES,
+    GRID_COLOR,
+    HEADER_GRID_COLOR,
+    HEADER_BG,
+    ZEBRA_BG,
+    elide_middle,
+    HoverTooltip,
+    ElidedTextController,
+    CanvasCheckbox,
+    center_window_on_parent,
+    write_error_log,
+    install_exception_handlers,
+    normalize_presets,
+    presets_from_settings,
+    symbol_chars_from_settings,
+    keep_clause_symbols_from_settings,
+    append_presets_to_rule_rows,
+    resource_path,
+    make_blank_rows,
+    _file_identity,
+    remove_matching_file_paths,
+    collect_supported_files,
+    BackgroundTaskRunner,
+    CappedScrollbarModel,
+    FlatScrollbar,
+    cap_existing_scrollbar,
 )
-SUPPORTED_EXTENSIONS = (".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx")
-WORD_EXTENSIONS = (".doc", ".docx")
-# 指标参数提取的默认符号，与 symbol_clause_extractor.DEFAULT_SYMBOL_CHARS 保持一致。
-# 这里单独定义一份是为了避免启动时加载 docx 依赖（symbol_clause_extractor 会引入它）。
-DEFAULT_SYMBOL_CHARS = "★#△▲"
-APP_STATE_DIR_NAME = "replace-simple"
-ERROR_LOG_NAME = "error.log"
-SETTINGS_NAME = "settings.json"
-
-COMPRESSED_SHEET_HEIGHT = 210      # 基准规则表像素高度（默认窗口下约露 6 行 + 表头，且底部按钮可见）
-MIN_SHEET_HEIGHT = 120             # 窗口较矮或系统缩放较大时，优先保住底部操作区
-TASK_POLL_INTERVAL_MS = 40
-FOLDER_SCAN_PROGRESS_INTERVAL = 100
-OUTPUT_DIR_HINT = "未选择则输出到原文件目录；文件名按规则同步替换，同名时直接覆盖原文件"
-OUTPUT_DIR_MAX_LINES = 2           # 长路径最多占两行，避免把「开始替换」顶出可视区
-
-# 网格线配色（护眼浅色版）：略降亮度与冷蓝感，长时间观看更柔和。
-# tksheet 网格线宽度硬编码 1px，靠颜色保持可辨。
-GRID_COLOR = "#A0A7B2"          # 数据区网格线（柔和中灰）
-HEADER_GRID_COLOR = "#8B929C"   # 表头/序号列网格线（略深于数据区）
-HEADER_BG = "#E8EBEF"           # 表头/序号列底色（低于纯浅灰）
-ZEBRA_BG = "#EEF0F3"            # 斑马纹底色
-
-def _app_data_dir(env_name):
-    base = os.environ.get(env_name) or os.path.expanduser("~")
-    return os.path.join(base, APP_STATE_DIR_NAME)
-
-
-def error_log_path():
-    return os.path.join(_app_data_dir("LOCALAPPDATA"), ERROR_LOG_NAME)
-
-
-def settings_path():
-    return os.path.join(_app_data_dir("APPDATA"), SETTINGS_NAME)
-
-
-def elide_middle(text, font, max_width, ellipsis="..."):
-    """把文本中间省略，使像素宽度不超过 max_width。路径会多留尾部目录名。"""
-    if not text or max_width <= 0:
-        return text
-    if font.measure(text) <= max_width:
-        return text
-
-    ellipsis_w = font.measure(ellipsis)
-    if ellipsis_w >= max_width:
-        for index in range(len(ellipsis), 0, -1):
-            piece = ellipsis[:index]
-            if font.measure(piece) <= max_width:
-                return piece
-        return ""
-
-    low, high = 0, len(text)
-    best = ellipsis
-    while low <= high:
-        keep = (low + high) // 2
-        if keep <= 0:
-            candidate = ellipsis
-        else:
-            head = max(1, keep * 2 // 5)
-            tail = keep - head
-            candidate = text[:head] + ellipsis + text[-tail:] if tail > 0 else text[:keep] + ellipsis
-        if font.measure(candidate) <= max_width:
-            best = candidate
-            low = keep + 1
-        else:
-            high = keep - 1
-    return best
-
-
-class HoverTooltip:
-    """鼠标悬停时显示完整文本，仅在控件展示内容被截断时出现。"""
-
-    def __init__(self, widget, text_getter, font, *, wraplength=480, fg="#2B2F36", shown_getter=None):
-        self.widget = widget
-        self.text_getter = text_getter
-        self.shown_getter = shown_getter
-        self.font = font
-        self.wraplength = wraplength
-        self.fg = fg
-        self._tip = None
-        widget.bind("<Enter>", self._show, add="+")
-        widget.bind("<Leave>", self._hide, add="+")
-        widget.bind("<Destroy>", lambda _event: self._hide(), add="+")
-
-    def _shown_text(self):
-        if self.shown_getter is not None:
-            try:
-                return str(self.shown_getter() or "")
-            except Exception:
-                return ""
-        try:
-            return str(self.widget.cget("text") or "")
-        except Exception:
-            return ""
-
-    def _show(self, _event=None):
-        self._hide()
-        try:
-            full = self.text_getter()
-        except Exception:
-            return
-        if not full:
-            return
-        if self._shown_text() == full:
-            return
-        tip = tk.Toplevel(self.widget)
-        tip.wm_overrideredirect(True)
-        try:
-            tip.wm_attributes("-topmost", True)
-        except Exception:
-            pass
-        tk.Label(
-            tip,
-            text=full,
-            justify="left",
-            background="#FFF8DC",
-            foreground=self.fg,
-            relief="solid",
-            borderwidth=1,
-            font=self.font,
-            wraplength=self.wraplength,
-            padx=8,
-            pady=5,
-        ).pack()
-        try:
-            x = self.widget.winfo_rootx()
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-            tip.geometry(f"+{x}+{y}")
-        except Exception:
-            tip.destroy()
-            return
-        self._tip = tip
-
-    def _hide(self, _event=None):
-        tip = self._tip
-        self._tip = None
-        if tip is None:
-            return
-        try:
-            tip.destroy()
-        except Exception:
-            pass
-
-    def hide(self):
-        self._hide()
-
-
-class ElidedTextController:
-    """把 Label 上的长文本限制在可用宽度内，避免把同行按钮挤出窗口。"""
-
-    def __init__(
-        self,
-        label,
-        font,
-        width_getter,
-        *,
-        max_lines=1,
-        tooltip=False,
-        tooltip_font=None,
-        tooltip_fg=None,
-        fallback_width=360,
-    ):
-        self.label = label
-        self.font = font
-        self.width_getter = width_getter
-        self.max_lines = max(1, int(max_lines))
-        self.fallback_width = fallback_width
-        self.full_text = str(label.cget("text") or "")
-        self._tooltip = None
-        if tooltip:
-            self._tooltip = HoverTooltip(
-                label,
-                lambda: self.full_text,
-                tooltip_font or font,
-                fg=tooltip_fg or "#2B2F36",
-            )
-
-    def attach_var(self, var):
-        """让 StringVar 的每次写入都自动按宽度省略显示。"""
-        var.trace_add("write", lambda *_args: self.set_text(var.get()))
-        self.set_text(var.get())
-        return self
-
-    def set_text(self, text, **label_kwargs):
-        self.full_text = "" if text is None else str(text)
-        if label_kwargs:
-            try:
-                self.label.configure(**label_kwargs)
-            except tk.TclError:
-                return
-        self.refresh()
-
-    def refresh(self):
-        try:
-            if not self.label.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        try:
-            width = int(self.width_getter() or 0)
-        except Exception:
-            width = 0
-        if width <= 1:
-            width = self.fallback_width
-        if self.max_lines > 1:
-            try:
-                current = int(float(self.label.cget("wraplength") or 0))
-            except (TypeError, ValueError, tk.TclError):
-                current = 0
-            if current != width:
-                self.label.configure(wraplength=width)
-        displayed = elide_middle(self.full_text, self.font, width * self.max_lines)
-        try:
-            if str(self.label.cget("text") or "") != displayed:
-                self.label.configure(text=displayed)
-        except tk.TclError:
-            pass
-
-    def hide_tooltip(self):
-        if self._tooltip is not None:
-            self._tooltip.hide()
-
-
-class CanvasCheckbox:
-    """手绘复选框：方框 + 蓝色对勾。
-
-    ttk 的 clam 主题不支持自定义选中标记（画出来是叉 ✕），与「预设」
-    下拉面板保持一致，全部用 Canvas 自绘对勾 ✓。variable 变化时自动
-    重绘，外部直接改 var 也能同步显示。
-    """
-
-    def __init__(
-        self,
-        parent,
-        text,
-        variable,
-        app,
-        command=None,
-        font=None,
-        background=None,
-        padx=10,
-        pady=7,
-        box_size=14,
-    ):
-        self.text = text
-        self.variable = variable
-        self.app = app
-        self.command = command
-        self.box_size = box_size
-        self.padx = padx
-        self.background = background or app.surface_bg
-        self.font = font or app.body_font
-
-        try:
-            text_width = self.font.measure(text)
-            line_space = self.font.metrics("linespace")
-        except tk.TclError:
-            text_width = 60
-            line_space = 18
-        self.height = max(box_size + 2 * pady, line_space + 2 * pady)
-
-        self.canvas = tk.Canvas(
-            parent,
-            width=padx + box_size + 8 + text_width + padx,
-            height=self.height,
-            bg=self.background,
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        self._hover = False
-        variable.trace_add("write", lambda *_args: self.redraw())
-        self.canvas.bind("<Button-1>", self._on_click)
-        self.canvas.bind("<Enter>", lambda _event: self._set_hover(True))
-        self.canvas.bind("<Leave>", lambda _event: self._set_hover(False))
-        self.redraw()
-
-    def _set_hover(self, hover):
-        if self._hover != hover:
-            self._hover = hover
-            self.redraw()
-
-    def _on_click(self, _event=None):
-        self.variable.set(not self.variable.get())
-        if self.command:
-            self.command()
-
-    def toggle(self):
-        self._on_click()
-
-    def redraw(self):
-        canvas = self.canvas
-        selected = bool(self.variable.get())
-        if selected:
-            background = "#E3EDF8"
-        elif self._hover:
-            background = "#EDF1F6"
-        else:
-            background = self.background
-        try:
-            canvas.configure(bg=background)
-        except tk.TclError:
-            return
-
-        box = self.box_size
-        x0 = self.padx
-        y0 = (self.height - box) // 2
-        canvas.delete("all")
-        canvas.create_rectangle(
-            x0, y0, x0 + box, y0 + box,
-            outline=self.app.accent_fg if selected else "#6F7B88",
-            width=1,
-            fill="#F7F8FA",
-        )
-        if selected:
-            # 对勾三个点按 13px 方框的比例缩放，加圆角端点
-            scale = box / 13.0
-            canvas.create_line(
-                x0 + 3 * scale, y0 + 6 * scale,
-                x0 + 6.5 * scale, y0 + 10 * scale,
-                x0 + 11 * scale, y0 + 3 * scale,
-                fill=self.app.accent_fg,
-                width=2,
-                capstyle="round",
-                joinstyle="round",
-            )
-        canvas.create_text(
-            x0 + box + 8, self.height // 2,
-            text=self.text,
-            anchor="w",
-            font=self.font,
-            fill=self.app.text_fg,
-        )
-
-
-def center_window_on_parent(window, parent, width=None, height=None):
-    """把子窗口放到父窗口可视区域正中央，避免默认落在屏幕左上角。
-
-    子窗口比父窗口更大时也会按中心对齐，并尽量夹在屏幕可见范围内。
-    """
-    try:
-        parent.update_idletasks()
-        window.update_idletasks()
-    except Exception:
-        pass
-
-    if width is None or height is None:
-        try:
-            current_w = window.winfo_width()
-            current_h = window.winfo_height()
-        except Exception:
-            current_w = current_h = 1
-        if width is None:
-            width = current_w if current_w > 1 else window.winfo_reqwidth()
-        if height is None:
-            height = current_h if current_h > 1 else window.winfo_reqheight()
-
-    width = int(width)
-    height = int(height)
-
-    try:
-        parent_x = parent.winfo_rootx()
-        parent_y = parent.winfo_rooty()
-        parent_w = parent.winfo_width()
-        parent_h = parent.winfo_height()
-    except Exception:
-        window.geometry(f"{width}x{height}")
-        return f"{width}x{height}"
-
-    if parent_w <= 1 or parent_h <= 1:
-        window.geometry(f"{width}x{height}")
-        return f"{width}x{height}"
-
-    # 允许负偏移：子窗口大于父窗口时仍相对父窗口中心对齐
-    x = parent_x + (parent_w - width) // 2
-    y = parent_y + (parent_h - height) // 2
-    try:
-        screen_w = int(parent.winfo_screenwidth())
-        screen_h = int(parent.winfo_screenheight())
-        if screen_w > 0 and screen_h > 0:
-            x = max(0, min(x, max(screen_w - width, 0)))
-            y = max(0, min(y, max(screen_h - height, 0)))
-    except Exception:
-        pass
-
-    geometry = f"{width}x{height}+{x}+{y}"
-    # 一次性写入宽高与坐标；Windows 上 withdraw 时 geometry() 读回值可能仍是默认值，
-    # 以本次写入值为准，显示后再校正一次即可。
-    window.geometry(geometry)
-    return geometry
-
-
-def write_error_log(exc_type, exc_value, exc_tb, context="未捕获异常"):
-    path = error_log_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
-        "\n" + "=" * 72 + "\n",
-        f"时间：{timestamp}\n",
-        f"位置：{context}\n",
-        "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
-    ]
-    with open(path, "a", encoding="utf-8") as file:
-        file.writelines(lines)
-    return path
-
-
-def install_exception_handlers(root):
-    def _handle_exception(exc_type, exc_value, exc_tb, context):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_tb)
-            return
-        try:
-            log_path = write_error_log(exc_type, exc_value, exc_tb, context=context)
-        except Exception:
-            log_path = error_log_path()
-        try:
-            messagebox.showerror(
-                "程序出错",
-                "程序遇到未处理错误，详细信息已写入日志：\n"
-                f"{log_path}\n\n"
-                "可以把这个日志文件发给维护人员排查。",
-                parent=root if root and root.winfo_exists() else None,
-            )
-        except Exception:
-            pass
-
-    sys.excepthook = lambda exc_type, exc_value, exc_tb: _handle_exception(
-        exc_type, exc_value, exc_tb, "主线程"
-    )
-    root.report_callback_exception = lambda exc_type, exc_value, exc_tb: _handle_exception(
-        exc_type, exc_value, exc_tb, "Tk 回调"
-    )
-
-
-def load_settings():
-    path = settings_path()
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_settings(data):
-    path = settings_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-
-
-def normalize_presets(values):
-    """清理预设名称，并在保留顺序的同时去重。"""
-    if not isinstance(values, (list, tuple)):
-        return []
-    result = []
-    seen = set()
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        value = value.strip()
-        if not value or value in seen:
-            continue
-        result.append(value)
-        seen.add(value)
-    return result
-
-
-def presets_from_settings(settings):
-    """首次运行使用系统预设；用户保存过空列表时也尊重该设置。"""
-    if isinstance(settings, dict) and isinstance(settings.get("presets"), list):
-        return normalize_presets(settings["presets"])
-    return list(DEFAULT_PRESETS)
-
-
-def symbol_chars_from_settings(settings):
-    """读取自定义提取符号；保存时已清洗过，这里只做基本类型校验。"""
-    value = settings.get("symbol_chars") if isinstance(settings, dict) else None
-    if isinstance(value, str) and value.strip():
-        return value
-    return DEFAULT_SYMBOL_CHARS
-
-
-def keep_clause_symbols_from_settings(settings):
-    """条款正文是否保留标记符号；未保存过时默认不保留，只写入符号列。"""
-    if isinstance(settings, dict) and "keep_clause_symbols" in settings:
-        return bool(settings["keep_clause_symbols"])
-    return False
-
-
-def append_presets_to_rule_rows(rows, selected_presets):
-    """把尚不存在的预设追加为原文本规则，并返回新增数量。"""
-    clean_rows = []
-    existing_old_texts = set()
-    for row in rows or []:
-        values = list(row) if isinstance(row, (list, tuple)) else [row]
-        old_text = "" if not values or values[0] is None else str(values[0])
-        new_text = "" if len(values) < 2 or values[1] is None else str(values[1])
-        if old_text or new_text:
-            clean_rows.append([old_text, new_text])
-        if old_text:
-            existing_old_texts.add(old_text)
-
-    added = 0
-    for preset in normalize_presets(selected_presets):
-        if preset in existing_old_texts:
-            continue
-        clean_rows.append([preset, ""])
-        existing_old_texts.add(preset)
-        added += 1
-    return clean_rows, added
-
-
-def resource_path(name):
-    """资源文件绝对路径：开发时取源码目录，PyInstaller 打包后取运行时目录(_MEIPASS)。"""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
-
-
-def normalize_rule_rows(rows):
-    """将界面规则行整理为替换规则，跳过空原文并按精确规则对去重。"""
-    rules = []
-    seen = set()
-
-    for row in rows:
-        old_value = row[0] if len(row) > 0 else ""
-        new_value = row[1] if len(row) > 1 else ""
-        old_text = "" if old_value is None else str(old_value).strip()
-        new_text = "" if new_value is None else str(new_value).strip()
-
-        if not old_text:
-            continue
-
-        pair = (old_text, new_text)
-        if pair in seen:
-            continue
-
-        seen.add(pair)
-        rules.append(pair)
-
-    return rules
-
-
-def make_blank_rows(count):
-    """生成 count 个相互独立的空规则行。
-
-    不能用 [["", ""]] * count —— 那样得到的是同一个列表对象的多个引用，
-    tksheet 直接持有这些行，编辑任一行时（data[r][c] = value）会连带改写
-    所有共享引用的行，表现为「输入一行，其余行跟着一起变」。
-    """
-    return [["", ""] for _ in range(max(count, 0))]
-
-
-def _file_identity(path):
-    """生成用于判断同一文件的规范化路径。"""
-    return os.path.normcase(os.path.abspath(os.path.realpath(os.fspath(path))))
-
-
-def remove_matching_file_paths(file_paths, target_path):
-    """从文件列表中移除与 target_path 指向同一文件的路径。"""
-    target_identity = _file_identity(target_path)
-    remaining = []
-    removed = []
-
-    for file_path in file_paths:
-        if _file_identity(file_path) == target_identity:
-            removed.append(file_path)
-        else:
-            remaining.append(file_path)
-
-    return remaining, removed
-
-
-def collect_supported_files(directory, extensions, progress_callback=None):
-    """递归收集支持的文件，跳过 Office 创建的临时文件。"""
-    collected = []
-    scanned_count = 0
-
-    for root_dir, _dirs, files in os.walk(directory):
-        for filename in files:
-            scanned_count += 1
-            if filename.startswith("~$"):
-                continue
-            file_path = os.path.join(root_dir, filename)
-            if os.path.splitext(filename)[1].lower() in extensions:
-                collected.append(file_path)
-            if progress_callback and scanned_count % FOLDER_SCAN_PROGRESS_INTERVAL == 0:
-                progress_callback(scanned_count)
-
-    if progress_callback:
-        progress_callback(scanned_count)
-    return collected
-
-
-class BackgroundTaskRunner:
-    """通过队列把后台任务结果安全地交回 Tk 主线程。"""
-
-    def __init__(self, widget):
-        self.widget = widget
-        self._events = queue.Queue()
-        self._active = False
-        self._on_progress = None
-        self._on_success = None
-        self._on_error = None
-
-    @property
-    def active(self):
-        return self._active
-
-    def submit(self, work, on_success, on_error, on_progress=None):
-        if self._active:
-            return False
-
-        self._active = True
-        self._on_progress = on_progress
-        self._on_success = on_success
-        self._on_error = on_error
-
-        def publish_progress(*args):
-            self._events.put(("progress", args))
-
-        def task():
-            try:
-                result = work(publish_progress)
-            except Exception as exc:
-                self._events.put(("error", (exc,)))
-            else:
-                self._events.put(("success", (result,)))
-
-        threading.Thread(target=task, daemon=True).start()
-        self._poll_events()
-        return True
-
-    def _poll_events(self):
-        latest_progress = None
-        completion = None
-
-        while True:
-            try:
-                event_name, args = self._events.get_nowait()
-            except queue.Empty:
-                break
-            if event_name == "progress":
-                latest_progress = args
-            else:
-                completion = (event_name, args)
-
-        if latest_progress and self._on_progress:
-            self._on_progress(*latest_progress)
-
-        if completion:
-            event_name, args = completion
-            on_success = self._on_success
-            on_error = self._on_error
-            self._active = False
-            self._on_progress = None
-            self._on_success = None
-            self._on_error = None
-            if event_name == "success" and on_success:
-                on_success(*args)
-            elif event_name == "error" and on_error:
-                on_error(*args)
-            return
-
-        if self._active:
-            self.widget.after(TASK_POLL_INTERVAL_MS, self._poll_events)
-
-
-class CappedScrollbarModel:
-    """限制滑块最大视觉长度，同时保持拖动位置与真实滚动范围一致。"""
-
-    def __init__(self, command, display_setter, max_thumb_fraction=0.72):
-        self.command = command
-        self.display_setter = display_setter
-        self.max_thumb_fraction = max_thumb_fraction
-        self.actual_first = 0.0
-        self.actual_last = 1.0
-        self.display_span = max_thumb_fraction
-
-    def set(self, first, last):
-        first = float(first)
-        last = float(last)
-        self.actual_first = first
-        self.actual_last = last
-        actual_span = max(0.0, min(last - first, 1.0))
-        self.display_span = min(actual_span, self.max_thumb_fraction)
-
-        actual_range = max(1.0 - actual_span, 0.0)
-        display_range = max(1.0 - self.display_span, 0.0)
-        if actual_range <= 1e-9:
-            display_first = display_range / 2
-        else:
-            display_first = (first / actual_range) * display_range
-        display_first = max(0.0, min(display_first, display_range))
-        self.display_setter(display_first, display_first + self.display_span)
-
-    def dispatch(self, *args):
-        if not args:
-            return
-        if args[0] == "moveto" and len(args) >= 2:
-            actual_span = max(self.actual_last - self.actual_first, 0.0)
-            actual_range = max(1.0 - actual_span, 0.0)
-            display_range = max(1.0 - self.display_span, 0.0)
-            if actual_range <= 1e-9 or display_range <= 1e-9:
-                return
-            display_first = max(0.0, min(float(args[1]), display_range))
-            actual_first = (display_first / display_range) * actual_range
-            self.command("moveto", actual_first)
-            return
-        self.command(*args)
-
-
-class FlatScrollbar(ttk.Scrollbar):
-    """带扁平箭头、淡蓝配色和限长滑块的统一滚动条。"""
-
-    def __init__(self, parent, *, command, orient="vertical", **kwargs):
-        style_name = (
-            "Flat.Vertical.TScrollbar" if orient == "vertical"
-            else "Flat.Horizontal.TScrollbar"
-        )
-        kwargs.setdefault("style", style_name)
-        super().__init__(parent, orient=orient, **kwargs)
-        self._capped_model = CappedScrollbarModel(command, super().set)
-        self.configure(command=self._capped_model.dispatch)
-
-    def set(self, first, last):
-        self._capped_model.set(first, last)
-
-
-def cap_existing_scrollbar(scrollbar, command, scrollable, orientation="vertical"):
-    """给第三方控件内部已创建的 ttk 滚动条套用统一样式与限长模型。"""
-    style_name = (
-        "Flat.Vertical.TScrollbar" if orientation == "vertical"
-        else "Flat.Horizontal.TScrollbar"
-    )
-    scrollbar.configure(style=style_name)
-    display_setter = lambda first, last: ttk.Scrollbar.set(scrollbar, first, last)
-    model = CappedScrollbarModel(command, display_setter)
-    scrollbar.configure(command=model.dispatch)
-    if orientation == "vertical":
-        scrollable.configure(yscrollcommand=model.set)
-    else:
-        scrollable.configure(xscrollcommand=model.set)
-    scrollbar._capped_model = model
-    return model
+from word_export_window import WordTableExportWindow
 
 
 class ReplaceSimpleApp:
@@ -807,6 +69,7 @@ class ReplaceSimpleApp:
         self._last_output_dir_to_open = None
         self._rules_resize_after = None
         self.table_export_window = None
+        self._project_info_details = []
         if restore_session:
             settings = load_settings()
             self.presets = presets_from_settings(settings)
@@ -1168,7 +431,17 @@ class ReplaceSimpleApp:
         rules_toolbar.grid(row=0, column=1, sticky="e")
         self._create_busy_button(rules_toolbar, text="新增一行", command=self.add_rule_row, width=9).pack(side="left", padx=(0, 6))
         self._create_busy_button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=9).pack(side="left", padx=(0, 6))
-        self._create_busy_button(rules_toolbar, text="清空规则", command=self.clear_rules, width=9).pack(side="left", padx=(0, 6))
+        more = ttk.Menubutton(rules_toolbar, text="更多 ▼", width=9)
+        more.pack(side="left", padx=(0, 6))
+        self._busy_widgets.append(more)
+        menu = tk.Menu(more, tearoff=False)
+        menu.add_command(label="将选中规则设为明确删除", command=self.mark_selected_rules_for_deletion)
+        menu.add_command(label="保存规则为 Excel…", command=self.save_rules_to_excel)
+        menu.add_command(label="执行前检查", command=self.preview_replacement)
+        menu.add_command(label="查看项目信息来源", command=self.show_project_info_details)
+        menu.add_separator()
+        menu.add_command(label="清空规则", command=self.clear_rules)
+        more.configure(menu=menu)
         self._create_busy_button(rules_toolbar, text="导入 Excel", command=self.import_rules_from_excel, width=10).pack(side="left", padx=(0, 6))
         self._create_busy_button(rules_toolbar, text="导入招标文件", command=self.import_rules_from_tender_file, width=13).pack(side="left", padx=(0, 6))
         self.preset_button = self._create_busy_button(
@@ -1178,7 +451,7 @@ class ReplaceSimpleApp:
 
         self.rules_hint = ttk.Label(
             rules_frame,
-            text="双击单元格可编辑；可从 Excel、招标 Word 或预设添加规则；执行时按原文长度长词优先。",
+            text=f"空白替换值跳过；明确删除请用“更多”或填入 {DELETE_MARKER}；同原文冲突须先修正。",
             style="Hint.TLabel",
         )
         self.rules_hint.grid(row=1, column=0, sticky="ew", pady=(4, 6))
@@ -1574,7 +847,7 @@ class ReplaceSimpleApp:
         data = {
             "geometry": self.root.geometry(),
             "output_dir": self.output_dir,
-            "rules": self.get_rules_from_table(),
+            "rules": normalize_rule_rows(self.rules_sheet.get_sheet_data()),
             "presets": self.presets,
             "symbol_chars": self.symbol_chars,
             "keep_clause_symbols": bool(self.keep_clause_symbols),
@@ -1718,9 +991,65 @@ class ReplaceSimpleApp:
             self._refresh_rules_sheet_view()
 
     def get_rules_from_table(self):
-        """从表格读取并归一化规则（跳过空原文、按精确规则对去重）。"""
+        """未填写的规则保留在界面，仅返回可执行的规则。"""
         rows = self.rules_sheet.get_sheet_data()
-        return normalize_rule_rows(rows)
+        return [(old, new) for old, new in normalize_rule_rows(rows) if new]
+
+    def mark_selected_rules_for_deletion(self):
+        for row in self.rules_sheet.get_selected_rows(get_cells_as_rows=True):
+            self.rules_sheet.set_cell_data(row, 1, DELETE_MARKER)
+        self._on_rules_changed()
+
+    def save_rules_to_excel(self):
+        path = filedialog.asksaveasfilename(title="保存替换规则", defaultextension=".xlsx", filetypes=[("Excel 规则表", "*.xlsx")])
+        if not path:
+            return
+        rows = normalize_rule_rows(self.rules_sheet.get_sheet_data())
+        self._begin_indeterminate_task("正在保存规则…")
+
+        def work(_progress):
+            from string_replacer import save_replacement_rules
+            save_replacement_rules(path, rows)
+
+        def on_success(_result):
+            self._reset_busy_state()
+            self._remove_rules_file_from_replace_files(path)
+            self.status_var.set(f"已保存 {len(rows)} 条规则：{path}")
+
+        self._task_runner.submit(work, on_success, lambda exc: self._handle_background_error(exc, "保存规则"))
+
+    def preview_replacement(self):
+        from string_replacer import get_output_path
+
+        rows = self.rules_sheet.get_sheet_data()
+        try:
+            validate_rules(rows)
+        except ValueError as exc:
+            messagebox.showwarning("规则冲突", str(exc))
+            return
+        rules = self.get_rules_from_table()
+        pending = [old for old, new in normalize_rule_rows(rows) if not new]
+        lines = [f"可执行规则：{len(rules)} 条；空白跳过：{len(pending)} 条。"]
+        if pending:
+            lines.append("待填写：" + "、".join(pending))
+        reserved = set()
+        for path in self.replace_files:
+            output = get_output_path(path, rules, self.output_dir, reserved)
+            action = "覆盖原文件" if _file_identity(path) == _file_identity(output) else "生成文件"
+            lines.append(f"\n{path}\n→ {output}（{action}）")
+        lines.append("\n这是执行前的路径检查；最终文件名以结果明细为准。")
+        self._show_result_window("\n".join(lines), title="执行前检查")
+
+    def show_project_info_details(self):
+        if not self._project_info_details:
+            messagebox.showinfo("项目信息", "请先导入招标文件。")
+            return
+        lines = [f"来源文件：{self._project_info_source}", "冲突项已留空，请核对候选值后在规则表填写。"]
+        for item in self._project_info_details:
+            lines.append(f"\n{item['placeholder']}【{item['status']}】 {item['value'] or '待填写'}")
+            for candidate in item["candidates"]:
+                lines.append(f"  {candidate['source']}：{candidate['value']}")
+        self._show_result_window("\n".join(lines), title="项目信息来源")
 
     def add_rule_row(self):
         self.rules_sheet.insert_row(row=["", ""])
@@ -2119,41 +1448,31 @@ class ReplaceSimpleApp:
         file_path = self._choose_tender_file_for_import()
         if not file_path:
             return
-
         self._begin_indeterminate_task("正在读取招标文件项目信息...")
 
         def work(_publish_progress):
-            from tender_info_extractor import extract_project_info_rules
-
-            if os.path.splitext(file_path)[1].lower() != ".doc":
-                return extract_project_info_rules(file_path)
-
+            from tender_info_extractor import extract_project_info_details
             from legacy_office import LegacyOfficeSession, temporary_docx_source
 
-            with LegacyOfficeSession() as legacy_session:
-                with temporary_docx_source(file_path, legacy_session) as readable_path:
-                    return extract_project_info_rules(readable_path)
+            if os.path.splitext(file_path)[1].lower() != ".doc":
+                return extract_project_info_details(file_path)
+            with LegacyOfficeSession() as session:
+                with temporary_docx_source(file_path, session) as readable:
+                    return extract_project_info_details(readable)
 
-        def on_success(rules):
+        def on_success(details):
             self._reset_busy_state()
-            if not rules:
-                messagebox.showwarning(
-                    "提示",
-                    "未识别到可导入的项目信息。\n\n"
-                    "目前支持项目名称、项目编号、标的名称、采购人信息、开标信息等字段。",
-                )
-                return
-
-            data = [[old, new] for old, new in rules]
-            self.rules_sheet.set_sheet_data(data)
+            self._project_info_details = details
+            self._project_info_source = file_path
+            recognized = sum(bool(item["value"]) for item in details)
+            self.rules_sheet.set_sheet_data([[item["placeholder"], item["value"]] for item in details])
             self._ensure_blank_rule_rows()
             self._refresh_rules_sheet_view()
             self._remember_word_files([file_path])
-            removed_from_targets = self._remove_import_source_from_replace_files(file_path, "招标文件")
-            status = f"已从招标文件导入 {len(rules)} 条项目信息：{os.path.basename(file_path)}"
-            if removed_from_targets:
-                status += "；已从待处理文件中移除招标文件"
-            self.status_var.set(status)
+            self._remove_import_source_from_replace_files(file_path, "招标文件")
+            self.status_var.set(f"已识别 {recognized}/{len(details)} 项：{os.path.basename(file_path)}；空白项不执行，可在“更多”核对来源")
+            if not recognized or any(item["status"] == "冲突" for item in details):
+                self.show_project_info_details()
 
         def on_error(exc):
             self._reset_busy_state()
@@ -2276,38 +1595,43 @@ class ReplaceSimpleApp:
         if not self.replace_files:
             messagebox.showwarning("提示", "请先选择待处理文件。")
             return
-
-        file_paths = list(self.replace_files)
-        rules = list(self.get_rules_from_table())
-        output_dir = self.output_dir
-        if not rules:
-            messagebox.showwarning("提示", "请先新增或导入至少一条替换规则。")
+        try:
+            validate_rules(self.rules_sheet.get_sheet_data())
+        except ValueError as exc:
+            messagebox.showwarning("规则冲突", str(exc))
             return
+        rules = self.get_rules_from_table()
+        if not rules:
+            messagebox.showwarning("提示", "没有可执行规则。空白替换值会跳过，请填写替换值或明确标记删除。")
+            return
+        self._run_replace(list(self.replace_files), rules, self.output_dir)
 
+    def _run_replace(self, file_paths, rules, output_dir):
+        if self._task_runner.active:
+            return
         self._begin_determinate_task(f"正在使用 {len(rules)} 条规则替换...", len(file_paths))
 
         def work(publish_progress):
             from string_replacer import batch_replace
-
-            return batch_replace(
-                file_paths,
-                rules,
-                output_dir=output_dir,
-                progress_callback=publish_progress,
-            )
+            details = []
+            results, error = batch_replace(file_paths, rules, output_dir=output_dir,
+                                          progress_callback=publish_progress,
+                                          result_callback=details.append)
+            return results, error, details
 
         def on_progress(current, total, filename):
             self.progress.configure(maximum=total, value=current)
             self.status_var.set(f"正在处理 ({current}/{total})：{filename}")
 
         def on_success(result):
-            results, error = result
-            self._show_result(results, error, file_paths=file_paths, output_dir=output_dir)
+            results, error, details = result
+            failed = [item["source_path"] for item in details if item["status"] == "失败"]
+            retry = (lambda: self._run_replace(failed, rules, output_dir)) if failed else None
+            self._show_result(results, error, file_paths=file_paths, output_dir=output_dir,
+                              details=details, retry=retry)
 
-        def on_error(exc):
-            self._handle_background_error(exc, "替换线程")
-
-        self._task_runner.submit(work, on_success, on_error, on_progress)
+        self._task_runner.submit(work, on_success,
+                                lambda exc: self._handle_background_error(exc, "替换线程"), on_progress)
 
     def _reset_busy_state(self):
         self.progress.stop()
@@ -2330,29 +1654,24 @@ class ReplaceSimpleApp:
             detail += f"\n\n错误日志：{log_path}"
         messagebox.showerror("错误", detail)
 
-    def _show_result(self, results, error, file_paths=None, output_dir=None):
+    def _show_result(self, results, error, file_paths=None, output_dir=None, details=None, retry=None):
         self._reset_busy_state()
-        total_count = sum(results.values())
-        lines = [
-            "替换完成。",
-            "",
-            f"共处理 {len(results)} 个文件，替换 {total_count} 处。",
-            "",
-        ]
-
-        if results:
-            lines.append("详细结果：")
-            for filename, count in results.items():
-                lines.append(f"  {filename}: {count} 处")
-
-        if error:
-            lines.extend(["", "部分文件处理失败：", error])
-            self.status_var.set("替换完成（部分失败）")
+        state = "全部失败" if error and not results else "部分失败" if error else "完成"
+        lines = [f"替换{state}。", f"成功处理 {len(results)} 个文件，替换 {sum(results.values())} 处。"]
+        if details is not None:
+            for item in details:
+                lines.append(f"\n【{item['status']}】{item['source_path']}：{item['count']} 处")
+                if item["output_path"]:
+                    lines.append("输出：" + item["output_path"])
+                if item["error"]:
+                    lines.append("原因：" + item["error"])
         else:
-            self.status_var.set("替换完成")
-
+            lines.extend(f"{filename}：{count} 处" for filename, count in results.items())
+            if error:
+                lines.append(error)
+        self.status_var.set("替换" + state)
         self._last_output_dir_to_open = output_dir or self._default_output_dir_to_open(file_paths=file_paths)
-        self._show_result_window("\n".join(lines))
+        self._show_result_window("\n".join(lines), retry=retry)
 
     def _default_output_dir_to_open(self, file_paths=None):
         if self.output_dir:
@@ -2371,9 +1690,9 @@ class ReplaceSimpleApp:
         except Exception as exc:
             messagebox.showerror("错误", f"无法打开输出目录：{exc}")
 
-    def _show_result_window(self, message):
+    def _show_result_window(self, message, title="替换结果", retry=None):
         window = tk.Toplevel(self.root)
-        window.title("替换结果")
+        window.title(title)
         window.geometry("680x420")
         window.minsize(520, 300)
         window.configure(bg=self.app_bg)
@@ -2407,6 +1726,24 @@ class ReplaceSimpleApp:
 
         buttons = ttk.Frame(body, style="App.TFrame")
         buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        def save_report():
+            from file_io import atomic_output_path
+            path = filedialog.asksaveasfilename(parent=window, title="保存结果", defaultextension=".txt", filetypes=[("文本报告", "*.txt")])
+            if path:
+                try:
+                    with atomic_output_path(path) as temporary:
+                        with open(temporary, "w", encoding="utf-8-sig") as report:
+                            report.write(message)
+                except OSError as exc:
+                    messagebox.showerror("保存失败", str(exc), parent=window)
+
+        self._create_busy_button(buttons, text="保存结果", command=save_report, width=10).pack(side="left", padx=(0, 8))
+        if retry:
+            def retry_failed():
+                if not self._task_runner.active:
+                    window.destroy()
+                    retry()
+            self._create_busy_button(buttons, text="仅重试失败", command=retry_failed, width=12).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="打开输出目录", command=self._open_output_dir, width=14).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="关闭", command=window.destroy, width=10).pack(side="left")
 
@@ -2473,1688 +1810,6 @@ class ReplaceSimpleApp:
             self.table_export_window.focus()
             return
         self.table_export_window = WordTableExportWindow(self, initial_files=initial_files)
-
-
-class WordTableExportWindow:
-    WINDOW_WIDTH = 1280
-    WINDOW_HEIGHT = 1100
-    MIN_WIDTH = 1020
-    MIN_HEIGHT = 820
-    SCAN_COLUMN_TITLES = {
-        "selected": "导出",
-        "file": "文件",
-        "type": "类型",
-        "section": "所在章节",
-        "item": "项目",
-        "quantity": "数量",
-    }
-
-    def __init__(self, app, initial_files=None):
-        self.app = app
-        self.window = tk.Toplevel(app.root)
-        self._task_runner = BackgroundTaskRunner(self.window)
-        self._busy_widgets = []
-        self.window.title("提取信息")
-        # Give the scan list enough room on first open.  The result list is the
-        # primary workspace in this window, so it should not start out cramped
-        # by the fixed-height sections around it.
-        self.window.configure(bg=app.app_bg)
-        # 不设置 transient：Windows 会为普通可调整大小的 Toplevel 提供最大化按钮。
-        self.window.resizable(True, True)
-        # 先藏起来，排完布局再相对主窗口居中显示，避免闪到屏幕左上角
-        self.window.withdraw()
-        width, height, min_w, min_h = self._fitted_window_size()
-        self.window.minsize(min_w, min_h)
-        try:
-            self.window.iconphoto(True, app._icon_photo)
-        except Exception:
-            pass
-
-        self.file_paths = []
-        self.table_items = []
-        self.symbol_items = []
-        self.scan_rows = []
-        self.scan_item_by_iid = {}
-        self.selected_scan_keys = set()
-        self.scan_filters = {}
-        self._filter_popup = None
-        self.output_dir = None
-        self.keep_symbols_var = tk.BooleanVar(value=bool(app.keep_clause_symbols))
-        self._last_output_dir_to_open = None
-        self._scan_separator_after = None
-        self.status_var = tk.StringVar(value="就绪")
-
-        self._create_widgets()
-        self._refresh_symbols_label()
-        if initial_files:
-            self._append_files(initial_files, show_status=False)
-            self.status_var.set(f"已自动带入 {len(self.file_paths)} 个 Word 文件")
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-
-        geometry = center_window_on_parent(
-            self.window,
-            app.root,
-            width=width,
-            height=height,
-        )
-        self.window.deiconify()
-        if geometry:
-            self.window.geometry(geometry)
-            # Windows 上 withdraw 后再显示，偶发丢掉刚才写入的尺寸，idle 后再钉一次
-            self.window.after_idle(lambda g=geometry: self._reapply_geometry(g))
-        else:
-            center_window_on_parent(
-                self.window,
-                app.root,
-                width=width,
-                height=height,
-            )
-        self.window.lift()
-        self.window.focus_force()
-
-    def _fitted_window_size(self):
-        """按屏幕可用区域收敛默认尺寸，避免超出任务栏或小屏显示器。"""
-        width, height = self.WINDOW_WIDTH, self.WINDOW_HEIGHT
-        min_w, min_h = self.MIN_WIDTH, self.MIN_HEIGHT
-        try:
-            screen_w = int(self.window.winfo_screenwidth())
-            screen_h = int(self.window.winfo_screenheight())
-        except Exception:
-            return width, height, min_w, min_h
-        if screen_w > 1:
-            width = min(width, max(screen_w - 48, 800))
-            min_w = min(min_w, width)
-        if screen_h > 1:
-            height = min(height, max(screen_h - 88, 600))
-            min_h = min(min_h, height)
-        return width, height, min_w, min_h
-
-    def _reapply_geometry(self, geometry):
-        try:
-            if self.window.winfo_exists() and geometry:
-                self.window.geometry(geometry)
-        except tk.TclError:
-            pass
-
-    def exists(self):
-        try:
-            return bool(self.window.winfo_exists())
-        except Exception:
-            return False
-
-    def focus(self):
-        try:
-            self.window.lift()
-            self.window.focus_force()
-        except Exception:
-            pass
-
-    def close(self):
-        if self._task_runner.active:
-            messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭窗口。", parent=self.window)
-            return
-        self._close_scan_filter_popup()
-        if self._scan_separator_after is not None:
-            try:
-                self.window.after_cancel(self._scan_separator_after)
-            except tk.TclError:
-                pass
-            self._scan_separator_after = None
-        if hasattr(self, "_output_path"):
-            self._output_path.hide_tooltip()
-        self.app.table_export_window = None
-        self.window.destroy()
-
-    def _create_busy_button(self, parent, **kwargs):
-        button = ttk.Button(parent, **kwargs)
-        self._busy_widgets.append(button)
-        return button
-
-    def _set_busy_controls(self, busy):
-        state = "disabled" if busy else "normal"
-        for widget in self._busy_widgets:
-            try:
-                if widget.winfo_exists():
-                    widget.config(state=state)
-            except tk.TclError:
-                continue
-
-    def _begin_indeterminate_task(self, status):
-        self._set_busy_controls(True)
-        self.progress.configure(mode="indeterminate", value=0)
-        self.progress.grid()
-        self.progress.start(12)
-        self.status_var.set(status)
-        self._refresh_constrained_texts()
-
-    def _begin_determinate_task(self, status, maximum):
-        self._set_busy_controls(True)
-        self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=maximum, value=0)
-        self.progress.grid()
-        self.status_var.set(status)
-        self._refresh_constrained_texts()
-
-    def _create_widgets(self):
-        body = ttk.Frame(self.window, padding=12, style="App.TFrame")
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(2, weight=1)
-
-        header = ttk.Frame(body, style="App.TFrame")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(header, text="提取信息", style="Title.TLabel").pack(anchor="w")
-        self.header_hint = ttk.Label(
-            header,
-            text="选择 .doc / .docx 文件；同时扫描 Word 表格和当前符号集，按文件实际章节勾选后导出。",
-            style="Subtitle.TLabel",
-        )
-        self.header_hint.pack(anchor="w", pady=(2, 0))
-
-        file_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
-        file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        file_frame.columnconfigure(0, weight=1)
-
-        file_header = ttk.Frame(file_frame, style="Toolbar.TFrame")
-        file_header.grid(row=0, column=0, sticky="ew")
-        file_header.columnconfigure(0, weight=1)
-        ttk.Label(file_header, text="Word 文件", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-
-        file_toolbar = ttk.Frame(file_header, style="Toolbar.TFrame")
-        file_toolbar.grid(row=0, column=1, sticky="e")
-        self._create_busy_button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
-        self._create_busy_button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
-        self._create_busy_button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
-        self._create_busy_button(file_toolbar, text="清空", command=self.clear_files, width=7).pack(side="left")
-
-        list_frame = ttk.Frame(file_frame, style="Toolbar.TFrame")
-        list_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-        self.file_listbox = tk.Listbox(
-            list_frame,
-            height=2,
-            selectmode="extended",
-            exportselection=False,
-            font=self.app.small_font,
-            bg=self.app.surface_bg,
-            fg=self.app.text_fg,
-            highlightthickness=1,
-            highlightbackground=self.app.border_color,
-            relief="flat",
-        )
-        self.file_listbox.grid(row=0, column=0, sticky="nsew")
-        scrollbar = FlatScrollbar(
-            list_frame,
-            orient="vertical",
-            command=self.file_listbox.yview,
-            style="Flat.Vertical.TScrollbar",
-        )
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.file_listbox.configure(yscrollcommand=scrollbar.set)
-        self.app._bind_vertical_mousewheel(self.file_listbox, self.file_listbox, scrollbar)
-
-        self.files_label = ttk.Label(file_frame, text="已选择 0 个 Word 文件", style="Muted.TLabel")
-        self.files_label.grid(row=2, column=0, sticky="w", pady=(5, 0))
-
-        scan_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
-        scan_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
-        scan_frame.columnconfigure(0, weight=1)
-        # 扫描表吃掉中间全部弹性空间；明细栏保持可读高度，窗口再拉高时表继续长
-        scan_frame.rowconfigure(1, weight=1)
-        scan_frame.rowconfigure(2, weight=0)
-
-        scan_header = ttk.Frame(scan_frame, style="Toolbar.TFrame")
-        scan_header.grid(row=0, column=0, sticky="ew")
-        scan_header.columnconfigure(0, weight=1)
-        ttk.Label(scan_header, text="扫描结果", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-
-        scan_toolbar = ttk.Frame(scan_header, style="Toolbar.TFrame")
-        scan_toolbar.grid(row=0, column=1, sticky="e")
-        self.scan_button = self._create_busy_button(
-            scan_toolbar, text="扫描表格和符号", command=self.scan_content, width=14
-        )
-        self.scan_button.pack(side="left", padx=(0, 6))
-        self._create_busy_button(scan_toolbar, text="推荐表格", command=self.select_recommended_tables, width=10).pack(side="left", padx=(0, 6))
-        self.toggle_visible_selection_button = self._create_busy_button(
-            scan_toolbar,
-            text="筛选结果全选",
-            command=self.toggle_visible_scan_selection,
-            width=14,
-        )
-        self.toggle_visible_selection_button.pack(side="left")
-
-        tree_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
-        tree_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
-        tree_frame.columnconfigure(0, weight=1)
-        tree_frame.rowconfigure(0, weight=1)
-
-        self.scan_tree = ttk.Treeview(
-            tree_frame,
-            columns=("selected", "file", "type", "section", "item", "quantity"),
-            show="headings",
-            selectmode="extended",
-            style="Scan.Treeview",
-            height=18,
-        )
-        for column, title in self.SCAN_COLUMN_TITLES.items():
-            self.scan_tree.heading(column, text=f"{title} ▼")
-        self.scan_tree.column("selected", width=64, minwidth=56, anchor="center", stretch=False)
-        self.scan_tree.column("file", width=205, minwidth=130, stretch=False)
-        self.scan_tree.column("type", width=90, minwidth=76, anchor="center", stretch=False)
-        self.scan_tree.column("section", width=430, minwidth=220)
-        self.scan_tree.column("item", width=150, minwidth=100, anchor="center", stretch=False)
-        self.scan_tree.column("quantity", width=76, minwidth=64, anchor="center", stretch=False)
-        self.scan_tree.grid(row=0, column=0, sticky="nsew")
-        y_scrollbar = FlatScrollbar(
-            tree_frame,
-            orient="vertical",
-            command=self.scan_tree.yview,
-            style="Scan.Vertical.TScrollbar",
-        )
-        y_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.scan_x_scrollbar = FlatScrollbar(
-            tree_frame,
-            orient="horizontal",
-            command=self._scan_tree_xview,
-            style="Scan.Horizontal.TScrollbar",
-        )
-        # 横向滚动条只在列宽超出可见区域时再出现，避免空表也占掉一行高度
-        self.scan_tree.configure(
-            yscrollcommand=y_scrollbar.set,
-            xscrollcommand=self._on_scan_tree_xscroll,
-        )
-        self.app._bind_vertical_mousewheel(self.scan_tree, self.scan_tree, y_scrollbar)
-        # 挂到 tree_frame 上，才能盖住表头区域（Treeview 子控件会被表头层盖住）
-        self._scan_column_separators = [
-            tk.Frame(
-                tree_frame,
-                width=1,
-                bg=HEADER_GRID_COLOR,
-                borderwidth=0,
-                highlightthickness=0,
-                takefocus=False,
-            )
-            for _column in self.scan_tree.cget("columns")[:-1]
-        ]
-        # 表头底部分隔横线，与竖线同色，补齐表头与数据区边界
-        self._scan_header_bottom_line = tk.Frame(
-            tree_frame,
-            height=1,
-            bg=HEADER_GRID_COLOR,
-            borderwidth=0,
-            highlightthickness=0,
-            takefocus=False,
-        )
-        self.scan_tree.bind("<Button-1>", self._toggle_scan_checkbox_from_click)
-        self.scan_tree.bind("<ButtonRelease-1>", self._open_scan_filter_from_heading, add="+")
-        self.scan_tree.bind("<ButtonRelease-1>", self._schedule_scan_tree_column_separators, add="+")
-        self.scan_tree.bind("<B1-Motion>", self._schedule_scan_tree_column_separators, add="+")
-        self.scan_tree.bind("<Configure>", self._schedule_scan_tree_column_separators, add="+")
-        self.scan_tree.bind("<Double-1>", self._toggle_scan_row_from_event)
-        self.scan_tree.bind("<space>", self._toggle_scan_rows_from_keyboard)
-        self.scan_tree.bind("<<TreeviewSelect>>", self._update_scan_detail)
-        self._schedule_scan_tree_column_separators()
-
-        detail_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
-        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
-        detail_frame.columnconfigure(0, weight=1)
-        detail_frame.rowconfigure(0, weight=1)
-        self.detail_text = tk.Text(
-            detail_frame,
-            height=10,
-            wrap="word",
-            font=self.app.body_font,
-            bg="#F1F3F6",
-            fg=self.app.text_fg,
-            relief="solid",
-            borderwidth=1,
-            padx=10,
-            pady=6,
-        )
-        self.detail_text.grid(row=0, column=0, sticky="nsew")
-        self.detail_scrollbar = FlatScrollbar(
-            detail_frame,
-            orient="vertical",
-            command=self.detail_text.yview,
-            style="Flat.Vertical.TScrollbar",
-        )
-        self.detail_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.detail_text.configure(yscrollcommand=self.detail_scrollbar.set)
-        self.app._bind_vertical_mousewheel(
-            self.detail_text, self.detail_text, self.detail_scrollbar
-        )
-        self.detail_text.insert("1.0", "选择扫描结果中的一行，可查看完整章节、表格或符号条款预览。")
-        self.detail_text.configure(state="disabled")
-
-        self.scan_label = ttk.Label(scan_frame, text="请先添加 Word 文件并扫描表格和符号", style="Muted.TLabel")
-        self.scan_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
-
-        # 符号扫描设置：符号范围在扫描前确定，是否保留符号只影响最终导出
-        symbols_frame = ttk.Frame(body, padding=(12, 8), style="Surface.TFrame")
-        symbols_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        symbols_frame.columnconfigure(0, weight=1)
-
-        symbols_header = ttk.Frame(symbols_frame, style="Toolbar.TFrame")
-        symbols_header.grid(row=0, column=0, sticky="ew")
-        symbols_header.columnconfigure(0, weight=1)
-        ttk.Label(symbols_header, text="符号扫描设置", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.customize_symbols_button = self._create_busy_button(
-            symbols_header,
-            text="自定义符号…",
-            command=self.open_symbol_settings,
-            width=12,
-        )
-        self.customize_symbols_button.grid(row=0, column=1, sticky="e")
-
-        symbols_content = ttk.Frame(symbols_frame, style="Toolbar.TFrame")
-        symbols_content.grid(row=1, column=0, sticky="ew", pady=(7, 0))
-        symbols_content.columnconfigure(0, weight=1)
-
-        symbols_row = ttk.Frame(symbols_content, style="Toolbar.TFrame")
-        symbols_row.grid(row=0, column=0, sticky="ew")
-        ttk.Label(symbols_row, text="扫描符号").pack(side="left")
-        self.symbols_label = ttk.Label(symbols_row, text="当前：★ # △ ▲", style="Muted.TLabel")
-        self.symbols_label.pack(side="left", padx=(10, 0))
-
-        keep_row = ttk.Frame(symbols_content, style="Toolbar.TFrame")
-        keep_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self.keep_symbols_check = CanvasCheckbox(
-            keep_row,
-            "条款内容中保留符号",
-            self.keep_symbols_var,
-            self.app,
-            command=self._on_keep_symbols_toggled,
-        )
-        self.keep_symbols_check.canvas.pack(side="left")
-        ttk.Label(
-            keep_row,
-            text="不勾选则只在符号列保留，条款正文不再重复带符号",
-            style="Muted.TLabel",
-        ).pack(side="left", padx=(10, 0))
-
-        self.output_frame = ttk.Frame(body, padding=(12, 6), style="Surface.TFrame")
-        output_frame = self.output_frame
-        output_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        output_frame.columnconfigure(1, weight=1)
-
-        # 单行：标题 + 路径说明 + 选择按钮；长路径中间省略，保持一行高度
-        ttk.Label(output_frame, text="输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.output_label = ttk.Label(
-            output_frame,
-            text="未选择则输出到原 Word 文件所在目录",
-            style="Muted.TLabel",
-            justify="left",
-        )
-        self.output_label.grid(row=0, column=1, sticky="ew", padx=(10, 10))
-        self._create_busy_button(output_frame, text="选择目录", command=self.select_output_dir, width=12).grid(
-            row=0, column=2, sticky="e"
-        )
-        self._output_path = ElidedTextController(
-            self.output_label,
-            self.app.body_font,
-            self._output_path_width,
-            max_lines=1,
-            tooltip=True,
-            tooltip_font=self.app.small_font,
-            tooltip_fg=self.app.text_fg,
-            fallback_width=700,
-        )
-        output_frame.bind("<Configure>", self._on_output_frame_configure)
-
-        self.action_frame = ttk.Frame(body, padding=(12, 9), style="Surface.TFrame")
-        action_frame = self.action_frame
-        action_frame.grid(row=5, column=0, sticky="ew")
-        action_frame.columnconfigure(0, weight=1)
-        action_frame.columnconfigure(2, minsize=118)
-
-        self.status_label = ttk.Label(action_frame, text="就绪", style="Status.TLabel")
-        self.status_label.grid(row=0, column=0, sticky="ew")
-        self.progress = ttk.Progressbar(action_frame, mode="determinate", length=220)
-        self.progress.grid(row=0, column=1, sticky="ew", padx=(14, 12))
-        self.progress.grid_remove()
-
-        self.export_button = self._create_busy_button(
-            action_frame,
-            text="开始导出",
-            command=self.start_export,
-            width=14,
-            style="Accent.TButton",
-        )
-        self.export_button.grid(row=0, column=2, sticky="e")
-        self._status_elide = ElidedTextController(
-            self.status_label,
-            self.app.body_font,
-            self._status_width,
-            max_lines=1,
-            fallback_width=400,
-        ).attach_var(self.status_var)
-        self.window.bind("<Configure>", self._on_window_configure)
-        self.window.after_idle(self._refresh_constrained_texts)
-
-    def _scan_tree_xview(self, *args):
-        self.scan_tree.xview(*args)
-        self._schedule_scan_tree_column_separators()
-
-    def _on_scan_tree_xscroll(self, first, last):
-        self.scan_x_scrollbar.set(first, last)
-        self._sync_scan_tree_x_scrollbar(first, last)
-        self._schedule_scan_tree_column_separators()
-
-    def _sync_scan_tree_x_scrollbar(self, first, last):
-        """列宽超出可见区域才显示横向滚动条，把垂直空间留给表格行。"""
-        try:
-            overflow = float(first) > 0.001 or float(last) < 0.999
-        except (TypeError, ValueError):
-            overflow = True
-        try:
-            shown = bool(self.scan_x_scrollbar.grid_info())
-        except tk.TclError:
-            return
-        if overflow and not shown:
-            self.scan_x_scrollbar.grid(row=1, column=0, sticky="ew")
-        elif not overflow and shown:
-            self.scan_x_scrollbar.grid_remove()
-
-    def _close_scan_filter_popup(self):
-        popup = self._filter_popup
-        self._filter_popup = None
-        if popup is None:
-            return
-        try:
-            popup.grab_release()
-        except tk.TclError:
-            pass
-        try:
-            if popup.winfo_exists():
-                popup.destroy()
-        except tk.TclError:
-            pass
-
-    def _refresh_scan_filter_headings(self):
-        if not hasattr(self, "scan_tree"):
-            return
-        for column, title in self.SCAN_COLUMN_TITLES.items():
-            marker = " [筛] ▼" if column in self.scan_filters else " ▼"
-            self.scan_tree.heading(column, text=title + marker)
-
-    def _scan_filter_value(self, column, kind, item):
-        if column == "selected":
-            return "已选" if self._scan_key(kind, item) in self.selected_scan_keys else "未选"
-        if column == "file":
-            return item.filename
-        if column == "type":
-            return "表格" if kind == "table" else "符号条款"
-        if column == "section":
-            return item.section
-        if column == "item":
-            return f"表格{item.table_index}" if kind == "table" else " ".join(item.symbols)
-        if column == "quantity":
-            return (
-                f"{item.row_count}x{item.column_count}"
-                if kind == "table"
-                else f"{item.clause_count}条"
-            )
-        return ""
-
-    def _scan_row_matches_filters(self, kind, item, ignore_column=None):
-        for column, selected_values in self.scan_filters.items():
-            if column == ignore_column:
-                continue
-            if self._scan_filter_value(column, kind, item) not in selected_values:
-                return False
-        return True
-
-    def _available_scan_filter_values(self, column):
-        values = []
-        seen = set()
-        for kind, item in self.scan_rows:
-            if not self._scan_row_matches_filters(kind, item, ignore_column=column):
-                continue
-            value = self._scan_filter_value(column, kind, item)
-            if value in seen:
-                continue
-            seen.add(value)
-            values.append(value)
-        return values
-
-    def _set_scan_filter(self, column, selected_values):
-        available = set(self._available_scan_filter_values(column))
-        chosen = set(selected_values)
-        if chosen == available:
-            self.scan_filters.pop(column, None)
-        else:
-            self.scan_filters[column] = chosen
-        self._apply_scan_filters(select_first=True)
-
-    def _open_scan_filter_from_heading(self, event):
-        if self.scan_tree.identify_region(event.x, event.y) != "heading":
-            return
-        column_id = self.scan_tree.identify_column(event.x)
-        try:
-            column_index = int(column_id.removeprefix("#")) - 1
-            column = self.scan_tree.cget("columns")[column_index]
-        except (ValueError, IndexError, TypeError):
-            return
-        if column not in self.SCAN_COLUMN_TITLES:
-            return
-
-        self._close_scan_filter_popup()
-        values = self._available_scan_filter_values(column)
-        selected_values = set(self.scan_filters.get(column, values))
-
-        popup = tk.Toplevel(self.window)
-        self._filter_popup = popup
-        popup.title(f"筛选：{self.SCAN_COLUMN_TITLES[column]}")
-        popup.transient(self.window)
-        popup.resizable(False, False)
-        popup.configure(bg=self.app.app_bg)
-        popup.protocol("WM_DELETE_WINDOW", self._close_scan_filter_popup)
-
-        outer = ttk.Frame(popup, padding=10, style="App.TFrame")
-        outer.pack(fill="both", expand=True)
-        body = ttk.Frame(outer, padding=10, style="Surface.TFrame")
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(1, weight=1)
-        ttk.Label(
-            body,
-            text=f"筛选“{self.SCAN_COLUMN_TITLES[column]}”（点击可多选）",
-            style="SectionTitle.TLabel",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 7))
-
-        list_width = min(72, max(26, max((len(value) for value in values), default=12) + 3))
-        listbox = tk.Listbox(
-            body,
-            selectmode="multiple",
-            exportselection=False,
-            height=min(14, max(4, len(values))),
-            width=list_width,
-            font=self.app.body_font,
-            bg=self.app.surface_bg,
-            fg=self.app.text_fg,
-            selectbackground="#3F6D92",
-            selectforeground="white",
-            relief="solid",
-            borderwidth=1,
-        )
-        listbox.grid(row=1, column=0, sticky="nsew")
-        for index, value in enumerate(values):
-            listbox.insert("end", value)
-            if value in selected_values:
-                listbox.selection_set(index)
-
-        scrollbar = FlatScrollbar(
-            body,
-            orient="vertical",
-            command=listbox.yview,
-            style="Flat.Vertical.TScrollbar",
-        )
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        x_scrollbar = FlatScrollbar(
-            body,
-            orient="horizontal",
-            command=listbox.xview,
-            style="Flat.Horizontal.TScrollbar",
-        )
-        x_scrollbar.grid(row=2, column=0, sticky="ew")
-        listbox.configure(
-            yscrollcommand=scrollbar.set,
-            xscrollcommand=x_scrollbar.set,
-        )
-        self.app._bind_vertical_mousewheel(listbox, listbox, scrollbar)
-
-        selection_buttons = ttk.Frame(body, style="Toolbar.TFrame")
-        selection_buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(
-            selection_buttons,
-            text="全选",
-            width=8,
-            command=lambda: listbox.selection_set(0, "end"),
-        ).pack(side="left", padx=(0, 6))
-        ttk.Button(
-            selection_buttons,
-            text="全不选",
-            width=8,
-            command=lambda: listbox.selection_clear(0, "end"),
-        ).pack(side="left")
-
-        def apply_selection():
-            chosen = [values[index] for index in listbox.curselection()]
-            self._close_scan_filter_popup()
-            self._set_scan_filter(column, chosen)
-
-        def clear_filter():
-            self.scan_filters.pop(column, None)
-            self._close_scan_filter_popup()
-            self._apply_scan_filters(select_first=True)
-
-        buttons = ttk.Frame(body, style="Toolbar.TFrame")
-        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(buttons, text="清除筛选", command=clear_filter, width=10).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="取消", command=self._close_scan_filter_popup, width=8).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="确定", style="Accent.TButton", command=apply_selection, width=8).pack(side="left")
-
-        popup.bind("<Escape>", lambda _event: self._close_scan_filter_popup())
-        popup.update_idletasks()
-        popup_width = popup.winfo_reqwidth()
-        popup_height = popup.winfo_reqheight()
-        screen_width = popup.winfo_screenwidth()
-        screen_height = popup.winfo_screenheight()
-        x = max(8, min(event.x_root, screen_width - popup_width - 8))
-        y = max(8, min(event.y_root + 4, screen_height - popup_height - 48))
-        popup.geometry(f"{popup_width}x{popup_height}+{x}+{y}")
-        popup.grab_set()
-        popup.lift()
-        listbox.focus_set()
-
-    def _schedule_scan_tree_column_separators(self, event=None):
-        if self._scan_separator_after is not None:
-            return
-        try:
-            self._scan_separator_after = self.window.after_idle(self._run_scan_tree_column_separator_update)
-        except tk.TclError:
-            pass
-
-    def _run_scan_tree_column_separator_update(self):
-        self._scan_separator_after = None
-        self._update_scan_tree_column_separators()
-
-    def _scan_tree_header_height(self):
-        """测量 Treeview 表头高度，用于底部分隔横线贴齐灰底下沿。"""
-        try:
-            for iid in self.scan_tree.get_children():
-                bbox = self.scan_tree.bbox(iid)
-                if bbox:
-                    return max(1, int(bbox[1]))
-        except tk.TclError:
-            pass
-
-        # 空表无 bbox：用 identify_region 实测 heading 区域下沿（比字体估算准）
-        try:
-            tree_height = self.scan_tree.winfo_height()
-            if tree_height > 1:
-                probe_x = max(2, min(20, self.scan_tree.winfo_width() // 4 or 2))
-                last_heading_y = -1
-                for y in range(0, min(tree_height, 96)):
-                    region = self.scan_tree.identify_region(probe_x, y)
-                    if region == "heading":
-                        last_heading_y = y
-                    elif last_heading_y >= 0:
-                        break
-                if last_heading_y >= 0:
-                    return last_heading_y + 1
-        except tk.TclError:
-            pass
-
-        try:
-            # 兜底：section 字体行高 + Heading padding(8,8) + 边框余量
-            linespace = int(self.app.section_font.metrics("linespace"))
-            return max(36, linespace + 22)
-        except Exception:
-            return 41
-
-    def _update_scan_tree_column_separators(self, event=None):
-        """Keep header separator overlays aligned while columns resize or scroll."""
-        try:
-            columns = tuple(self.scan_tree.cget("columns"))
-            widths = [int(self.scan_tree.column(column, "width")) for column in columns]
-            total_width = sum(widths)
-            if total_width <= 0:
-                return
-
-            scroll_offset = float(self.scan_tree.xview()[0]) * total_width
-            visible_width = self.scan_tree.winfo_width()
-            tree_height = self.scan_tree.winfo_height()
-            if visible_width <= 1 or tree_height <= 1:
-                return
-
-            # tree_frame 坐标系：竖线贯穿表头和数据区；<B1-Motion> 会在
-            # 拖动列宽期间实时重算位置，避免旧线残留在内容中间。
-            origin_x = self.scan_tree.winfo_x()
-            origin_y = self.scan_tree.winfo_y()
-            header_height = self._scan_tree_header_height()
-            boundary = 0
-            for separator, width in zip(self._scan_column_separators, widths[:-1]):
-                boundary += width
-                x = round(boundary - scroll_offset)
-                if 1 < x < visible_width - 1:
-                    separator.place(
-                        x=origin_x + x - 1,
-                        y=origin_y,
-                        width=1,
-                        height=tree_height,
-                    )
-                    separator.lift()
-                else:
-                    separator.place_forget()
-
-            # 表头底部分隔横线：横跨可见表头宽度
-            if header_height < tree_height:
-                self._scan_header_bottom_line.place(
-                    x=origin_x,
-                    y=origin_y + header_height - 1,
-                    width=visible_width,
-                    height=1,
-                )
-                self._scan_header_bottom_line.lift()
-            else:
-                self._scan_header_bottom_line.place_forget()
-        except (tk.TclError, ValueError, AttributeError):
-            pass
-
-    def select_files(self):
-        file_paths = filedialog.askopenfilenames(
-            title="选择 Word 文件",
-            filetypes=[("Word 文档", "*.doc;*.docx"), ("所有文件", "*.*")],
-            parent=self.window,
-        )
-        if file_paths:
-            self._append_files(file_paths)
-
-    def select_folder(self):
-        directory = filedialog.askdirectory(title="选择包含 Word 文件的文件夹", parent=self.window)
-        if not directory:
-            return
-
-        self._begin_indeterminate_task("正在扫描文件夹中的 Word 文件...")
-
-        def work(publish_progress):
-            return collect_supported_files(directory, WORD_EXTENSIONS, publish_progress)
-
-        def on_progress(scanned_count):
-            self.status_var.set(f"正在扫描文件夹：已检查 {scanned_count} 个文件...")
-
-        def on_success(collected):
-            self._reset_busy_state()
-            if not collected:
-                messagebox.showinfo("提示", "该文件夹中未找到 .doc 或 .docx 文件。", parent=self.window)
-                return
-            self._append_files(collected)
-
-        def on_error(exc):
-            self._finish_background_error(exc, "扫描 Word 文件夹")
-
-        self._task_runner.submit(work, on_success, on_error, on_progress)
-
-    def _append_files(self, file_paths, show_status=True):
-        existing = {_file_identity(path) for path in self.file_paths}
-        added = 0
-        skipped = 0
-        added_paths = []
-
-        for file_path in file_paths:
-            if not self._is_docx(file_path):
-                skipped += 1
-                continue
-            identity = _file_identity(file_path)
-            if identity in existing:
-                skipped += 1
-                continue
-            self.file_paths.append(file_path)
-            existing.add(identity)
-            added_paths.append(file_path)
-            added += 1
-
-        self.app._remember_word_files(added_paths)
-        self._refresh_file_list()
-        if added:
-            self._clear_scan_results("文件列表已变化，请重新扫描表格和符号")
-        if not show_status:
-            return
-        if added:
-            message = f"已添加 {added} 个 Word 文件"
-            if skipped:
-                message += f"；跳过 {skipped} 个重复或不支持的文件"
-            self.status_var.set(message)
-        elif skipped:
-            self.status_var.set(f"未添加新文件；跳过 {skipped} 个重复或不支持的文件")
-
-    def _is_docx(self, file_path):
-        return (
-            not os.path.basename(file_path).startswith("~$")
-            and os.path.splitext(file_path)[1].lower() in WORD_EXTENSIONS
-        )
-
-    def _refresh_file_list(self):
-        self.file_listbox.delete(0, "end")
-        if self.file_paths:
-            self.file_listbox.insert("end", *self.file_paths)
-        count = len(self.file_paths)
-        foreground = "green" if count else self.app.muted_fg
-        self.files_label.config(text=f"已选择 {count} 个 Word 文件", foreground=foreground)
-
-    def remove_selected_files(self):
-        selected = list(self.file_listbox.curselection())
-        if not selected:
-            return
-        for index in reversed(selected):
-            del self.file_paths[index]
-        self._refresh_file_list()
-        self._clear_scan_results("文件列表已变化，请重新扫描表格和符号")
-        self.status_var.set(f"已移除 {len(selected)} 个文件")
-
-    def clear_files(self):
-        if not self.file_paths:
-            return
-        self.file_paths = []
-        self._refresh_file_list()
-        self._clear_scan_results("请先添加 Word 文件并扫描表格和符号")
-        self.status_var.set("Word 文件列表已清空")
-
-    def scan_content(self):
-        if not self.file_paths:
-            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
-            return
-
-        file_paths = list(self.file_paths)
-        symbol_chars = self.app.symbol_chars
-        total_steps = len(file_paths) * 2
-        self._begin_determinate_task(f"正在扫描 {len(file_paths)} 个 Word 文件...", total_steps)
-
-        def work(publish_progress):
-            from symbol_clause_extractor import batch_scan_symbol_clause_sections
-            from word_table_exporter import batch_scan_word_tables
-
-            def table_progress(current, total, filename):
-                publish_progress(current, total_steps, filename, "正在扫描表格")
-
-            table_result = batch_scan_word_tables(
-                file_paths,
-                progress_callback=table_progress,
-            )
-
-            def symbol_progress(current, total, filename):
-                publish_progress(len(file_paths) + current, total_steps, filename, "正在扫描符号")
-
-            symbol_result = batch_scan_symbol_clause_sections(
-                file_paths,
-                progress_callback=symbol_progress,
-                symbols=symbol_chars,
-            )
-            return table_result, symbol_result
-
-        def on_success(result):
-            table_result, symbol_result = result
-            self._show_scan_result(*table_result, *symbol_result)
-
-        def on_error(exc):
-            self._finish_background_error(exc, "Word 表格和符号扫描线程")
-
-        self._task_runner.submit(work, on_success, on_error, self._update_progress)
-
-    def _show_scan_result(
-        self,
-        table_items,
-        table_skipped,
-        table_error,
-        symbol_items,
-        symbol_skipped,
-        symbol_error,
-    ):
-        self.table_items = list(table_items)
-        self.symbol_items = list(symbol_items)
-        self._close_scan_filter_popup()
-        self.selected_scan_keys = set()
-        self.scan_filters = {}
-
-        tables_by_file = {}
-        symbols_by_file = {}
-        for item in self.table_items:
-            tables_by_file.setdefault(_file_identity(item.file_path), []).append(item)
-        for item in self.symbol_items:
-            symbols_by_file.setdefault(_file_identity(item.file_path), []).append(item)
-
-        ordered_rows = []
-        for file_path in self.file_paths:
-            identity = _file_identity(file_path)
-            ordered_rows.extend(("table", item) for item in tables_by_file.get(identity, []))
-            ordered_rows.extend(("symbol", item) for item in symbols_by_file.get(identity, []))
-
-        self.scan_rows = ordered_rows
-        self._apply_scan_filters(select_first=True)
-
-        self._reset_busy_state()
-        message = (
-            f"已扫描到 {len(self.table_items)} 张表格、{len(self.symbol_items)} 个符号章节，"
-            "当前选择 0 项"
-        )
-        if table_error or symbol_error:
-            message += "；部分文件失败"
-        has_items = bool(ordered_rows)
-        self.scan_label.config(text=message, foreground="green" if has_items else self.app.muted_fg)
-        self.status_var.set("扫描完成" if not (table_error or symbol_error) else "扫描完成（部分失败）")
-
-        if table_skipped or symbol_skipped or table_error or symbol_error:
-            lines = ["扫描完成。", "", message]
-            if table_skipped:
-                lines.extend(["", "表格扫描提示："])
-                for filename, reason in table_skipped.items():
-                    lines.append(f"  {filename}: {reason}")
-            if symbol_skipped:
-                lines.extend(["", "符号扫描提示："])
-                for filename, reason in symbol_skipped.items():
-                    lines.append(f"  {filename}: {reason}")
-            if table_error or symbol_error:
-                lines.extend(["", "失败文件："])
-                if table_error:
-                    lines.append(table_error)
-                if symbol_error:
-                    lines.append(symbol_error)
-            self._show_result_window("\n".join(lines), title="扫描结果")
-
-    def _clear_scan_results(self, label_text):
-        self.table_items = []
-        self.symbol_items = []
-        self.scan_rows = []
-        self.scan_item_by_iid = {}
-        self.selected_scan_keys = set()
-        self.scan_filters = {}
-        self._close_scan_filter_popup()
-        if hasattr(self, "scan_tree"):
-            self.scan_tree.delete(*self.scan_tree.get_children())
-            self._refresh_scan_filter_headings()
-            self._schedule_scan_tree_column_separators()
-        if hasattr(self, "scan_label"):
-            self.scan_label.config(text=label_text, foreground=self.app.muted_fg)
-        self._refresh_visible_selection_button()
-        if hasattr(self, "detail_text"):
-            self._set_detail_text("选择扫描结果中的一行，可查看完整章节、表格或符号条款预览。")
-
-    def _scan_tree_values(self, kind, item, selected):
-        if kind == "table":
-            item_text = f"表格{item.table_index}"
-            quantity = f"{item.row_count}x{item.column_count}"
-            type_text = "表格"
-        else:
-            item_text = " ".join(item.symbols)
-            quantity = f"{item.clause_count}条"
-            type_text = "符号条款"
-        return (
-            "☑" if selected else "☐",
-            item.filename,
-            type_text,
-            item.section,
-            item_text,
-            quantity,
-        )
-
-    def _scan_key(self, kind, item):
-        if kind == "table":
-            return (kind, _file_identity(item.file_path), item.table_index)
-        return (kind, _file_identity(item.file_path), item.section)
-
-    def _apply_scan_filters(self, select_first=False):
-        focus_key = None
-        current_iid = self.scan_tree.focus() if hasattr(self, "scan_tree") else ""
-        current_row = self.scan_item_by_iid.get(current_iid)
-        if current_row is not None:
-            focus_key = self._scan_key(*current_row)
-
-        self.scan_tree.delete(*self.scan_tree.get_children())
-        self.scan_item_by_iid = {}
-        focus_iid = None
-        for row_index, (kind, item) in enumerate(self.scan_rows, start=1):
-            if not self._scan_row_matches_filters(kind, item):
-                continue
-            iid = str(row_index)
-            key = self._scan_key(kind, item)
-            self.scan_item_by_iid[iid] = (kind, item)
-            self.scan_tree.insert(
-                "",
-                "end",
-                iid=iid,
-                values=self._scan_tree_values(
-                    kind, item, selected=key in self.selected_scan_keys
-                ),
-            )
-            if key == focus_key:
-                focus_iid = iid
-
-        children = self.scan_tree.get_children()
-        target_iid = focus_iid or (children[0] if children and select_first else None)
-        if target_iid:
-            self.scan_tree.selection_set(target_iid)
-            self.scan_tree.focus(target_iid)
-        if children:
-            self._update_scan_detail()
-        elif self.scan_rows:
-            self._set_detail_text("当前筛选条件下没有扫描结果，请调整表头筛选。")
-        else:
-            self._set_detail_text("没有扫描到可导出的正文表格或带符号条款。")
-
-        self._refresh_scan_filter_headings()
-        self._refresh_scan_label()
-        self._schedule_scan_tree_column_separators()
-
-    def _refresh_scan_label(self):
-        selected = len(self.selected_scan_keys)
-        visible = len(self.scan_item_by_iid)
-        total = len(self.scan_rows)
-        filter_text = f"，筛选显示 {visible}/{total} 项" if self.scan_filters else ""
-        text = (
-            f"已扫描到 {len(self.table_items)} 张表格、{len(self.symbol_items)} 个符号章节"
-            f"{filter_text}，当前选择 {selected} 项"
-        )
-        self.scan_label.config(text=text, foreground="green" if selected else self.app.muted_fg)
-        self._refresh_visible_selection_button()
-
-    def _toggle_scan_row_from_event(self, event):
-        row_id = self.scan_tree.identify_row(event.y)
-        if row_id:
-            self._toggle_scan_iids([row_id])
-
-    def _toggle_scan_checkbox_from_click(self, event):
-        if self.scan_tree.identify_region(event.x, event.y) != "cell":
-            return None
-        if self.scan_tree.identify_column(event.x) != "#1":
-            return None
-        row_id = self.scan_tree.identify_row(event.y)
-        if not row_id:
-            return None
-        self.scan_tree.selection_set(row_id)
-        self.scan_tree.focus(row_id)
-        self._toggle_scan_iids([row_id])
-        self._update_scan_detail()
-        return "break"
-
-    def _toggle_scan_rows_from_keyboard(self, event=None):
-        self.toggle_selected_scan_rows()
-        return "break"
-
-    def toggle_selected_scan_rows(self):
-        selected_rows = self.scan_tree.selection()
-        if not selected_rows:
-            return
-        self._toggle_scan_iids(selected_rows)
-        self._update_scan_detail()
-
-    def _toggle_scan_iids(self, iids):
-        for iid in iids:
-            row = self.scan_item_by_iid.get(iid)
-            if row is None:
-                continue
-            kind, item = row
-            key = self._scan_key(kind, item)
-            if key in self.selected_scan_keys:
-                self.selected_scan_keys.remove(key)
-            else:
-                self.selected_scan_keys.add(key)
-        self._apply_scan_filters(select_first=True)
-
-    def select_recommended_tables(self):
-        visible_table_keys = {
-            self._scan_key(kind, item)
-            for kind, item in self.scan_item_by_iid.values()
-            if kind == "table"
-        }
-        recommended_tables = {
-            self._scan_key(kind, item)
-            for kind, item in self.scan_item_by_iid.values()
-            if kind == "table" and item.hint.startswith("建议关注")
-        }
-        self.selected_scan_keys.difference_update(visible_table_keys)
-        self.selected_scan_keys.update(recommended_tables)
-        self._refresh_all_scan_rows()
-        self._update_scan_detail()
-        self.status_var.set(f"已按提示选择 {len(recommended_tables)} 张建议关注的表格")
-
-    def _visible_scan_keys(self):
-        return {
-            self._scan_key(kind, item)
-            for kind, item in self.scan_item_by_iid.values()
-        }
-
-    def _refresh_visible_selection_button(self):
-        if not hasattr(self, "toggle_visible_selection_button"):
-            return
-        visible_keys = self._visible_scan_keys()
-        all_selected = bool(visible_keys) and visible_keys.issubset(self.selected_scan_keys)
-        self.toggle_visible_selection_button.config(
-            text="筛选结果全不选" if all_selected else "筛选结果全选"
-        )
-
-    def toggle_visible_scan_selection(self):
-        visible_keys = self._visible_scan_keys()
-        if not visible_keys:
-            self.status_var.set("当前筛选条件下没有可选择内容")
-            return
-        if visible_keys.issubset(self.selected_scan_keys):
-            self.selected_scan_keys.difference_update(visible_keys)
-            action = "已取消当前筛选显示的全部项目"
-        else:
-            self.selected_scan_keys.update(visible_keys)
-            action = "已选择当前筛选显示的全部项目"
-        self._refresh_all_scan_rows()
-        self._update_scan_detail()
-        self.status_var.set(f"{action}（{len(visible_keys)} 项）")
-
-    def select_all_scan_items(self):
-        visible_keys = self._visible_scan_keys()
-        self.selected_scan_keys.update(visible_keys)
-        self._refresh_all_scan_rows()
-        self._update_scan_detail()
-        self.status_var.set(f"已选择当前显示的 {len(visible_keys)} 项扫描结果")
-
-    def clear_scan_selection(self):
-        visible_keys = self._visible_scan_keys()
-        self.selected_scan_keys.difference_update(visible_keys)
-        self._refresh_all_scan_rows()
-        self._update_scan_detail()
-        self.status_var.set(f"已取消当前显示的 {len(visible_keys)} 项选择")
-
-    def _refresh_all_scan_rows(self):
-        self._apply_scan_filters(select_first=True)
-
-    def _update_scan_detail(self, event=None):
-        selection = self.scan_tree.selection()
-        iid = selection[0] if selection else self.scan_tree.focus()
-        row = self.scan_item_by_iid.get(iid)
-        if row is None:
-            self._set_detail_text("选择扫描结果中的一行，可查看完整章节、表格或符号条款预览。")
-            return
-
-        kind, item = row
-        selected = "是" if self._scan_key(kind, item) in self.selected_scan_keys else "否"
-        if kind == "table":
-            detail = (
-                f"导出：{selected}    类型：表格    文件：{item.filename}    "
-                f"表格：{item.table_index}    行列：{item.row_count}x{item.column_count}\n"
-                f"所在章节：{item.section}\n"
-                f"提示：{item.hint}\n"
-                f"表格前文：{item.context}\n"
-                f"内容预览：{item.preview}"
-            )
-        else:
-            detail = (
-                f"导出：{selected}    类型：符号条款    文件：{item.filename}    "
-                f"条款：{item.clause_count}条\n"
-                f"所在章节：{item.section}\n"
-                f"发现符号：{' '.join(item.symbols)}\n"
-                f"内容来源：{'、'.join(item.sources) or '未识别'}\n"
-                f"内容预览：{item.preview or '无可读文本'}"
-            )
-        self._set_detail_text(detail)
-
-    def _set_detail_text(self, text):
-        self.detail_text.configure(state="normal")
-        self.detail_text.delete("1.0", "end")
-        self.detail_text.insert("1.0", text)
-        self.detail_text.configure(state="disabled")
-
-    def _on_window_configure(self, event=None):
-        if event is not None and event.widget is not self.window:
-            return
-        self._refresh_constrained_texts()
-
-    def _on_output_frame_configure(self, event=None):
-        if event is not None and event.widget is not self.output_frame:
-            return
-        self._refresh_constrained_texts()
-
-    def _output_path_width(self):
-        try:
-            frame_w = self.output_frame.winfo_width()
-        except Exception:
-            return 0
-        if frame_w <= 1:
-            return 0
-        return max(frame_w - 80 - 110 - 40, 120)
-
-    def _status_width(self):
-        try:
-            row_width = self.action_frame.winfo_width()
-            button_width = self.export_button.winfo_reqwidth()
-        except Exception:
-            return 0
-        extra = 20
-        try:
-            if self.progress.winfo_ismapped():
-                extra += int(self.progress.winfo_reqwidth()) + 26
-        except Exception:
-            pass
-        return max(row_width - button_width - extra, 120)
-
-    def _refresh_constrained_texts(self):
-        if hasattr(self, "_output_path"):
-            self._output_path.refresh()
-        if hasattr(self, "_status_elide"):
-            self._status_elide.refresh()
-        try:
-            wrap = max(self.window.winfo_width() - 48, 200)
-            self.header_hint.configure(wraplength=wrap)
-            self.scan_label.configure(wraplength=wrap)
-        except (AttributeError, tk.TclError):
-            pass
-
-    def select_output_dir(self):
-        directory = filedialog.askdirectory(title="选择输出目录", parent=self.window)
-        if not directory:
-            return
-        self.output_dir = directory
-        self._output_path.set_text(directory, foreground="green")
-        self.status_var.set("已选择输出目录")
-        self._refresh_constrained_texts()
-
-    def _on_keep_symbols_toggled(self):
-        self._persist_symbol_extract_settings()
-        if self.keep_symbols_var.get():
-            self.status_var.set("条款正文将保留标记符号")
-        else:
-            self.status_var.set("条款正文不再保留标记符号，只写入符号列")
-        self._refresh_constrained_texts()
-
-    def _persist_symbol_extract_settings(self):
-        self.app.keep_clause_symbols = bool(self.keep_symbols_var.get())
-        if not self.app.restore_session:
-            return
-        settings = load_settings()
-        settings["keep_clause_symbols"] = self.app.keep_clause_symbols
-        save_settings(settings)
-
-    def _refresh_symbols_label(self):
-        chars = self.app.symbol_chars or DEFAULT_SYMBOL_CHARS
-        self.symbols_label.config(text=f"当前：{' '.join(chars)}")
-
-    def open_symbol_settings(self):
-        """打开自定义提取符号对话框：勾选/取消常用符号，也可输入其他符号。"""
-        from symbol_clause_extractor import COMMON_SYMBOL_CHOICES, normalize_symbol_chars
-
-        current = normalize_symbol_chars(self.app.symbol_chars) or DEFAULT_SYMBOL_CHARS
-        choices = list(COMMON_SYMBOL_CHOICES) + [
-            char for char in current if char not in COMMON_SYMBOL_CHOICES
-        ]
-
-        dialog = tk.Toplevel(self.window)
-        dialog.title("自定义提取符号")
-        dialog.withdraw()
-        dialog.transient(self.window)
-        dialog.resizable(False, False)
-        dialog.configure(bg=self.app.app_bg)
-        try:
-            dialog.iconphoto(True, self.app._icon_photo)
-        except Exception:
-            pass
-
-        outer = ttk.Frame(dialog, padding=14, style="App.TFrame")
-        outer.pack(fill="both", expand=True)
-        body = ttk.Frame(outer, padding=14, style="Surface.TFrame")
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        ttk.Label(body, text="选择要提取的标记符号", style="SectionTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(
-            body,
-            text="勾选要参与提取的符号（默认 ★ # △ ▲，可取消）；也可以在下方输入其他符号。",
-            style="Hint.TLabel",
-            wraplength=440,
-            justify="left",
-        ).grid(row=1, column=0, sticky="ew", pady=(3, 9))
-
-        grid = ttk.Frame(body, style="Toolbar.TFrame")
-        grid.grid(row=2, column=0, sticky="ew")
-        symbol_vars = {}
-        chips = {}
-        for index, symbol in enumerate(choices):
-            var = tk.BooleanVar(value=symbol in current)
-            symbol_vars[symbol] = var
-            chip = CanvasCheckbox(
-                grid,
-                symbol,
-                var,
-                self.app,
-                command=lambda: refresh_selected(),
-                padx=7,
-                pady=5,
-            )
-            chip.canvas.grid(row=index // 8, column=index % 8, padx=3, pady=2, sticky="w")
-            chips[symbol] = chip
-        dialog._symbol_chips = chips
-
-        ttk.Label(body, text="其他符号（可直接输入多个，追加到勾选项）", style="SectionTitle.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(12, 5)
-        )
-        entry_var = tk.StringVar()
-        entry = ttk.Entry(body, textvariable=entry_var, width=32)
-        entry.grid(row=4, column=0, sticky="w")
-        ttk.Label(
-            body,
-            text="数字、字母、汉字和空格会被自动忽略；符号须出现在条款开头或序号之后才会命中。",
-            style="Hint.TLabel",
-            wraplength=440,
-            justify="left",
-        ).grid(row=5, column=0, sticky="ew", pady=(4, 0))
-
-        selected_label = ttk.Label(body, text="", style="Muted.TLabel")
-        selected_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
-
-        def selected_chars():
-            chosen = [symbol for symbol, var in symbol_vars.items() if var.get()]
-            chosen += list(normalize_symbol_chars(entry_var.get()))
-            return "".join(dict.fromkeys(chosen))
-
-        def refresh_selected():
-            chars = selected_chars()
-            selected_label.config(
-                text=f"已选 {len(chars)} 个：{' '.join(chars)}" if chars else "已选 0 个：请至少保留一个符号"
-            )
-
-        def reset_default():
-            for symbol, var in symbol_vars.items():
-                var.set(symbol in DEFAULT_SYMBOL_CHARS)
-            entry_var.set("")
-            refresh_selected()
-
-        def save_selection():
-            chars = selected_chars()
-            if not chars:
-                messagebox.showwarning("提示", "请至少选择或输入一个符号。", parent=dialog)
-                return
-            changed = chars != self.app.symbol_chars
-            self.app.symbol_chars = chars
-            settings = load_settings()
-            settings["symbol_chars"] = chars
-            save_settings(settings)
-            self._refresh_symbols_label()
-            dialog.destroy()
-            if changed:
-                self._clear_scan_results("符号设置已变化，请重新扫描表格和符号")
-                self.status_var.set(f"扫描符号已更新为 {''.join(chars)}，请重新扫描")
-            else:
-                self.status_var.set(f"扫描符号保持为 {''.join(chars)}")
-
-        buttons = ttk.Frame(body, style="Toolbar.TFrame")
-        buttons.grid(row=7, column=0, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="恢复默认", command=reset_default, width=10).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="取消", command=dialog.destroy, width=8).pack(side="left", padx=(0, 8))
-        ttk.Button(
-            buttons, text="确定", style="Accent.TButton", command=save_selection, width=10
-        ).pack(side="left")
-
-        entry.bind("<KeyRelease>", lambda _event: refresh_selected())
-        dialog.bind("<Escape>", lambda _event: dialog.destroy())
-        refresh_selected()
-
-        # 高度必须按内容自适应：符号块较多时写死高度会把底部按钮裁掉
-        dialog.update_idletasks()
-        center_window_on_parent(
-            dialog,
-            self.window,
-            width=max(520, dialog.winfo_reqwidth()),
-            height=dialog.winfo_reqheight(),
-        )
-        dialog.deiconify()
-        dialog.lift()
-        dialog.focus_force()
-        entry.focus_set()
-
-    def start_export(self):
-        if not self.file_paths:
-            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
-            return
-        if not self.scan_rows:
-            messagebox.showwarning(
-                "提示", "请先点击“扫描表格和符号”。", parent=self.window
-            )
-            return
-        if not self.selected_scan_keys:
-            messagebox.showwarning(
-                "提示", "请先在扫描结果中选择至少一项。", parent=self.window
-            )
-            return
-
-        selected_tables = {}
-        for item in self.table_items:
-            key = self._scan_key("table", item)
-            if key not in self.selected_scan_keys:
-                continue
-            selected_tables.setdefault(key[1], []).append(item.table_index)
-
-        selected_sections = {}
-        for item in self.symbol_items:
-            key = self._scan_key("symbol", item)
-            if key not in self.selected_scan_keys:
-                continue
-            selected_sections.setdefault(key[1], []).append(item.section)
-
-        table_file_paths = [
-            file_path
-            for file_path in self.file_paths
-            if _file_identity(file_path) in selected_tables
-        ]
-        symbol_file_paths = [
-            file_path
-            for file_path in self.file_paths
-            if _file_identity(file_path) in selected_sections
-        ]
-        if not table_file_paths and not symbol_file_paths:
-            messagebox.showwarning("提示", "请先在扫描结果中选择至少一项。", parent=self.window)
-            return
-
-        output_dir = self.output_dir
-        symbol_chars = self.app.symbol_chars
-        keep_symbols_in_text = bool(self.keep_symbols_var.get())
-        total_files = len(table_file_paths) + len(symbol_file_paths)
-        self._begin_determinate_task(f"正在导出 {total_files} 个文件...", total_files)
-
-        def work(publish_progress):
-            from symbol_clause_extractor import batch_export_symbol_clauses
-            from word_table_exporter import batch_export_word_tables
-
-            table_results = {}
-            table_skipped = {}
-            table_error = None
-            symbol_results = None
-            symbol_skipped = {}
-            symbol_error = None
-
-            if table_file_paths:
-                def table_progress(current, total, filename):
-                    publish_progress(current, total_files, filename)
-
-                table_results, table_skipped, table_error = batch_export_word_tables(
-                    table_file_paths,
-                    output_dir=output_dir,
-                    progress_callback=table_progress,
-                    selected_tables=selected_tables or None,
-                )
-
-            if symbol_file_paths:
-                symbol_results = {}
-                table_count = len(table_file_paths)
-
-                def symbol_progress(current, total, filename):
-                    publish_progress(table_count + current, total_files, filename)
-
-                symbol_results, symbol_skipped, symbol_error = batch_export_symbol_clauses(
-                    symbol_file_paths,
-                    output_dir=output_dir,
-                    progress_callback=symbol_progress,
-                    symbols=symbol_chars,
-                    keep_symbols_in_text=keep_symbols_in_text,
-                    selected_sections=selected_sections,
-                )
-
-            return (
-                table_results,
-                table_skipped,
-                table_error,
-                symbol_results,
-                symbol_skipped,
-                symbol_error,
-            )
-
-        def on_success(result):
-            table_results, table_skipped, table_error, symbol_results, symbol_skipped, symbol_error = result
-            self._show_export_result(
-                table_results,
-                table_skipped,
-                table_error,
-                list(dict.fromkeys(table_file_paths + symbol_file_paths)),
-                symbol_results=symbol_results,
-                symbol_skipped=symbol_skipped,
-                symbol_error=symbol_error,
-            )
-
-        def on_error(exc):
-            self._finish_background_error(exc, "Word 表格和符号导出线程")
-
-        self._task_runner.submit(work, on_success, on_error, self._update_progress)
-
-    def _update_progress(self, current, total, filename, action="正在导出"):
-        self.progress.configure(maximum=total, value=current)
-        self.status_var.set(f"{action} ({current}/{total})：{filename}")
-        self._refresh_constrained_texts()
-
-    def _reset_busy_state(self):
-        self.progress.stop()
-        self.progress.configure(mode="determinate")
-        self.progress.configure(value=0)
-        self.progress.grid_remove()
-        self._set_busy_controls(False)
-        self._refresh_constrained_texts()
-
-    def _finish_background_error(self, exc, context):
-        log_path = write_error_log(type(exc), exc, exc.__traceback__, context=context)
-        self._finish_with_error(str(exc), log_path)
-
-    def _finish_with_error(self, message, log_path=None):
-        self._reset_busy_state()
-        self.status_var.set("导出失败")
-        detail = f"导出失败：{message}"
-        if log_path:
-            detail += f"\n\n错误日志：{log_path}"
-        messagebox.showerror("错误", detail, parent=self.window)
-
-    def _show_export_result(
-        self,
-        results,
-        skipped,
-        error,
-        source_files,
-        symbol_results=None,
-        symbol_skipped=None,
-        symbol_error=None,
-    ):
-        self._reset_busy_state()
-        total_tables = sum(int(item["tables"]) for item in results.values())
-        symbol_results = symbol_results or {}
-        symbol_skipped = symbol_skipped or {}
-        total_clauses = sum(int(item["count"]) for item in symbol_results.values())
-
-        lines = ["导出完成。"]
-        table_activity = bool(results or skipped or error)
-        symbol_activity = bool(symbol_results or symbol_skipped or symbol_error)
-
-        if table_activity:
-            lines.extend(["", f"表格导出：成功 {len(results)} 个文件，共 {total_tables} 张表格。"])
-            for filename, info in results.items():
-                lines.append(f"  {filename}: {info['tables']} 张表格 -> {info['output_path']}")
-
-        if symbol_activity:
-            lines.extend([
-                "",
-                f"指标参数提取：成功 {len(symbol_results)} 个文件，共 {total_clauses} 条带符号条款。",
-            ])
-            for filename, info in symbol_results.items():
-                lines.append(f"  {filename}: {info['count']} 条 -> {info['output_path']}")
-            if not symbol_results:
-                lines.append("  （未提取到带符号条款）")
-
-        if skipped:
-            lines.extend(["", "表格导出跳过文件："])
-            for filename, reason in skipped.items():
-                lines.append(f"  {filename}: {reason}")
-
-        if symbol_skipped:
-            lines.extend(["", "指标参数提取跳过文件："])
-            for filename, reason in symbol_skipped.items():
-                lines.append(f"  {filename}: {reason}")
-
-        if error or symbol_error:
-            lines.extend(["", "失败文件："])
-            if error:
-                lines.append(error)
-            if symbol_error:
-                lines.append(symbol_error)
-            self.status_var.set("导出完成（部分失败）")
-        else:
-            self.status_var.set("导出完成")
-
-        self._last_output_dir_to_open = self._default_output_dir_to_open(
-            results, source_files, symbol_results=symbol_results,
-        )
-        self._show_result_window("\n".join(lines))
-
-    def _default_output_dir_to_open(self, results=None, source_files=None, symbol_results=None):
-        if self.output_dir:
-            return self.output_dir
-        outputs = [results, symbol_results]
-        for collected in outputs:
-            first = next(iter(collected.values()), None) if collected else None
-            if first and first.get("output_path"):
-                return os.path.dirname(first["output_path"])
-        if source_files:
-            return os.path.dirname(source_files[0])
-        return None
-
-    def _open_output_dir(self):
-        directory = self._last_output_dir_to_open or self._default_output_dir_to_open()
-        if not directory:
-            return
-        try:
-            os.startfile(directory)
-        except Exception as exc:
-            messagebox.showerror("错误", f"无法打开输出目录：{exc}", parent=self.window)
-
-    def _show_result_window(self, message, title="导出结果"):
-        window = tk.Toplevel(self.window)
-        window.title(title)
-        window.minsize(560, 320)
-        window.configure(bg=self.app.app_bg)
-        window.transient(self.window)
-        window.withdraw()
-
-        body = ttk.Frame(window, padding=12, style="App.TFrame")
-        body.pack(fill="both", expand=True)
-        body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=1)
-
-        text = tk.Text(
-            body,
-            wrap="word",
-            font=self.app.body_font,
-            bg=self.app.surface_bg,
-            fg=self.app.text_fg,
-            relief="solid",
-            borderwidth=1,
-            padx=8,
-            pady=8,
-        )
-        text.grid(row=0, column=0, sticky="nsew")
-        scrollbar = FlatScrollbar(
-            body, orient="vertical", command=text.yview, style="Flat.Vertical.TScrollbar"
-        )
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        text.configure(yscrollcommand=scrollbar.set)
-        self.app._bind_vertical_mousewheel(text, text, scrollbar)
-        text.insert("1.0", message)
-        text.configure(state="disabled")
-
-        buttons = ttk.Frame(body, style="App.TFrame")
-        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(buttons, text="打开输出目录", command=self._open_output_dir, width=14).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="关闭", command=window.destroy, width=10).pack(side="left")
-
-        geometry = center_window_on_parent(window, self.window, width=720, height=440)
-        window.deiconify()
-        if geometry:
-            window.geometry(geometry)
-        else:
-            center_window_on_parent(window, self.window, width=720, height=440)
-        window.lift()
-        window.focus_force()
 
 
 def main():

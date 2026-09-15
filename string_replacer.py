@@ -9,6 +9,9 @@ import shutil
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
+from legacy_office import _atomic_editable_copy
+from replacement_rules import DELETE_MARKER, validate_rules
+
 warnings.filterwarnings("ignore", message="Data Validation extension is not supported")
 
 
@@ -61,7 +64,7 @@ def load_replacement_rules(excel_path: str) -> List[Tuple[str, str]]:
     rules = []
     seen = set()
     wb = load_workbook(excel_path, data_only=False)
-    ws = wb.active
+    ws = wb.worksheets[0]
 
     try:
         for old_cell, new_cell in ws.iter_rows(min_row=1, max_col=2):
@@ -117,11 +120,31 @@ def _load_xls_replacement_rules(excel_path: str) -> List[Tuple[str, str]]:
     return rules
 
 
+def save_replacement_rules(path, rows):
+    from openpyxl import Workbook
+    from file_io import atomic_output_path
+    from replacement_rules import normalize_rule_rows
+
+    workbook = Workbook()
+    try:
+        for row_index, values in enumerate(normalize_rule_rows(rows), 1):
+            for column, value in enumerate(values, 1):
+                cell = workbook.active.cell(row_index, column, value)
+                cell.data_type = "s"
+        with atomic_output_path(path) as temporary:
+            workbook.save(temporary)
+    finally:
+        workbook.close()
+
+
 def _prepare_rules(rules: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+    validate_rules(rules)
     prepared = []
     for order, (old_text, new_text) in enumerate(rules):
-        if not old_text:
+        if not old_text or new_text is None or new_text == "":
             continue
+        if new_text == DELETE_MARKER:
+            new_text = ""
         prepared.append({
             "old": old_text,
             "new": new_text,
@@ -234,6 +257,32 @@ def _is_occurrence_inside_replacement(text: str, start: int, old_text: str, new_
     return False
 
 
+def _replace_text_in_run(run, start: int, end: int, new_text: str) -> None:
+    """替换 run 内的文字区间，Word 的图片、域和未命中节点保持原位。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.text.run import CT_R
+
+    if not isinstance(run, CT_R):
+        text = run.text or ""
+        run.text = text[:start] + new_text + text[end:]
+        return
+
+    position = 0
+    for child in run.xpath("w:br | w:cr | w:noBreakHyphen | w:ptab | w:t | w:tab"):
+        text = str(child)
+        child_end = position + len(text)
+        if position < end and child_end > start:
+            replacement = OxmlElement("w:r")
+            # 借用 Word 的文字写入逻辑处理 xml:space、制表符和换行，
+            # 仅把生成的文字节点放回命中节点的位置，不清空原 run。
+            inserted = new_text if position <= start < child_end else ""
+            replacement.text = text[:max(0, start - position)] + inserted + text[max(0, end - position):]
+            for node in replacement:
+                child.addprevious(node)
+            run.remove(child)
+        position = child_end
+
+
 def _replace_range_in_runs(runs, spans: List[Dict[str, object]], start: int, end: int, new_text: str) -> None:
     start_span = _find_span_for_position(spans, start)
     end_span = _find_span_for_position(spans, end - 1)
@@ -242,25 +291,12 @@ def _replace_range_in_runs(runs, spans: List[Dict[str, object]], start: int, end
 
     start_index = start_span["index"]
     end_index = end_span["index"]
-    start_run = start_span["run"]
-    end_run = end_span["run"]
-
-    start_text = start_run.text or ""
-    prefix = start_text[:start - start_span["start"]]
-
-    if start_index == end_index:
-        suffix = start_text[end - start_span["start"]:]
-        start_run.text = prefix + new_text + suffix
-        return
-
-    end_text = end_run.text or ""
-    suffix = end_text[end - end_span["start"]:]
-    start_run.text = prefix + new_text
-
-    for index in range(start_index + 1, end_index):
-        runs[index].text = ""
-
-    end_run.text = suffix
+    for index in range(start_index, end_index + 1):
+        run = runs[index]
+        local_start = start - start_span["start"] if index == start_index else 0
+        local_end = end - end_span["start"] if index == end_index else len(run.text or "")
+        if local_start < local_end:
+            _replace_text_in_run(run, local_start, local_end, new_text if index == start_index else "")
 
 
 def _apply_rules_to_runs(runs, prepared_rules: List[Dict[str, str]]) -> int:
@@ -414,7 +450,8 @@ def replace_in_docx(file_path: str, rules: List[Tuple[str, str]], output_path: s
     total_count += _apply_rules_to_docx_headers_footers(doc, prepared_rules)
     total_count += _apply_rules_to_docx_aux_parts(doc, prepared_rules)
 
-    doc.save(output_path)
+    with _atomic_editable_copy(file_path, output_path) as temporary_path:
+        doc.save(temporary_path)
     return total_count
 
 
@@ -422,13 +459,13 @@ def _workbook_cell_text(value) -> Optional[str]:
     """把单元格值转成可参与文本替换的字符串；不适合替换的返回 None。
 
     公式格跳过（改文本会破坏公式）；日期/时间格跳过（显示格式由
-    number_format 决定，直接替换底层值会改变显示内容）；数值格按
-    Excel 的常规显示转成文本，规则原文与其显示内容一致时也能替换。
+    number_format 决定，直接替换底层值会改变显示内容）；数值格按底层
+    数值转成十进制文本，不模拟百分比、货币或补零等显示格式。
     """
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, str):
-        return None if value.startswith("=") else value
+        return value
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -445,6 +482,8 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
     for worksheet in workbook.worksheets:
         for row in worksheet.iter_rows():
             for cell in row:
+                if cell.data_type == "f":
+                    continue
                 text = _workbook_cell_text(cell.value)
                 if not text:
                     continue
@@ -452,6 +491,7 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
                 new_value, replaced_count = _replace_text_with_rules(text, prepared_rules)
                 if replaced_count:
                     cell.value = new_value
+                    cell.data_type = "s"
                     total_count += replaced_count
 
     return total_count
@@ -460,16 +500,16 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
 def replace_in_xlsx(file_path: str, rules: List[Tuple[str, str]], output_path: str) -> int:
     from openpyxl import load_workbook
 
-    if os.path.abspath(file_path) != os.path.abspath(output_path):
-        shutil.copy2(file_path, output_path)
-
     keep_vba = os.path.splitext(output_path)[1].lower() == ".xlsm"
-    workbook = load_workbook(output_path, keep_vba=keep_vba)
-    try:
-        total_count = replace_in_workbook(workbook, rules)
-        workbook.save(output_path)
-    finally:
-        workbook.close()
+    with _atomic_editable_copy(file_path, output_path) as temporary_path:
+        workbook = load_workbook(temporary_path, keep_vba=keep_vba)
+        try:
+            total_count = replace_in_workbook(workbook, rules)
+            workbook.save(temporary_path)
+        finally:
+            workbook.close()
+            if workbook.vba_archive is not None:
+                workbook.vba_archive.close()
 
     return total_count
 
@@ -522,7 +562,8 @@ def replace_in_pptx(file_path: str, rules: List[Tuple[str, str]], output_path: s
                 slide.notes_slide.notes_text_frame, prepared_rules
             )
 
-    presentation.save(output_path)
+    with _atomic_editable_copy(file_path, output_path) as temporary_path:
+        presentation.save(temporary_path)
     return total_count
 
 
@@ -575,9 +616,6 @@ def get_output_path(
     - 若目标路径已被其他已有文件占用，或本批任务中其他文件已占用，则追加 _1、_2…
     """
     dir_path = output_dir or os.path.dirname(file_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
     filename = os.path.basename(file_path)
     if rules:
         filename = apply_rules_to_filename(filename, rules)
@@ -620,8 +658,10 @@ def batch_replace(
     rules: List[Tuple[str, str]],
     output_dir: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    result_callback: Optional[Callable[[dict], None]] = None,
 ) -> Tuple[Dict[str, int], Optional[str]]:
     """批量处理 Office 文件，返回替换结果和错误信息。"""
+    validate_rules(rules)
     results = {}
     errors = []
     reserved_output_paths = set()
@@ -634,6 +674,8 @@ def batch_replace(
                 progress_callback(index + 1, len(file_paths), filename)
 
             try:
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
                 output_path = get_output_path(
                     file_path,
                     rules,
@@ -675,12 +717,20 @@ def batch_replace(
                     else:
                         count = replace_in_ppt(file_path, rules, output_path, legacy_session)
                 else:
-                    errors.append(f"{filename}: 不支持的文件格式")
-                    continue
+                    raise ValueError("不支持的文件格式")
 
                 results[_result_key(results, filename, file_path)] = count
+                if result_callback:
+                    result_callback({"source_path": os.path.abspath(file_path),
+                                     "output_path": os.path.abspath(output_path),
+                                     "count": count, "error": "",
+                                     "status": "零命中" if count == 0 else "成功"})
             except Exception as exc:
                 errors.append(f"{filename}: {_format_processing_error(exc)}")
+                if result_callback:
+                    result_callback({"source_path": os.path.abspath(file_path),
+                                     "output_path": "", "count": 0,
+                                     "error": _format_processing_error(exc), "status": "失败"})
     finally:
         if legacy_session is not None:
             legacy_session.close()

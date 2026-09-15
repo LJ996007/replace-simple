@@ -53,6 +53,7 @@ class TableScanItem:
     row_count: int
     column_count: int
     hint: str
+    table: Optional[ExportedTable] = None
 
 
 def get_table_export_output_path(docx_path: str, output_dir: Optional[str] = None) -> str:
@@ -70,9 +71,10 @@ def get_table_export_output_path(docx_path: str, output_dir: Optional[str] = Non
     return candidate
 
 
-def scan_word_tables(docx_path: str) -> List[TableScanItem]:
+def scan_word_tables(docx_path: str, document=None) -> List[TableScanItem]:
     """Scan body tables and return context-rich metadata for user selection."""
-    document = Document(docx_path)
+    if document is None:
+        document = Document(docx_path)
     filename = os.path.basename(docx_path)
     table_items: List[TableScanItem] = []
     headings: Dict[int, str] = {}
@@ -114,6 +116,7 @@ def scan_word_tables(docx_path: str) -> List[TableScanItem]:
             row_count=exported_table.row_count,
             column_count=exported_table.column_count,
             hint=hint,
+            table=exported_table,
         ))
 
     return table_items
@@ -171,6 +174,7 @@ def export_word_tables_to_excel(
     docx_path: str,
     output_path: str,
     table_indexes: Optional[List[int]] = None,
+    exported_tables: Optional[List[ExportedTable]] = None,
 ) -> int:
     """Export all body tables from one .docx file to one .xlsx workbook.
 
@@ -179,29 +183,27 @@ def export_word_tables_to_excel(
     """
     from openpyxl import Workbook
 
-    document = Document(docx_path)
-    tables = _body_tables(document)
-    if table_indexes is not None:
-        selected = set(table_indexes)
-        tables = [
-            table
-            for index, table in enumerate(tables, start=1)
-            if index in selected
-        ]
+    if exported_tables is None:
+        document = Document(docx_path)
+        tables = _body_tables(document)
+        if table_indexes is not None:
+            selected = set(table_indexes)
+            tables = [table for index, table in enumerate(tables, start=1) if index in selected]
+        exported_tables = [_extract_table(table) for table in tables]
 
-    if not tables:
+    if not exported_tables:
         return 0
 
     workbook = Workbook()
     try:
-        for sheet_index, table in enumerate(tables, start=1):
+        for sheet_index, table in enumerate(exported_tables, start=1):
             worksheet = workbook.active if sheet_index == 1 else workbook.create_sheet()
             worksheet.title = f"表格{sheet_index}"
-            _write_table_to_worksheet(worksheet, _extract_table(table))
+            _write_table_to_worksheet(worksheet, table)
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         workbook.save(output_path)
-        return len(tables)
+        return len(exported_tables)
     finally:
         workbook.close()
 
@@ -566,6 +568,7 @@ def _write_table_to_worksheet(worksheet, table: ExportedTable) -> None:
     for exported_cell in table.cells:
         cell = worksheet.cell(row=exported_cell.row, column=exported_cell.column)
         cell.value = exported_cell.text
+        cell.data_type = "s"
 
     for exported_cell in table.cells:
         end_row = exported_cell.row + exported_cell.row_span - 1
