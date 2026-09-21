@@ -567,6 +567,16 @@ def collect_supported_files(directory, extensions, progress_callback=None):
     return collected
 
 
+def cancel_widget_callbacks(event):
+    """销毁时取消控件的延迟回调；根窗口关闭时清空所属解释器的任务。"""
+    widget = event.widget
+    commands = set(widget._tclCommands or ())
+    for task in widget.tk.splitlist(widget.tk.call("after", "info")):
+        script, _kind = widget.tk.call("after", "info", task)
+        if isinstance(widget, tk.Tk) or widget.tk.splitlist(script)[0] in commands:
+            widget.after_cancel(task)
+
+
 class BackgroundTaskRunner:
     """通过队列把后台任务结果安全地交回 Tk 主线程。"""
 
@@ -718,5 +728,4 @@ def cap_existing_scrollbar(scrollbar, command, scrollable, orientation="vertical
         scrollable.configure(xscrollcommand=model.set)
     scrollbar._capped_model = model
     return model
-
 

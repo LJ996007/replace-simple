@@ -1,5 +1,5 @@
 python-docx
-openpyxl
+openpyxl>=3.1.5
 xlrd
 python-pptx
 pywin32; sys_platform == "win32"

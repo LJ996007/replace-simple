@@ -476,6 +476,10 @@ def _workbook_cell_text(value) -> Optional[str]:
 
 
 def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
+    from copy import copy
+    from types import SimpleNamespace
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+
     prepared_rules = _prepare_rules(rules)
     total_count = 0
 
@@ -484,11 +488,17 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
             for cell in row:
                 if cell.data_type == "f":
                     continue
-                text = _workbook_cell_text(cell.value)
-                if not text:
-                    continue
-
-                new_value, replaced_count = _replace_text_with_rules(text, prepared_rules)
+                if isinstance(cell.value, CellRichText):
+                    runs = [copy(part) if isinstance(part, TextBlock) else SimpleNamespace(text=str(part))
+                            for part in cell.value]
+                    replaced_count = _apply_rules_to_runs(runs, prepared_rules)
+                    new_value = CellRichText([run if isinstance(run, TextBlock) else run.text
+                                              for run in runs if run.text])
+                else:
+                    text = _workbook_cell_text(cell.value)
+                    if not text:
+                        continue
+                    new_value, replaced_count = _replace_text_with_rules(text, prepared_rules)
                 if replaced_count:
                     cell.value = new_value
                     cell.data_type = "s"
@@ -502,10 +512,11 @@ def replace_in_xlsx(file_path: str, rules: List[Tuple[str, str]], output_path: s
 
     keep_vba = os.path.splitext(output_path)[1].lower() == ".xlsm"
     with _atomic_editable_copy(file_path, output_path) as temporary_path:
-        workbook = load_workbook(temporary_path, keep_vba=keep_vba)
+        workbook = load_workbook(temporary_path, keep_vba=keep_vba, rich_text=True)
         try:
             total_count = replace_in_workbook(workbook, rules)
-            workbook.save(temporary_path)
+            if total_count:
+                workbook.save(temporary_path)
         finally:
             workbook.close()
             if workbook.vba_archive is not None:

@@ -259,6 +259,37 @@ class SimpleReplacementTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_same_dir_replace_button_clears_selected_output_dir(self):
+        root = create_hidden_root()
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app._apply_output_dir(r"C:\output")
+
+            app.same_dir_button.invoke()
+            root.update_idletasks()
+
+            self.assertIsNone(app.output_dir)
+            self.assertTrue(app.same_dir_replace)
+            self.assertEqual(app.status_var.get(), "已选择同目录替换")
+            self.assertEqual(app.same_dir_button.cget("text"), "✓ 同目录替换")
+            self.assertIn("各待处理文件所在目录", app.output_label.cget("text"))
+        finally:
+            root.destroy()
+
+    def test_selecting_output_dir_leaves_same_dir_replace_mode(self):
+        root = create_hidden_root()
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app.select_same_dir_replace()
+
+            app._apply_output_dir(r"C:\output")
+
+            self.assertEqual(app.output_dir, r"C:\output")
+            self.assertFalse(app.same_dir_replace)
+            self.assertEqual(app.same_dir_button.cget("text"), "同目录替换")
+        finally:
+            root.destroy()
+
     def test_long_status_and_progress_filename_do_not_cover_start_button(self):
         root = create_hidden_root()
         try:
@@ -447,7 +478,7 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertGreaterEqual(app.table_export_window.WINDOW_WIDTH, 1200)
             self.assertGreaterEqual(app.table_export_window.WINDOW_HEIGHT, 1000)
             self.assertGreaterEqual(int(app.table_export_window.scan_tree.cget("height")), 18)
-            self.assertGreaterEqual(int(app.table_export_window.detail_text.cget("height")), 10)
+            self.assertGreaterEqual(int(app.table_export_window.detail_text.cget("height")), 5)
             self.assertEqual(app.table_export_window.window.resizable(), (1, 1))
             self.assertFalse(bool(app.table_export_window.window.transient()))
             self.assertTrue(hasattr(app.table_export_window, "detail_scrollbar"))
@@ -455,15 +486,15 @@ class SimpleReplacementTests(unittest.TestCase):
                 app.table_export_window.scan_tree.cget("columns"),
                 ("selected", "file", "type", "section", "item", "quantity"),
             )
-            self.assertEqual(app.table_export_window.scan_tree.heading("section", "text"), "所在章节 ▼")
+            self.assertEqual(app.table_export_window.scan_tree.heading("section", "text"), "所在章节")
             self.assertTrue(all(
-                "▼" in app.table_export_window.scan_tree.heading(column, "text")
+                "▼" not in app.table_export_window.scan_tree.heading(column, "text")
                 for column in app.table_export_window.scan_tree.cget("columns")
             ))
             self.assertTrue(app.table_export_window.scan_tree.bind("<B1-Motion>"))
             self.assertEqual(
                 app.table_export_window.toggle_visible_selection_button.cget("text"),
-                "筛选结果全选",
+                "勾选当前结果",
             )
             self.assertNotIn("hint", app.table_export_window.scan_tree.cget("columns"))
             self.assertEqual(
@@ -544,34 +575,6 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertEqual(exporter.scan_tree.item("2", "values")[2], "符号条款")
 
             root.update_idletasks()
-            heading_y = max(2, exporter._scan_tree_header_height() // 2)
-            type_x = (
-                int(exporter.scan_tree.column("selected", "width"))
-                + int(exporter.scan_tree.column("file", "width"))
-                + int(exporter.scan_tree.column("type", "width")) // 2
-            )
-            self.assertEqual(exporter.scan_tree.identify_region(type_x, heading_y), "heading")
-            exporter._open_scan_filter_from_heading(SimpleNamespace(
-                x=type_x,
-                y=heading_y,
-                x_root=exporter.scan_tree.winfo_rootx() + type_x,
-                y_root=exporter.scan_tree.winfo_rooty() + heading_y,
-            ))
-            self.assertIsNotNone(exporter._filter_popup)
-
-            def walk(widget):
-                for child in widget.winfo_children():
-                    yield child
-                    yield from walk(child)
-
-            filter_listboxes = [
-                child for child in walk(exporter._filter_popup)
-                if isinstance(child, tk.Listbox)
-            ]
-            self.assertEqual(len(filter_listboxes), 1)
-            self.assertEqual(filter_listboxes[0].cget("selectmode"), "multiple")
-            exporter._close_scan_filter_popup()
-
             exporter._update_scan_tree_column_separators()
             first_separator = exporter._scan_column_separators[0]
             old_place = first_separator.place_info()
@@ -584,28 +587,28 @@ class SimpleReplacementTests(unittest.TestCase):
             exporter._update_scan_tree_column_separators(SimpleNamespace())
             self.assertGreater(int(first_separator.place_info()["x"]), old_x)
 
-            exporter._set_scan_filter("type", ["符号条款"])
+            exporter._set_multi_filter("type", {"符号条款"})
             self.assertEqual(len(exporter.scan_tree.get_children()), 1)
             self.assertIn("[筛]", exporter.scan_tree.heading("type", "text"))
             self.assertEqual(
-                exporter._available_scan_filter_values("type"),
-                ["表格", "符号条款"],
+                exporter.filter_boxes["type"].cget("text"),
+                "已选 1 项 ▾",
             )
             self.assertEqual(
                 exporter.toggle_visible_selection_button.cget("text"),
-                "筛选结果全选",
+                "勾选当前结果",
             )
             exporter.toggle_visible_selection_button.invoke()
             self.assertEqual(exporter.selected_scan_keys, {exporter._scan_key("symbol", symbol_item)})
             self.assertEqual(
                 exporter.toggle_visible_selection_button.cget("text"),
-                "筛选结果全不选",
+                "勾选当前结果",
             )
-            exporter.toggle_visible_selection_button.invoke()
+            exporter.clear_scan_selection()
             self.assertEqual(exporter.selected_scan_keys, set())
             exporter.toggle_visible_selection_button.invoke()
 
-            exporter._set_scan_filter("type", ["表格", "符号条款"])
+            exporter.reset_scan_filters()
             self.assertEqual(len(exporter.scan_tree.get_children()), 2)
             self.assertNotIn("[筛]", exporter.scan_tree.heading("type", "text"))
 

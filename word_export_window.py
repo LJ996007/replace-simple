@@ -1,6 +1,7 @@
 """Word 表格与指标条款提取窗口。"""
 
 import os
+from dataclasses import replace
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from app_settings import load_settings, save_settings
@@ -15,6 +16,7 @@ from ui_common import (
     _file_identity,
     collect_supported_files,
     BackgroundTaskRunner,
+    cancel_widget_callbacks,
     FlatScrollbar,
 )
 
@@ -36,6 +38,7 @@ class WordTableExportWindow:
     def __init__(self, app, initial_files=None):
         self.app = app
         self.window = tk.Toplevel(app.root)
+        self.window.bind("<Destroy>", cancel_widget_callbacks, add="+")
         self._task_runner = BackgroundTaskRunner(self.window)
         self._busy_widgets = []
         self.window.title("提取信息")
@@ -62,7 +65,8 @@ class WordTableExportWindow:
         self.scan_item_by_iid = {}
         self.selected_scan_keys = set()
         self.scan_filters = {}
-        self._filter_popup = None
+        self.keyword_var = tk.StringVar(value="")
+        self.only_selected_var = tk.BooleanVar(value=False)
         self.output_dir = None
         self.keep_symbols_var = tk.BooleanVar(value=bool(app.keep_clause_symbols))
         self._last_output_dir_to_open = None
@@ -138,13 +142,6 @@ class WordTableExportWindow:
         if self._task_runner.active:
             messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭窗口。", parent=self.window)
             return
-        self._close_scan_filter_popup()
-        if self._scan_separator_after is not None:
-            try:
-                self.window.after_cancel(self._scan_separator_after)
-            except tk.TclError:
-                pass
-            self._scan_separator_after = None
         if hasattr(self, "_output_path"):
             self._output_path.hide_tooltip()
         self.app.table_export_window = None
@@ -260,30 +257,61 @@ class WordTableExportWindow:
             scan_toolbar, text="扫描表格和符号", command=self.scan_content, width=14
         )
         self.scan_button.pack(side="left", padx=(0, 6))
-        self._create_busy_button(scan_toolbar, text="推荐表格", command=self.select_recommended_tables, width=10).pack(side="left", padx=(0, 6))
+        self._create_busy_button(scan_toolbar, text="追加推荐表格", command=self.select_recommended_tables, width=14, style="TButton").pack(side="left", padx=(0, 6))
         self.toggle_visible_selection_button = self._create_busy_button(
             scan_toolbar,
-            text="筛选结果全选",
-            command=self.toggle_visible_scan_selection,
+            text="勾选当前结果",
+            style="TButton",
+            command=self.select_all_scan_items,
             width=14,
         )
         self.toggle_visible_selection_button.pack(side="left")
+        self._create_busy_button(scan_toolbar, text="取消当前结果", command=self.clear_scan_selection, style="TButton").pack(side="left", padx=6)
+        self._create_busy_button(scan_toolbar, text="清空全部", command=self.clear_all_scan_selection, style="TButton").pack(side="left")
+
+        filters = ttk.Frame(scan_frame, style="Toolbar.TFrame")
+        filters.grid(row=1, column=0, sticky="ew", pady=6)
+        self.filter_boxes = {}
+        for column, title in (("file", "文件"), ("section", "章节"), ("type", "类型")):
+            ttk.Label(filters, text=title).pack(side="left", padx=(0, 4))
+            if column == "file":
+                box = ttk.Combobox(filters, state="readonly", width=18)
+                box.bind("<<ComboboxSelected>>", lambda event: self._choose_filter("file"))
+            else:
+                box = ttk.Button(filters, text="全部 ▾", width=18 if column == "section" else 12,
+                                 style="TButton",
+                                 command=lambda c=column: self._open_multi_filter(c))
+            box.pack(side="left", padx=(0, 8))
+            self.filter_boxes[column] = box
+        search = ttk.Frame(scan_frame, style="Toolbar.TFrame")
+        search.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(search, text="关键词").pack(side="left")
+        ttk.Entry(search, textvariable=self.keyword_var, width=30).pack(side="left", padx=4)
+        self.keyword_var.trace_add("write", lambda *_: self._apply_scan_filters())
+        ttk.Checkbutton(search, text="仅看已选", variable=self.only_selected_var,
+                        command=self._apply_scan_filters).pack(side="left")
+        ttk.Button(search, text="重置筛选", command=self.reset_scan_filters, style="TButton").pack(side="left", padx=4)
+        ttk.Label(search, text="单击预览 · 勾选或空格选择 · 展开章节逐条选择", style="Muted.TLabel").pack(side="left", padx=8)
+        scan_frame.rowconfigure(1, weight=0)
+        scan_frame.rowconfigure(2, weight=0)
+        scan_frame.rowconfigure(3, weight=1, minsize=90)
 
         tree_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
-        tree_frame.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
+        tree_frame.grid(row=3, column=0, sticky="nsew", pady=(7, 0))
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
 
         self.scan_tree = ttk.Treeview(
             tree_frame,
             columns=("selected", "file", "type", "section", "item", "quantity"),
-            show="headings",
+            show="tree headings",
             selectmode="extended",
             style="Scan.Treeview",
             height=18,
         )
         for column, title in self.SCAN_COLUMN_TITLES.items():
-            self.scan_tree.heading(column, text=f"{title} ▼")
+            self.scan_tree.heading(column, text=title)
+        self.scan_tree.column("#0", width=32, minwidth=32, stretch=False)
         self.scan_tree.column("selected", width=64, minwidth=56, anchor="center", stretch=False)
         self.scan_tree.column("file", width=205, minwidth=130, stretch=False)
         self.scan_tree.column("type", width=90, minwidth=76, anchor="center", stretch=False)
@@ -332,22 +360,20 @@ class WordTableExportWindow:
             takefocus=False,
         )
         self.scan_tree.bind("<Button-1>", self._toggle_scan_checkbox_from_click)
-        self.scan_tree.bind("<ButtonRelease-1>", self._open_scan_filter_from_heading, add="+")
         self.scan_tree.bind("<ButtonRelease-1>", self._schedule_scan_tree_column_separators, add="+")
         self.scan_tree.bind("<B1-Motion>", self._schedule_scan_tree_column_separators, add="+")
         self.scan_tree.bind("<Configure>", self._schedule_scan_tree_column_separators, add="+")
-        self.scan_tree.bind("<Double-1>", self._toggle_scan_row_from_event)
         self.scan_tree.bind("<space>", self._toggle_scan_rows_from_keyboard)
         self.scan_tree.bind("<<TreeviewSelect>>", self._update_scan_detail)
         self._schedule_scan_tree_column_separators()
 
         detail_frame = ttk.Frame(scan_frame, style="Toolbar.TFrame")
-        detail_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        detail_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(0, weight=1)
         self.detail_text = tk.Text(
             detail_frame,
-            height=10,
+            height=5,
             wrap="word",
             font=self.app.body_font,
             bg="#F1F3F6",
@@ -373,7 +399,7 @@ class WordTableExportWindow:
         self.detail_text.configure(state="disabled")
 
         self.scan_label = ttk.Label(scan_frame, text="请先添加 Word 文件并扫描表格和符号", style="Muted.TLabel")
-        self.scan_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        self.scan_label.grid(row=5, column=0, sticky="ew", pady=(5, 0))
 
         # 符号扫描设置：符号范围在扫描前确定，是否保留符号只影响最终导出
         symbols_frame = ttk.Frame(body, padding=(12, 8), style="Surface.TFrame")
@@ -461,7 +487,7 @@ class WordTableExportWindow:
 
         self.export_button = self._create_busy_button(
             action_frame,
-            text="开始导出",
+            text="导出已选 0 项",
             command=self.start_export,
             width=14,
             style="Accent.TButton",
@@ -501,197 +527,130 @@ class WordTableExportWindow:
         elif not overflow and shown:
             self.scan_x_scrollbar.grid_remove()
 
-    def _close_scan_filter_popup(self):
-        popup = self._filter_popup
-        self._filter_popup = None
-        if popup is None:
-            return
-        try:
-            popup.grab_release()
-        except tk.TclError:
-            pass
-        try:
-            if popup.winfo_exists():
-                popup.destroy()
-        except tk.TclError:
-            pass
-
     def _refresh_scan_filter_headings(self):
         if not hasattr(self, "scan_tree"):
             return
         for column, title in self.SCAN_COLUMN_TITLES.items():
-            marker = " [筛] ▼" if column in self.scan_filters else " ▼"
+            marker = " [筛]" if column in self.scan_filters else ""
             self.scan_tree.heading(column, text=title + marker)
+        for column, box in self.filter_boxes.items():
+            values = list(dict.fromkeys(self._scan_filter_value(column, kind, item)
+                                       for kind, item in self.scan_rows))
+            if column == "file":
+                box.configure(values=["全部", *values])
+                box.set(next(iter(self.scan_filters.get(column, ())), "全部"))
+            else:
+                chosen = self.scan_filters.get(column)
+                label = "全部" if chosen is None else f"已选 {len(chosen)} 项"
+                box.configure(text=label + " ▾")
+
+    def _open_multi_filter(self, column):
+        values = list(dict.fromkeys(self._scan_filter_value(column, kind, item)
+                                   for kind, item in self.scan_rows))
+        popup = tk.Toplevel(self.window)
+        popup.title("筛选" + self.SCAN_COLUMN_TITLES[column])
+        popup.configure(bg=self.app.surface_bg)
+        popup.transient(self.window)
+        frame = ttk.Frame(popup, padding=12, style="Toolbar.TFrame")
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="点击可多选；确定后应用，取消保留原筛选。 ").pack(anchor="w")
+        list_frame = ttk.Frame(frame, style="Toolbar.TFrame")
+        list_frame.pack(fill="both", expand=True, pady=8)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        choices = tk.Listbox(list_frame, selectmode="multiple", exportselection=False,
+                             width=60, height=min(14, max(4, len(values))),
+                             bg=self.app.surface_bg, fg=self.app.text_fg,
+                             selectbackground="#C6DFF3", selectforeground=self.app.text_fg)
+        choices.grid(row=0, column=0, sticky="nsew")
+        chosen = self.scan_filters.get(column, set(values))
+        for index, value in enumerate(values):
+            choices.insert("end", value)
+            if value in chosen:
+                choices.selection_set(index)
+        scrollbar = FlatScrollbar(list_frame, orient="vertical", command=choices.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        choices.configure(yscrollcommand=scrollbar.set)
+        horizontal = FlatScrollbar(list_frame, orient="horizontal", command=choices.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        choices.configure(xscrollcommand=horizontal.set)
+        buttons = ttk.Frame(frame, style="Toolbar.TFrame")
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="全选", style="TButton", command=lambda: choices.selection_set(0, "end")).pack(side="left")
+        ttk.Button(buttons, text="全不选", style="TButton", command=lambda: choices.selection_clear(0, "end")).pack(side="left", padx=6)
+
+        def apply():
+            self._set_multi_filter(column, {values[i] for i in choices.curselection()})
+            popup.destroy()
+
+        ttk.Button(buttons, text="确定", style="TButton", command=apply).pack(side="right")
+        ttk.Button(buttons, text="取消", style="TButton", command=popup.destroy).pack(side="right", padx=6)
+        popup.bind("<Escape>", lambda _event: popup.destroy())
+        center_window_on_parent(popup, self.window, width=620, height=400)
+        popup.grab_set()
+        choices.focus_set()
+
+    def _set_multi_filter(self, column, chosen):
+        available = {self._scan_filter_value(column, kind, item) for kind, item in self.scan_rows}
+        if chosen == available:
+            self.scan_filters.pop(column, None)
+        else:
+            self.scan_filters[column] = set(chosen)
+        self._apply_scan_filters(select_first=True)
+
+    def _choose_filter(self, column):
+        value = self.filter_boxes[column].get()
+        if self.filter_boxes[column].current() == 0:
+            self.scan_filters.pop(column, None)
+        else:
+            self.scan_filters[column] = {value}
+        self._apply_scan_filters(select_first=True)
+
+    def reset_scan_filters(self):
+        self.scan_filters.clear()
+        self.only_selected_var.set(False)
+        self.keyword_var.set("")
+        self._apply_scan_filters(select_first=True)
 
     def _scan_filter_value(self, column, kind, item):
-        if column == "selected":
-            return "已选" if self._scan_key(kind, item) in self.selected_scan_keys else "未选"
         if column == "file":
-            return item.filename
+            return item.file_path
         if column == "type":
             return "表格" if kind == "table" else "符号条款"
         if column == "section":
             return item.section
-        if column == "item":
-            return f"表格{item.table_index}" if kind == "table" else " ".join(item.symbols)
-        if column == "quantity":
-            return (
-                f"{item.row_count}x{item.column_count}"
-                if kind == "table"
-                else f"{item.clause_count}条"
-            )
         return ""
 
-    def _scan_row_matches_filters(self, kind, item, ignore_column=None):
+    def _scan_row_matches_filters(self, kind, item):
+        if self.only_selected_var.get() and not self._row_keys(kind, item) & self.selected_scan_keys:
+            return False
+        keyword = self.keyword_var.get().strip().casefold()
+        if keyword and keyword not in self._search_text(kind, item).casefold():
+            return False
         for column, selected_values in self.scan_filters.items():
-            if column == ignore_column:
-                continue
             if self._scan_filter_value(column, kind, item) not in selected_values:
                 return False
         return True
 
-    def _available_scan_filter_values(self, column):
-        values = []
-        seen = set()
-        for kind, item in self.scan_rows:
-            if not self._scan_row_matches_filters(kind, item, ignore_column=column):
-                continue
-            value = self._scan_filter_value(column, kind, item)
-            if value in seen:
-                continue
-            seen.add(value)
-            values.append(value)
-        return values
+    def _search_text(self, kind, item):
+        return f"{item.file_path}\n{item.section}\n{self._preview_content(kind, item)}"
 
-    def _set_scan_filter(self, column, selected_values):
-        available = set(self._available_scan_filter_values(column))
-        chosen = set(selected_values)
-        if chosen == available:
-            self.scan_filters.pop(column, None)
-        else:
-            self.scan_filters[column] = chosen
-        self._apply_scan_filters(select_first=True)
+    def _preview_content(self, kind, item):
+        if kind == "table" and item.table is not None:
+            rows = {}
+            for cell in item.table.cells:
+                rows.setdefault(cell.row, []).append(f"[列{cell.column}] {cell.text}")
+            return "\n".join(f"第{row}行：" + " | ".join(cells) for row, cells in rows.items())
+        return "\n\n".join(clause.text for clause in getattr(item, "clauses", ())) or item.preview
 
-    def _open_scan_filter_from_heading(self, event):
-        if self.scan_tree.identify_region(event.x, event.y) != "heading":
-            return
-        column_id = self.scan_tree.identify_column(event.x)
-        try:
-            column_index = int(column_id.removeprefix("#")) - 1
-            column = self.scan_tree.cget("columns")[column_index]
-        except (ValueError, IndexError, TypeError):
-            return
-        if column not in self.SCAN_COLUMN_TITLES:
-            return
+    def _clause_items(self, item):
+        return [replace(item, clauses=(clause,), clause_count=1, symbols=(clause.symbol,),
+                        sources=(clause.source,), preview=clause.text) for clause in item.clauses]
 
-        self._close_scan_filter_popup()
-        values = self._available_scan_filter_values(column)
-        selected_values = set(self.scan_filters.get(column, values))
-
-        popup = tk.Toplevel(self.window)
-        self._filter_popup = popup
-        popup.title(f"筛选：{self.SCAN_COLUMN_TITLES[column]}")
-        popup.transient(self.window)
-        popup.resizable(False, False)
-        popup.configure(bg=self.app.app_bg)
-        popup.protocol("WM_DELETE_WINDOW", self._close_scan_filter_popup)
-
-        outer = ttk.Frame(popup, padding=10, style="App.TFrame")
-        outer.pack(fill="both", expand=True)
-        body = ttk.Frame(outer, padding=10, style="Surface.TFrame")
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(1, weight=1)
-        ttk.Label(
-            body,
-            text=f"筛选“{self.SCAN_COLUMN_TITLES[column]}”（点击可多选）",
-            style="SectionTitle.TLabel",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 7))
-
-        list_width = min(72, max(26, max((len(value) for value in values), default=12) + 3))
-        listbox = tk.Listbox(
-            body,
-            selectmode="multiple",
-            exportselection=False,
-            height=min(14, max(4, len(values))),
-            width=list_width,
-            font=self.app.body_font,
-            bg=self.app.surface_bg,
-            fg=self.app.text_fg,
-            selectbackground="#3F6D92",
-            selectforeground="white",
-            relief="solid",
-            borderwidth=1,
-        )
-        listbox.grid(row=1, column=0, sticky="nsew")
-        for index, value in enumerate(values):
-            listbox.insert("end", value)
-            if value in selected_values:
-                listbox.selection_set(index)
-
-        scrollbar = FlatScrollbar(
-            body,
-            orient="vertical",
-            command=listbox.yview,
-            style="Flat.Vertical.TScrollbar",
-        )
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        x_scrollbar = FlatScrollbar(
-            body,
-            orient="horizontal",
-            command=listbox.xview,
-            style="Flat.Horizontal.TScrollbar",
-        )
-        x_scrollbar.grid(row=2, column=0, sticky="ew")
-        listbox.configure(
-            yscrollcommand=scrollbar.set,
-            xscrollcommand=x_scrollbar.set,
-        )
-        self.app._bind_vertical_mousewheel(listbox, listbox, scrollbar)
-
-        selection_buttons = ttk.Frame(body, style="Toolbar.TFrame")
-        selection_buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(
-            selection_buttons,
-            text="全选",
-            width=8,
-            command=lambda: listbox.selection_set(0, "end"),
-        ).pack(side="left", padx=(0, 6))
-        ttk.Button(
-            selection_buttons,
-            text="全不选",
-            width=8,
-            command=lambda: listbox.selection_clear(0, "end"),
-        ).pack(side="left")
-
-        def apply_selection():
-            chosen = [values[index] for index in listbox.curselection()]
-            self._close_scan_filter_popup()
-            self._set_scan_filter(column, chosen)
-
-        def clear_filter():
-            self.scan_filters.pop(column, None)
-            self._close_scan_filter_popup()
-            self._apply_scan_filters(select_first=True)
-
-        buttons = ttk.Frame(body, style="Toolbar.TFrame")
-        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(buttons, text="清除筛选", command=clear_filter, width=10).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="取消", command=self._close_scan_filter_popup, width=8).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="确定", style="Accent.TButton", command=apply_selection, width=8).pack(side="left")
-
-        popup.bind("<Escape>", lambda _event: self._close_scan_filter_popup())
-        popup.update_idletasks()
-        popup_width = popup.winfo_reqwidth()
-        popup_height = popup.winfo_reqheight()
-        screen_width = popup.winfo_screenwidth()
-        screen_height = popup.winfo_screenheight()
-        x = max(8, min(event.x_root, screen_width - popup_width - 8))
-        y = max(8, min(event.y_root + 4, screen_height - popup_height - 48))
-        popup.geometry(f"{popup_width}x{popup_height}+{x}+{y}")
-        popup.grab_set()
-        popup.lift()
-        listbox.focus_set()
+    def _row_keys(self, kind, item):
+        if kind == "symbol" and item.clauses:
+            return {self._scan_key("clause", child) for child in self._clause_items(item)}
+        return {self._scan_key(kind, item)}
 
     def _schedule_scan_tree_column_separators(self, event=None):
         if self._scan_separator_after is not None:
@@ -744,7 +703,8 @@ class WordTableExportWindow:
         try:
             columns = tuple(self.scan_tree.cget("columns"))
             widths = [int(self.scan_tree.column(column, "width")) for column in columns]
-            total_width = sum(widths)
+            tree_width = int(self.scan_tree.column("#0", "width"))
+            total_width = sum(widths) + tree_width
             if total_width <= 0:
                 return
 
@@ -759,7 +719,7 @@ class WordTableExportWindow:
             origin_x = self.scan_tree.winfo_x()
             origin_y = self.scan_tree.winfo_y()
             header_height = self._scan_tree_header_height()
-            boundary = 0
+            boundary = tree_width
             for separator, width in zip(self._scan_column_separators, widths[:-1]):
                 boundary += width
                 x = round(boundary - scroll_offset)
@@ -920,9 +880,10 @@ class WordTableExportWindow:
     ):
         self.table_items = list(table_items)
         self.symbol_items = list(symbol_items)
-        self._close_scan_filter_popup()
         self.selected_scan_keys = set()
         self.scan_filters = {}
+        self.only_selected_var.set(False)
+        self.keyword_var.set("")
 
         tables_by_file = {}
         symbols_by_file = {}
@@ -977,7 +938,8 @@ class WordTableExportWindow:
         self.scan_item_by_iid = {}
         self.selected_scan_keys = set()
         self.scan_filters = {}
-        self._close_scan_filter_popup()
+        self.only_selected_var.set(False)
+        self.keyword_var.set("")
         if hasattr(self, "scan_tree"):
             self.scan_tree.delete(*self.scan_tree.get_children())
             self._refresh_scan_filter_headings()
@@ -988,7 +950,7 @@ class WordTableExportWindow:
         if hasattr(self, "detail_text"):
             self._set_detail_text("选择扫描结果中的一行，可查看完整章节、表格或符号条款预览。")
 
-    def _scan_tree_values(self, kind, item, selected):
+    def _scan_tree_values(self, kind, item):
         if kind == "table":
             item_text = f"表格{item.table_index}"
             quantity = f"{item.row_count}x{item.column_count}"
@@ -996,9 +958,11 @@ class WordTableExportWindow:
         else:
             item_text = " ".join(item.symbols)
             quantity = f"{item.clause_count}条"
-            type_text = "符号条款"
+            type_text = "指标条款" if kind == "clause" else "符号条款"
+        keys = self._row_keys(kind, item)
+        checked = keys & self.selected_scan_keys
         return (
-            "☑" if selected else "☐",
+            "☑" if checked == keys else "◩" if checked else "☐",
             item.filename,
             type_text,
             item.section,
@@ -1009,9 +973,14 @@ class WordTableExportWindow:
     def _scan_key(self, kind, item):
         if kind == "table":
             return (kind, _file_identity(item.file_path), item.table_index)
+        if kind == "clause":
+            return (kind, _file_identity(item.file_path), item.section, id(item.clauses[0]))
         return (kind, _file_identity(item.file_path), item.section)
 
     def _apply_scan_filters(self, select_first=False):
+        previous_selection = self.scan_tree.selection()
+        opened = {iid for iid in self.scan_item_by_iid if self.scan_tree.item(iid, "open")}
+        scroll = self.scan_tree.yview()
         focus_key = None
         current_iid = self.scan_tree.focus() if hasattr(self, "scan_tree") else ""
         current_row = self.scan_item_by_iid.get(current_iid)
@@ -1022,7 +991,13 @@ class WordTableExportWindow:
         self.scan_item_by_iid = {}
         focus_iid = None
         for row_index, (kind, item) in enumerate(self.scan_rows, start=1):
-            if not self._scan_row_matches_filters(kind, item):
+            children = [(index, child) for index, child in enumerate(self._clause_items(item), 1)
+                        if self._scan_row_matches_filters("clause", child)] if kind == "symbol" and item.clauses else []
+            if kind == "symbol" and item.clauses:
+                matches = bool(children)
+            else:
+                matches = self._scan_row_matches_filters(kind, item)
+            if not matches:
                 continue
             iid = str(row_index)
             key = self._scan_key(kind, item)
@@ -1031,22 +1006,36 @@ class WordTableExportWindow:
                 "",
                 "end",
                 iid=iid,
+                open=iid in opened or bool(self.keyword_var.get().strip()),
                 values=self._scan_tree_values(
-                    kind, item, selected=key in self.selected_scan_keys
+                    kind, item
                 ),
             )
             if key == focus_key:
                 focus_iid = iid
+            for index, child in children:
+                child_iid = f"{iid}.{index}"
+                self.scan_item_by_iid[child_iid] = ("clause", child)
+                self.scan_tree.insert(iid, "end", iid=child_iid,
+                                      values=self._scan_tree_values("clause", child))
+                if self._scan_key("clause", child) == focus_key:
+                    focus_iid = child_iid
 
         children = self.scan_tree.get_children()
         target_iid = focus_iid or (children[0] if children and select_first else None)
-        if target_iid:
+        retained = [iid for iid in previous_selection if iid in self.scan_item_by_iid]
+        if retained:
+            self.scan_tree.selection_set(retained)
+        elif target_iid:
             self.scan_tree.selection_set(target_iid)
+        if target_iid:
             self.scan_tree.focus(target_iid)
+        if scroll:
+            self.scan_tree.yview_moveto(scroll[0])
         if children:
             self._update_scan_detail()
         elif self.scan_rows:
-            self._set_detail_text("当前筛选条件下没有扫描结果，请调整表头筛选。")
+            self._set_detail_text("当前筛选条件下没有扫描结果，请调整上方筛选条件。")
         else:
             self._set_detail_text("没有扫描到可导出的正文表格或带符号条款。")
 
@@ -1056,20 +1045,14 @@ class WordTableExportWindow:
 
     def _refresh_scan_label(self):
         selected = len(self.selected_scan_keys)
-        visible = len(self.scan_item_by_iid)
-        total = len(self.scan_rows)
-        filter_text = f"，筛选显示 {visible}/{total} 项" if self.scan_filters else ""
+        visible_keys = self._visible_scan_keys()
+        hidden = len(self.selected_scan_keys - visible_keys)
         text = (
             f"已扫描到 {len(self.table_items)} 张表格、{len(self.symbol_items)} 个符号章节"
-            f"{filter_text}，当前选择 {selected} 项"
+            f"，当前显示 {len(visible_keys)} 项；已选 {selected} 项，其中 {hidden} 项被筛选隐藏"
         )
         self.scan_label.config(text=text, foreground="green" if selected else self.app.muted_fg)
         self._refresh_visible_selection_button()
-
-    def _toggle_scan_row_from_event(self, event):
-        row_id = self.scan_tree.identify_row(event.y)
-        if row_id:
-            self._toggle_scan_iids([row_id])
 
     def _toggle_scan_checkbox_from_click(self, event):
         if self.scan_tree.identify_region(event.x, event.y) != "cell":
@@ -1097,64 +1080,48 @@ class WordTableExportWindow:
         self._update_scan_detail()
 
     def _toggle_scan_iids(self, iids):
+        keys = set()
+        visible_keys = self._visible_scan_keys()
         for iid in iids:
             row = self.scan_item_by_iid.get(iid)
             if row is None:
                 continue
             kind, item = row
-            key = self._scan_key(kind, item)
-            if key in self.selected_scan_keys:
-                self.selected_scan_keys.remove(key)
-            else:
-                self.selected_scan_keys.add(key)
+            # 章节只操作筛选后列出的条款，避免误选隐藏的搜索结果。
+            keys.update(self._row_keys(kind, item) & visible_keys)
+        if keys and keys.issubset(self.selected_scan_keys):
+            self.selected_scan_keys.difference_update(keys)
+        else:
+            self.selected_scan_keys.update(keys)
         self._apply_scan_filters(select_first=True)
 
     def select_recommended_tables(self):
-        visible_table_keys = {
-            self._scan_key(kind, item)
-            for kind, item in self.scan_item_by_iid.values()
-            if kind == "table"
-        }
         recommended_tables = {
             self._scan_key(kind, item)
             for kind, item in self.scan_item_by_iid.values()
             if kind == "table" and item.hint.startswith("建议关注")
         }
-        self.selected_scan_keys.difference_update(visible_table_keys)
         self.selected_scan_keys.update(recommended_tables)
         self._refresh_all_scan_rows()
         self._update_scan_detail()
-        self.status_var.set(f"已按提示选择 {len(recommended_tables)} 张建议关注的表格")
+        self.status_var.set(f"已追加勾选当前结果中的 {len(recommended_tables)} 张推荐表格，保留手动选择")
 
     def _visible_scan_keys(self):
         return {
             self._scan_key(kind, item)
             for kind, item in self.scan_item_by_iid.values()
+            if kind != "symbol" or not item.clauses
         }
 
     def _refresh_visible_selection_button(self):
         if not hasattr(self, "toggle_visible_selection_button"):
             return
-        visible_keys = self._visible_scan_keys()
-        all_selected = bool(visible_keys) and visible_keys.issubset(self.selected_scan_keys)
-        self.toggle_visible_selection_button.config(
-            text="筛选结果全不选" if all_selected else "筛选结果全选"
-        )
+        if hasattr(self, "export_button"):
+            self.export_button.config(text=f"导出已选 {len(self.selected_scan_keys)} 项")
 
-    def toggle_visible_scan_selection(self):
-        visible_keys = self._visible_scan_keys()
-        if not visible_keys:
-            self.status_var.set("当前筛选条件下没有可选择内容")
-            return
-        if visible_keys.issubset(self.selected_scan_keys):
-            self.selected_scan_keys.difference_update(visible_keys)
-            action = "已取消当前筛选显示的全部项目"
-        else:
-            self.selected_scan_keys.update(visible_keys)
-            action = "已选择当前筛选显示的全部项目"
+    def clear_all_scan_selection(self):
+        self.selected_scan_keys.clear()
         self._refresh_all_scan_rows()
-        self._update_scan_detail()
-        self.status_var.set(f"{action}（{len(visible_keys)} 项）")
 
     def select_all_scan_items(self):
         visible_keys = self._visible_scan_keys()
@@ -1182,7 +1149,9 @@ class WordTableExportWindow:
             return
 
         kind, item = row
-        selected = "是" if self._scan_key(kind, item) in self.selected_scan_keys else "否"
+        keys = self._row_keys(kind, item)
+        checked = keys & self.selected_scan_keys
+        selected = "是" if checked == keys else "部分" if checked else "否"
         if kind == "table":
             detail = (
                 f"导出：{selected}    类型：表格    文件：{item.filename}    "
@@ -1190,7 +1159,7 @@ class WordTableExportWindow:
                 f"所在章节：{item.section}\n"
                 f"提示：{item.hint}\n"
                 f"表格前文：{item.context}\n"
-                f"内容预览：{item.preview}"
+                f"内容预览：\n{self._preview_content(kind, item)}"
             )
         else:
             detail = (
@@ -1199,7 +1168,7 @@ class WordTableExportWindow:
                 f"所在章节：{item.section}\n"
                 f"发现符号：{' '.join(item.symbols)}\n"
                 f"内容来源：{'、'.join(item.sources) or '未识别'}\n"
-                f"内容预览：{item.preview or '无可读文本'}"
+                f"内容预览：\n{self._preview_content(kind, item)}"
             )
         self._set_detail_text(detail)
 
@@ -1432,7 +1401,12 @@ class WordTableExportWindow:
             return
 
         tables = [item for item in self.table_items if self._scan_key("table", item) in self.selected_scan_keys]
-        sections = [item for item in self.symbol_items if self._scan_key("symbol", item) in self.selected_scan_keys]
+        sections = []
+        for item in self.symbol_items:
+            clauses = tuple(child.clauses[0] for child in self._clause_items(item)
+                            if self._scan_key("clause", child) in self.selected_scan_keys)
+            if clauses:
+                sections.append(replace(item, clauses=clauses, clause_count=len(clauses)))
         table_file_paths = list(dict.fromkeys(item.file_path for item in tables))
         symbol_file_paths = list(dict.fromkeys(item.file_path for item in sections))
         if not tables and not sections:

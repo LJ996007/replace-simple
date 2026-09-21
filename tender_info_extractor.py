@@ -365,22 +365,22 @@ def _clean_opening_time(value: str) -> str:
 
 def _split_procurement_contact_and_phone(found: Dict[str, str]) -> None:
     """Split values such as “刘老师，010-82314928” into two fields."""
-    phone_value = found.get("采购人电话", "")
-    phone_parts = re.split(r"[,，]", phone_value, maxsplit=1)
-    if len(phone_parts) == 2 and all(part.strip() for part in phone_parts):
-        contact, phone = (_trim_value(part) for part in phone_parts)
-        if "采购人联系人" not in found:
-            found["采购人联系人"] = contact
-        found["采购人电话"] = phone
+    for field in ("采购人电话", "采购人联系人"):
+        if isinstance(found, _FieldValues) and len({c["value"] for c in found.candidates.get(field, [])}) > 1:
+            continue
+        parts = re.split(r"[,，]", found.get(field, ""), maxsplit=1)
+        if len(parts) != 2:
+            continue
+        contact, phone = map(_trim_value, parts)
+        # ponytail: 只拆分明确的姓名+号码，复杂说明保留原值，有实际样本再扩展。
+        if (not re.fullmatch(r"[^\W\d_]+(?:[·.'’\s][^\W\d_]+)*", contact)
+                or not re.fullmatch(r"[+＋\d\s()（）\-－—]+", phone)
+                or not 7 <= sum(char.isdigit() for char in phone) <= 20):
+            continue
+        found[field] = phone if field == "采购人电话" else contact
+        found.setdefault("采购人联系人", contact)
+        found.setdefault("采购人电话", phone)
         return
-
-    contact_value = found.get("采购人联系人", "")
-    contact_parts = re.split(r"[,，]", contact_value, maxsplit=1)
-    if len(contact_parts) == 2 and all(part.strip() for part in contact_parts):
-        contact, phone = (_trim_value(part) for part in contact_parts)
-        found["采购人联系人"] = contact
-        if "采购人电话" not in found:
-            found["采购人电话"] = phone
 
 
 def _extract_announcement_signature_date(document) -> Optional[Tuple[str, str]]:

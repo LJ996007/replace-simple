@@ -43,6 +43,7 @@ from ui_common import (
     remove_matching_file_paths,
     collect_supported_files,
     BackgroundTaskRunner,
+    cancel_widget_callbacks,
     CappedScrollbarModel,
     FlatScrollbar,
     cap_existing_scrollbar,
@@ -53,6 +54,7 @@ from word_export_window import WordTableExportWindow
 class ReplaceSimpleApp:
     def __init__(self, root, restore_session=True):
         self.root = root
+        root.bind("<Destroy>", cancel_widget_callbacks, add="+")
         self.restore_session = restore_session
         self._task_runner = BackgroundTaskRunner(root)
         self._busy_widgets = []
@@ -66,6 +68,7 @@ class ReplaceSimpleApp:
         self.replace_files = []
         self.recent_word_files = []
         self.output_dir = None
+        self.same_dir_replace = False
         self._last_output_dir_to_open = None
         self._rules_resize_after = None
         self.table_export_window = None
@@ -121,9 +124,31 @@ class ReplaceSimpleApp:
             relief="solid", borderwidth=1, bordercolor=self.border_color,
         )
         style.configure("Toolbar.TFrame", background=self.surface_bg)
-        style.configure("TLabel", font=self.body_font)
+        style.configure("TLabel", font=self.body_font, background=self.surface_bg, foreground=self.text_fg)
         style.configure("TButton", font=self.body_font, padding=(10, 5))
-        style.configure("TEntry", font=self.body_font)
+        for control in ("TEntry", "TCombobox"):
+            style.configure(control, font=self.body_font, fieldbackground=self.surface_bg,
+                            background=HEADER_BG, foreground=self.text_fg,
+                            bordercolor=self.border_color, lightcolor=self.border_color,
+                            darkcolor=self.border_color, padding=5,
+                            selectbackground="#C6D8EB", selectforeground=self.text_fg,
+                            arrowcolor=self.muted_fg)
+            style.map(control,
+                      fieldbackground=[("disabled", self.app_bg), ("readonly", self.surface_bg)],
+                      foreground=[("disabled", self.muted_fg), ("readonly", self.text_fg)],
+                      selectbackground=[("readonly", "#C6D8EB")],
+                      selectforeground=[("readonly", self.text_fg)],
+                      bordercolor=[("focus", self.accent_fg)])
+        style.configure("TCheckbutton", font=self.body_font, background=self.surface_bg,
+                        foreground=self.text_fg, indicatorbackground=self.surface_bg,
+                        indicatorforeground=self.accent_fg)
+        style.map("TCheckbutton", background=[("active", self.surface_bg)],
+                  indicatorbackground=[("active", "#E3EDF8"), ("selected", self.surface_bg)],
+                  foreground=[("disabled", self.muted_fg)])
+        self.root.option_add("*TCombobox*Listbox.background", self.surface_bg)
+        self.root.option_add("*TCombobox*Listbox.foreground", self.text_fg)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", "#C6D8EB")
+        self.root.option_add("*TCombobox*Listbox.selectForeground", self.text_fg)
         style.configure("Title.TLabel", font=self.title_font, background=self.app_bg)
         style.configure("Subtitle.TLabel", font=self.small_font, foreground=self.muted_fg, background=self.app_bg)
         style.configure("SectionTitle.TLabel", font=self.section_font, background=self.surface_bg)
@@ -431,7 +456,7 @@ class ReplaceSimpleApp:
         rules_toolbar.grid(row=0, column=1, sticky="e")
         self._create_busy_button(rules_toolbar, text="新增一行", command=self.add_rule_row, width=9).pack(side="left", padx=(0, 6))
         self._create_busy_button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=9).pack(side="left", padx=(0, 6))
-        more = ttk.Menubutton(rules_toolbar, text="更多 ▼", width=9)
+        more = ttk.Menubutton(rules_toolbar, text="更多 ▼", width=9, style="TButton")
         more.pack(side="left", padx=(0, 6))
         self._busy_widgets.append(more)
         menu = tk.Menu(more, tearoff=False)
@@ -561,12 +586,19 @@ class ReplaceSimpleApp:
         bottom_frame.pack(fill="x")
         bottom_frame.columnconfigure(0, weight=1)
 
-        # 标题行：左标题 + 右「选择目录」按钮
+        # 标题行：左标题 + 右侧输出方式按钮
         output_header = ttk.Frame(bottom_frame, style="Toolbar.TFrame")
         output_header.grid(row=0, column=0, sticky="ew")
         output_header.columnconfigure(0, weight=1)
         ttk.Label(output_header, text="3  输出目录", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self._create_busy_button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=1, sticky="e")
+        self.same_dir_button = self._create_busy_button(
+            output_header,
+            text="同目录替换",
+            command=self.select_same_dir_replace,
+            width=13,
+        )
+        self.same_dir_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
+        self._create_busy_button(output_header, text="选择目录", command=self.select_output_dir, width=12).grid(row=0, column=2, sticky="e")
 
         # 输出路径/说明单独占整行；按面板宽度换行，且最多两行（中间省略），
         # 避免超长目录把下方「开始替换」顶出可视区。
@@ -750,10 +782,20 @@ class ReplaceSimpleApp:
         except (AttributeError, tk.TclError):
             pass
 
-    def _apply_output_dir(self, directory):
+    def _apply_output_dir(self, directory, *, same_dir_replace=False):
         self.output_dir = directory
+        self.same_dir_replace = bool(same_dir_replace and not directory)
+        if hasattr(self, "same_dir_button"):
+            self.same_dir_button.configure(
+                text="✓ 同目录替换" if self.same_dir_replace else "同目录替换",
+            )
         if directory:
             self._output_path.set_text(directory, foreground="green")
+        elif self.same_dir_replace:
+            self._output_path.set_text(
+                "同目录替换：结果保存到各待处理文件所在目录；同名时直接覆盖原文件",
+                foreground="green",
+            )
         else:
             self._output_path.set_text(OUTPUT_DIR_HINT, foreground=self.muted_fg)
         self._refresh_output_and_status_layout()
@@ -840,6 +882,8 @@ class ReplaceSimpleApp:
         output_dir = settings.get("output_dir")
         if isinstance(output_dir, str) and output_dir:
             self._apply_output_dir(output_dir)
+        elif settings.get("same_dir_replace") is True:
+            self._apply_output_dir(None, same_dir_replace=True)
 
     def _save_session(self):
         if not self.restore_session:
@@ -847,6 +891,7 @@ class ReplaceSimpleApp:
         data = {
             "geometry": self.root.geometry(),
             "output_dir": self.output_dir,
+            "same_dir_replace": self.same_dir_replace,
             "rules": normalize_rule_rows(self.rules_sheet.get_sheet_data()),
             "presets": self.presets,
             "symbol_chars": self.symbol_chars,
@@ -864,14 +909,13 @@ class ReplaceSimpleApp:
             messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭程序。")
             return
         try:
-            try:
-                if hasattr(self, "_output_path"):
-                    self._output_path.hide_tooltip()
-                self._save_session()
-            except Exception:
-                pass
-        finally:
-            self.root.destroy()
+            self._save_session()
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"无法保存本次规则和设置：{exc}\n\n窗口将保持打开，请重试关闭，或先将规则保存为 Excel。", parent=self.root)
+            return
+        if hasattr(self, "_output_path"):
+            self._output_path.hide_tooltip()
+        self.root.destroy()
 
     # ---------- 规则表数据操作 ----------
     def _refresh_status(self):
@@ -1588,6 +1632,11 @@ class ReplaceSimpleApp:
 
         self._apply_output_dir(directory)
         self.status_var.set("已选择输出目录")
+        self._refresh_output_and_status_layout()
+
+    def select_same_dir_replace(self):
+        self._apply_output_dir(None, same_dir_replace=True)
+        self.status_var.set("已选择同目录替换")
         self._refresh_output_and_status_layout()
 
     # ---------- 替换执行 ----------

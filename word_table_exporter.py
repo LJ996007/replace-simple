@@ -17,6 +17,7 @@ from docx.oxml.text.paragraph import CT_P
 from docx.oxml.ns import qn
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
+from file_io import atomic_output_path
 
 
 TABLE_OUTPUT_SUFFIX = "_表格"
@@ -201,8 +202,8 @@ def export_word_tables_to_excel(
             worksheet.title = f"表格{sheet_index}"
             _write_table_to_worksheet(worksheet, table)
 
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        workbook.save(output_path)
+        with atomic_output_path(output_path) as temporary:
+            workbook.save(temporary)
         return len(exported_tables)
     finally:
         workbook.close()

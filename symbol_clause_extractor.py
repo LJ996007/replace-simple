@@ -540,8 +540,9 @@ def export_symbol_clauses_to_excel(
         for column, width in widths.items():
             worksheet.column_dimensions[get_column_letter(column)].width = width
 
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        workbook.save(output_path)
+        from file_io import atomic_output_path
+        with atomic_output_path(output_path) as temporary:
+            workbook.save(temporary)
         return len(clauses)
     finally:
         workbook.close()

@@ -24,6 +24,139 @@ from word_table_exporter import export_word_tables_to_excel
 
 
 class ReviewFixTests(unittest.TestCase):
+    def test_multi_filters_use_original_button_style(self):
+        from dataclasses import replace
+        from word_table_exporter import TableScanItem
+        root = main.tk.Tk()
+        root.withdraw()
+        try:
+            app = main.ReplaceSimpleApp(root, restore_session=False)
+            style = main.ttk.Style(root)
+            original_styles = {name: (style.configure(name), style.map(name))
+                               for name in (".", "TButton", "Accent.TButton", "TCombobox", "Scan.Treeview")}
+            app.open_word_table_exporter()
+            window = app.table_export_window
+            window.file_paths = ["sample.docx"]
+            table = TableScanItem("sample.docx", "sample.docx", 1, "第一章", "", "内容", 1, 1, "")
+            tables = [replace(table, table_index=i, section=section)
+                      for i, section in enumerate(("第一章", "第二章", "第三章"), 1)]
+            window._show_scan_result(tables, {}, None, [], {}, None)
+            window.select_all_scan_items()
+            window.filter_boxes["section"].invoke()
+            popup = next(child for child in window.window.winfo_children() if isinstance(child, main.tk.Toplevel))
+
+            def descendants(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from descendants(child)
+
+            widgets = list(descendants(popup))
+            choices = next(widget for widget in widgets if isinstance(widget, main.tk.Listbox))
+            self.assertEqual(choices.cget("selectmode"), "multiple")
+            choices.selection_clear(0, "end")
+            choices.selection_set(0, 1)
+            next(widget for widget in widgets if isinstance(widget, main.ttk.Button) and widget.cget("text") == "确定").invoke()
+            self.assertEqual(window.scan_filters["section"], {"第一章", "第二章"})
+            self.assertEqual(len(window.scan_tree.get_children()), 2)
+            self.assertEqual(len(window.selected_scan_keys), 3)
+            window._set_multi_filter("type", set())
+            self.assertEqual(len(window.scan_tree.get_children()), 0)
+            window._set_multi_filter("type", {"表格"})
+            self.assertEqual(len(window.scan_tree.get_children()), 2)
+            window.reset_scan_filters()
+            self.assertEqual(len(window.scan_tree.get_children()), 3)
+            self.assertEqual(app.app_bg, "#F0F2F5")
+            self.assertEqual(app.surface_bg, "#F7F8FA")
+            self.assertEqual(style.lookup("TLabel", "background"), app.surface_bg)
+            self.assertEqual(style.lookup("TCheckbutton", "background", ("active",)), app.surface_bg)
+            self.assertEqual(style.lookup("TCombobox", "fieldbackground", ("readonly",)), app.surface_bg)
+            self.assertEqual(style.lookup("TEntry", "fieldbackground"), app.surface_bg)
+            for name, original in original_styles.items():
+                self.assertEqual({key: str(value) for key, value in (style.configure(name) or {}).items() if key != "padding"},
+                                 {key: str(value) for key, value in (original[0] or {}).items() if key != "padding"})
+                self.assertEqual(style.map(name), original[1])
+            self.assertEqual(window.filter_boxes["section"].cget("style"), "TButton")
+            self.assertEqual(window.toggle_visible_selection_button.cget("style"), "TButton")
+            self.assertEqual(window.export_button.cget("style"), "Accent.TButton")
+            more = next(widget for widget in app._busy_widgets if isinstance(widget, main.ttk.Menubutton))
+            self.assertEqual(more.cget("text"), "更多 ▼")
+            self.assertEqual(more.cget("style"), "TButton")
+            menu = more.nametowidget(more.cget("menu"))
+            self.assertEqual(menu.entrycget(0, "label"), "将选中规则设为明确删除")
+            root.update()
+        finally:
+            root.destroy()
+
+    def test_indicator_selection_filters_preserve_checks_and_export_only_checked_clauses(self):
+        with TemporaryDirectory() as directory:
+            root = main.tk.Tk()
+            root.withdraw()
+            try:
+                path = Path(directory) / "selection.docx"
+                document = Document()
+                document.add_paragraph("★速度要求")
+                document.add_paragraph("★精度要求")
+                document.add_table(rows=1, cols=1).cell(0, 0).text = "手选内容"
+                document.add_table(rows=1, cols=1).cell(0, 0).text = "技术参数"
+                document.save(path)
+                app = main.ReplaceSimpleApp(root, restore_session=False)
+                app._remember_word_files([str(path)])
+                app.open_word_table_exporter()
+                window = app.table_export_window
+                root.update()
+                window.window.geometry("1020x820")
+                root.update()
+                tree_frame = window.scan_tree.master
+                detail_frame = window.detail_text.master
+                self.assertLessEqual(tree_frame.winfo_y() + tree_frame.winfo_height(), detail_frame.winfo_y())
+                self.assertLessEqual(detail_frame.winfo_y() + detail_frame.winfo_height(), window.scan_label.winfo_y())
+                for box in window.filter_boxes.values():
+                    self.assertLessEqual(box.winfo_x() + box.winfo_width(), box.master.winfo_width())
+                tables, sections, stamps = word_scan.scan_word_content([str(path)], "★")
+                window._show_scan_result(*tables, *sections)
+                window.scan_stamps = stamps
+                self.assertFalse(window.scan_tree.bind("<Double-1>"))
+                window._toggle_scan_iids(["1", "3.1"])
+                self.assertEqual(window.scan_tree.item("3", "values")[0], "◩")
+                window.scan_tree.selection_set("3.1")
+                window._update_scan_detail()
+                self.assertIn("速度要求", window.detail_text.get("1.0", "end"))
+                window.keyword_var.set("精度")
+                self.assertEqual(len(window._visible_scan_keys()), 1)
+                self.assertIn("2 项被筛选隐藏", window.scan_label.cget("text"))
+                window._toggle_scan_iids(["3"])
+                self.assertEqual(len(window.selected_scan_keys), 3)
+                window.clear_scan_selection()
+                self.assertEqual(len(window.selected_scan_keys), 2)
+                window.reset_scan_filters()
+                window.select_recommended_tables()
+                self.assertIn(window._scan_key("table", tables[0][0]), window.selected_scan_keys)
+                self.assertEqual(len(window.selected_scan_keys), 3)
+                window.only_selected_var.set(True)
+                window._apply_scan_filters()
+                self.assertEqual(len(window._visible_scan_keys()), 3)
+                self.assertEqual(window.export_button.cget("text"), "导出已选 3 项")
+                window.output_dir = str(Path(directory) / "out")
+                with patch.object(window._task_runner, "submit") as submit:
+                    window.start_export()
+                result = submit.call_args.args[0](lambda *_: None)
+                self.assertIsNone(result[5])
+                output = next(iter(result[3].values()))["output_path"]
+                workbook = load_workbook(output)
+                try:
+                    text = " ".join(str(cell.value) for row in workbook.active for cell in row)
+                    self.assertIn("速度要求", text)
+                    self.assertNotIn("精度要求", text)
+                finally:
+                    workbook.close()
+                window._reset_busy_state()
+                window.clear_all_scan_selection()
+                self.assertEqual(window.selected_scan_keys, set())
+                self.assertEqual(len(window._visible_scan_keys()), 0)
+            finally:
+                root.update_idletasks()
+                root.destroy()
+
     def test_missing_fields_are_not_deletions_and_conflicts_stop_before_writing(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "source.docx"
