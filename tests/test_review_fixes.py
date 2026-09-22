@@ -43,7 +43,9 @@ class ReviewFixTests(unittest.TestCase):
             window._show_scan_result(tables, {}, None, [], {}, None)
             window.select_all_scan_items()
             window.filter_boxes["section"].invoke()
+            root.update()
             popup = next(child for child in window.window.winfo_children() if isinstance(child, main.tk.Toplevel))
+            self.assertTrue(popup.overrideredirect())
 
             def descendants(widget):
                 for child in widget.winfo_children():
@@ -51,11 +53,12 @@ class ReviewFixTests(unittest.TestCase):
                     yield from descendants(child)
 
             widgets = list(descendants(popup))
-            choices = next(widget for widget in widgets if isinstance(widget, main.tk.Listbox))
-            self.assertEqual(choices.cget("selectmode"), "multiple")
-            choices.selection_clear(0, "end")
-            choices.selection_set(0, 1)
-            next(widget for widget in widgets if isinstance(widget, main.ttk.Button) and widget.cget("text") == "确定").invoke()
+            self.assertFalse(any(isinstance(widget, main.ttk.Button) for widget in widgets))
+            chapter = next(
+                widget for widget in widgets
+                if isinstance(widget, main.tk.Label) and widget.cget("text") == "第三章"
+            )
+            chapter.event_generate("<Button-1>")
             self.assertEqual(window.scan_filters["section"], {"第一章", "第二章"})
             self.assertEqual(len(window.scan_tree.get_children()), 2)
             self.assertEqual(len(window.selected_scan_keys), 3)
@@ -76,7 +79,6 @@ class ReviewFixTests(unittest.TestCase):
                                  {key: str(value) for key, value in (original[0] or {}).items() if key != "padding"})
                 self.assertEqual(style.map(name), original[1])
             self.assertEqual(window.filter_boxes["section"].cget("style"), "TButton")
-            self.assertEqual(window.toggle_visible_selection_button.cget("style"), "TButton")
             self.assertEqual(window.export_button.cget("style"), "Accent.TButton")
             more = next(widget for widget in app._busy_widgets if isinstance(widget, main.ttk.Menubutton))
             self.assertEqual(more.cget("text"), "更多 ▼")
@@ -104,14 +106,20 @@ class ReviewFixTests(unittest.TestCase):
                 app.open_word_table_exporter()
                 window = app.table_export_window
                 root.update()
-                window.window.geometry("1020x820")
+                window.window.geometry("1280x900")
                 root.update()
                 tree_frame = window.scan_tree.master
-                detail_frame = window.detail_text.master
-                self.assertLessEqual(tree_frame.winfo_y() + tree_frame.winfo_height(), detail_frame.winfo_y())
-                self.assertLessEqual(detail_frame.winfo_y() + detail_frame.winfo_height(), window.scan_label.winfo_y())
+                detail_frame = window.detail_frame
+                self.assertLess(
+                    tree_frame.winfo_rootx() + tree_frame.winfo_width(),
+                    detail_frame.winfo_rootx() + 4,
+                )
+                self.assertLess(
+                    window.scan_label.winfo_rooty() + window.scan_label.winfo_height(),
+                    tree_frame.winfo_rooty(),
+                )
                 for box in window.filter_boxes.values():
-                    self.assertLessEqual(box.winfo_x() + box.winfo_width(), box.master.winfo_width())
+                    self.assertLessEqual(box.winfo_x() + box.winfo_width(), box.master.winfo_width() + 2)
                 tables, sections, stamps = word_scan.scan_word_content([str(path)], "★")
                 window._show_scan_result(*tables, *sections)
                 window.scan_stamps = stamps
@@ -120,10 +128,10 @@ class ReviewFixTests(unittest.TestCase):
                 self.assertEqual(window.scan_tree.item("3", "values")[0], "◩")
                 window.scan_tree.selection_set("3.1")
                 window._update_scan_detail()
-                self.assertIn("速度要求", window.detail_text.get("1.0", "end"))
+                self.assertIn("速度要求", window.preview_plain_text())
                 window.keyword_var.set("精度")
                 self.assertEqual(len(window._visible_scan_keys()), 1)
-                self.assertIn("2 项被筛选隐藏", window.scan_label.cget("text"))
+                self.assertIn("另有 2 项已选但被筛掉", window.scan_label.cget("text"))
                 window._toggle_scan_iids(["3"])
                 self.assertEqual(len(window.selected_scan_keys), 3)
                 window.clear_scan_selection()

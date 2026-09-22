@@ -210,17 +210,23 @@ class ExtractTableTests(unittest.TestCase):
 
         self.assertEqual([clause.symbol for clause in clauses], ["★", "▲", "★"])
         camera_rows = clauses[:2]
+        self.assertEqual(camera_rows[0].headers, ("序号", "设备名称", "技术参数要求"))
         for camera_row in camera_rows:
-            self.assertIn("1", camera_row.text.splitlines())
-            self.assertIn("网络摄像机", camera_row.text.splitlines())
-        self.assertIn("★分辨率不低于400万像素", camera_rows[0].text.splitlines())
-        self.assertNotIn("▲支持H.265编码", camera_rows[0].text)
-        self.assertIn("▲支持H.265编码", camera_rows[1].text.splitlines())
-        self.assertNotIn("★分辨率不低于400万像素", camera_rows[1].text)
+            self.assertEqual(camera_row.columns[0], "1")
+            self.assertEqual(camera_row.columns[1], "网络摄像机")
+            self.assertNotIn("网络摄像机", camera_row.text)
+        self.assertEqual(camera_rows[0].text, "★分辨率不低于400万像素")
+        self.assertEqual(camera_rows[0].columns[2], "★分辨率不低于400万像素")
+        self.assertEqual(camera_rows[1].text, "▲支持H.265编码")
+        self.assertEqual(camera_rows[0].merge_keys[1], camera_rows[1].merge_keys[1])
+        self.assertIsNone(camera_rows[0].merge_keys[2])
         # 无符号行（交换机）不提取
         self.assertNotIn("交换机", "\n".join(clause.text for clause in clauses))
-        # 纯符号单元格：整行仍完整提取
-        self.assertIn("服务器CPU不低于32核", clauses[2].text)
+        self.assertNotIn("交换机", "\n".join("\n".join(clause.columns) for clause in clauses))
+        # 符号单独成格时，同行其他列仍各自保留
+        self.assertEqual(clauses[2].text, "★")
+        self.assertEqual(clauses[2].columns[0], "3")
+        self.assertEqual(clauses[2].columns[2], "服务器CPU不低于32核")
 
     def test_multiple_marked_clauses_in_one_cell_export_separately(self):
         with TemporaryDirectory() as directory:
@@ -243,12 +249,14 @@ class ExtractTableTests(unittest.TestCase):
         self.assertEqual(
             [clause.text for clause in clauses],
             [
-                "技术要求\n# 2.1.1.1 最大耐受流速：≥2.5 mL/min。\n证明材料随附",
-                "技术要求\n# 2.1.1.2 最高加热温度：≥700℃。",
-                "技术要求\n★2.1.1.3 离子源接口：锥孔结构。",
-                "技术要求\n★2.1.3 采用180度U型弯曲碰撞室设计。",
+                "# 2.1.1.1 最大耐受流速：≥2.5 mL/min。\n证明材料随附",
+                "# 2.1.1.2 最高加热温度：≥700℃。",
+                "★2.1.1.3 离子源接口：锥孔结构。",
+                "★2.1.3 采用180度U型弯曲碰撞室设计。",
             ],
         )
+        self.assertTrue(all(clause.columns[0] == "技术要求" for clause in clauses))
+        self.assertNotIn("技术要求", clauses[0].text)
 
     def test_table_cell_auto_numbering_reconstructed(self):
         with TemporaryDirectory() as directory:
@@ -265,7 +273,56 @@ class ExtractTableTests(unittest.TestCase):
 
         self.assertEqual(len(clauses), 1)
         self.assertEqual(clauses[0].symbol, "★")
-        self.assertEqual(clauses[0].text, "2、\n摄像机\n★自动编号条款")
+        self.assertEqual(clauses[0].columns[0], "2、")
+        self.assertEqual(clauses[0].columns[1], "摄像机")
+        self.assertEqual(clauses[0].text, "★自动编号条款")
+
+    def test_merged_requirement_table_exports_name_in_its_own_column(self):
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            path = directory / "采购需求.docx"
+            document = Document()
+            table = document.add_table(rows=4, cols=4)
+            for column, title in enumerate(("序号", "产品名称", "参数", "数量")):
+                table.cell(0, column).text = title
+            table.cell(1, 0).text = "1"
+            table.cell(1, 1).text = "机器人整机认知和测绘平台"
+            table.cell(1, 2).text = "1.1.1 普通条款\n▲1.1.5 腰部扭矩\n▲1.1.6 峰值扭矩"
+            table.cell(1, 3).text = "1"
+            table.cell(1, 0).merge(table.cell(2, 0))
+            table.cell(1, 1).merge(table.cell(2, 1))
+            table.cell(1, 3).merge(table.cell(2, 3))
+            table.cell(2, 2).text = "▲1.2.3 单臂臂展"
+            table.cell(3, 0).text = "2"
+            table.cell(3, 1).text = "上肢关键部件"
+            table.cell(3, 2).text = "▲1.3.3 底盘形式"
+            table.cell(3, 3).text = "2"
+            document.save(path)
+
+            output = get_symbol_output_path(str(path), str(directory))
+            count = export_symbol_clauses_to_excel(str(path), output)
+            self.assertEqual(count, 4)
+            workbook = load_workbook(output)
+            worksheet = workbook.active
+            self.assertEqual(
+                [worksheet.cell(1, column).value for column in range(1, 5)],
+                ["序号", "产品名称", "参数", "数量"],
+            )
+            self.assertEqual(worksheet.cell(2, 2).value, "机器人整机认知和测绘平台")
+            self.assertEqual(worksheet.cell(2, 3).value, "▲1.1.5 腰部扭矩")
+            self.assertEqual(worksheet.cell(3, 3).value, "▲1.1.6 峰值扭矩")
+            self.assertEqual(worksheet.cell(4, 3).value, "▲1.2.3 单臂臂展")
+            self.assertEqual(worksheet.cell(5, 2).value, "上肢关键部件")
+            self.assertEqual(worksheet.cell(5, 3).value, "▲1.3.3 底盘形式")
+            self.assertNotIn("普通条款", "\n".join(
+                str(worksheet.cell(row, 3).value or "") for row in range(2, 6)
+            ))
+            merged = {str(item) for item in worksheet.merged_cells.ranges}
+            self.assertIn("B2:B4", merged)
+            self.assertIn("A2:A4", merged)
+            self.assertIn("D2:D4", merged)
+            self.assertNotIn("C2:C4", merged)
+            workbook.close()
 
 
 class ExcelExportTests(unittest.TestCase):
@@ -579,7 +636,8 @@ class StripClauseSymbolTests(unittest.TestCase):
         self.assertEqual(clauses[0].text, "3.2、支持H.265编码，码率可调")
         self.assertNotIn("★", clauses[1].text)
         self.assertIn("分辨率不低于400万像素", clauses[1].text)
-        self.assertIn("网络摄像机", clauses[1].text)
+        self.assertEqual(clauses[1].columns[1], "网络摄像机")
+        self.assertNotIn("网络摄像机", clauses[1].text)
 
 
 class SectionKeywordTests(unittest.TestCase):

@@ -478,25 +478,28 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertGreaterEqual(app.table_export_window.WINDOW_WIDTH, 1200)
             self.assertGreaterEqual(app.table_export_window.WINDOW_HEIGHT, 1000)
             self.assertGreaterEqual(int(app.table_export_window.scan_tree.cget("height")), 18)
-            self.assertGreaterEqual(int(app.table_export_window.detail_text.cget("height")), 5)
+            self.assertTrue(hasattr(app.table_export_window, "detail_canvas"))
+            self.assertFalse(hasattr(app.table_export_window, "recommend_button"))
+            self.assertFalse(hasattr(app.table_export_window, "clear_all_button"))
             self.assertEqual(app.table_export_window.window.resizable(), (1, 1))
             self.assertFalse(bool(app.table_export_window.window.transient()))
             self.assertTrue(hasattr(app.table_export_window, "detail_scrollbar"))
             self.assertEqual(
                 app.table_export_window.scan_tree.cget("columns"),
-                ("selected", "file", "type", "section", "item", "quantity"),
+                ("selected", "type", "section", "item", "quantity", "hint"),
             )
             self.assertEqual(app.table_export_window.scan_tree.heading("section", "text"), "所在章节")
+            self.assertEqual(app.table_export_window.scan_tree.heading("hint", "text"), "提示")
             self.assertTrue(all(
                 "▼" not in app.table_export_window.scan_tree.heading(column, "text")
                 for column in app.table_export_window.scan_tree.cget("columns")
             ))
             self.assertTrue(app.table_export_window.scan_tree.bind("<B1-Motion>"))
-            self.assertEqual(
-                app.table_export_window.toggle_visible_selection_button.cget("text"),
-                "勾选当前结果",
-            )
-            self.assertNotIn("hint", app.table_export_window.scan_tree.cget("columns"))
+            self.assertEqual(app.table_export_window.scan_tree.heading("selected", "text"), "☐")
+            self.assertFalse(hasattr(app.table_export_window, "toggle_visible_selection_button"))
+            self.assertFalse(hasattr(app.table_export_window, "clear_visible_button"))
+            self.assertFalse(app.table_export_window.scan_button.instate(["disabled"]))
+            self.assertIn("hint", app.table_export_window.scan_tree.cget("columns"))
             self.assertEqual(
                 len(app.table_export_window._scan_column_separators),
                 len(app.table_export_window.scan_tree.cget("columns")) - 1,
@@ -571,8 +574,9 @@ class SimpleReplacementTests(unittest.TestCase):
             )
             self.assertEqual(len(exporter.scan_tree.get_children()), 2)
             self.assertEqual(exporter.selected_scan_keys, set())
-            self.assertEqual(exporter.scan_tree.item("1", "values")[2], "表格")
-            self.assertEqual(exporter.scan_tree.item("2", "values")[2], "符号条款")
+            self.assertEqual(exporter.scan_tree.item("1", "values")[1], "表格")
+            self.assertEqual(exporter.scan_tree.item("1", "values")[5], "建议关注")
+            self.assertEqual(exporter.scan_tree.item("2", "values")[1], "符号条款")
 
             root.update_idletasks()
             exporter._update_scan_tree_column_separators()
@@ -592,21 +596,16 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertIn("[筛]", exporter.scan_tree.heading("type", "text"))
             self.assertEqual(
                 exporter.filter_boxes["type"].cget("text"),
-                "已选 1 项 ▾",
+                "类型 符号条款 ▾",
             )
-            self.assertEqual(
-                exporter.toggle_visible_selection_button.cget("text"),
-                "勾选当前结果",
-            )
-            exporter.toggle_visible_selection_button.invoke()
+            self.assertEqual(exporter.scan_tree.heading("selected", "text"), "☐")
+            exporter._toggle_visible_from_heading()
             self.assertEqual(exporter.selected_scan_keys, {exporter._scan_key("symbol", symbol_item)})
-            self.assertEqual(
-                exporter.toggle_visible_selection_button.cget("text"),
-                "勾选当前结果",
-            )
+            self.assertEqual(exporter.scan_tree.heading("selected", "text"), "☑")
             exporter.clear_scan_selection()
             self.assertEqual(exporter.selected_scan_keys, set())
-            exporter.toggle_visible_selection_button.invoke()
+            self.assertEqual(exporter.scan_tree.heading("selected", "text"), "☐")
+            exporter._toggle_visible_from_heading()
 
             exporter.reset_scan_filters()
             self.assertEqual(len(exporter.scan_tree.get_children()), 2)
@@ -620,6 +619,60 @@ class SimpleReplacementTests(unittest.TestCase):
 
             exporter.clear_scan_selection()
             self.assertEqual(exporter.selected_scan_keys, set())
+        finally:
+            if app is not None and app.table_export_window is not None:
+                app.table_export_window.close()
+            root.destroy()
+
+    def test_scan_selection_range_keeps_highlight_and_groups_files(self):
+        root = create_hidden_root()
+        app = None
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app.open_word_table_exporter()
+            root.update_idletasks()
+            exporter = app.table_export_window
+            first = str(Path("C:/fixtures/甲.docx"))
+            second = str(Path("C:/fixtures/乙.docx"))
+            exporter.file_paths = [first, second]
+            tables = [
+                TableScanItem(first, "甲.docx", 1, "第一章", "", "甲", 2, 2, "建议关注：资格审查"),
+                TableScanItem(first, "甲.docx", 2, "第二章", "", "甲2", 2, 2, "谨慎选择：可能是投标文件格式"),
+                TableScanItem(second, "乙.docx", 1, "第三章", "", "乙", 1, 1, "普通表"),
+            ]
+            exporter._show_scan_result(tables, {}, None, [], {}, None)
+            self.assertEqual(exporter.scan_tree.get_children(), ("file:0", "file:1"))
+            self.assertEqual(exporter.scan_tree.get_children("file:0"), ("1", "2"))
+            self.assertEqual(exporter.scan_tree.get_children("file:1"), ("3",))
+            self.assertEqual(exporter.scan_tree.item("2", "values")[5], "谨慎选择")
+            self.assertEqual(exporter.scan_tree.item("3", "values")[5], "未命中")
+            self.assertEqual(exporter.scan_tree.item("file:0", "values")[2], "甲.docx")
+            self.assertEqual(exporter.scan_tree.item("file:0", "values")[4], "2 项")
+
+            exporter._toggle_scan_iids(["1"])
+            exporter._set_check_range("1", "3")
+            self.assertEqual(
+                exporter.selected_scan_keys,
+                {exporter._scan_key("table", item) for item in tables},
+            )
+            exporter._toggle_scan_iids(["1"])
+            exporter._set_check_range("1", "3")
+            self.assertEqual(exporter.selected_scan_keys, set())
+
+            exporter.scan_tree.selection_set(("1", "3"))
+            exporter.scan_tree.identify_region = lambda x, y: "cell"
+            exporter.scan_tree.identify_column = lambda x: "#1"
+            exporter.scan_tree.identify_row = lambda y: "2"
+            result = exporter._toggle_scan_checkbox_from_click(
+                SimpleNamespace(x=8, y=8, state=0)
+            )
+            self.assertEqual(result, "break")
+            self.assertEqual(set(exporter.scan_tree.selection()), {"1", "3"})
+            self.assertEqual(
+                exporter.selected_scan_keys,
+                {exporter._scan_key("table", tables[1])},
+            )
+            self.assertIn("已高亮 2 行", exporter.scan_label.cget("text"))
         finally:
             if app is not None and app.table_export_window is not None:
                 app.table_export_window.close()
@@ -644,7 +697,50 @@ class SimpleReplacementTests(unittest.TestCase):
 
             self.assertIn("导入招标文件", button_texts)
             self.assertIn("预设 ▼", button_texts)
+            self.assertIn("清空规则", button_texts)
             self.assertNotIn("导出 Excel", button_texts)
+        finally:
+            root.destroy()
+
+    def test_add_rule_row_inserts_below_selected_cell_row(self):
+        root = create_hidden_root()
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app.rules_sheet.set_sheet_data([
+                ["第一行", "一"],
+                ["第二行", "二"],
+                ["第三行", "三"],
+            ])
+            app.rules_sheet.select_cell(1, 0)
+
+            app.add_rule_row()
+
+            self.assertEqual(app.rules_sheet.get_sheet_data(), [
+                ["第一行", "一"],
+                ["第二行", "二"],
+                ["", ""],
+                ["第三行", "三"],
+            ])
+            self.assertEqual(
+                app.rules_sheet.get_selected_rows(get_cells_as_rows=True),
+                {2},
+            )
+        finally:
+            root.destroy()
+
+    def test_add_rule_row_appends_when_no_row_is_selected(self):
+        root = create_hidden_root()
+        try:
+            app = ReplaceSimpleApp(root, restore_session=False)
+            app.rules_sheet.set_sheet_data([["第一行", "一"]])
+            app.rules_sheet.deselect()
+
+            app.add_rule_row()
+
+            self.assertEqual(app.rules_sheet.get_sheet_data(), [
+                ["第一行", "一"],
+                ["", ""],
+            ])
         finally:
             root.destroy()
 

@@ -3,9 +3,11 @@
 
 从 .docx 文件中提取带标记符号（★、#、△、▲ 等）的指标条款：符号可能在
 条款最开头，也可能紧跟在条款序号之后；条款可能在正文段落里，也可能在
-表格里（整行完整提取）。Word 自动编号（w:numPr）会被重建并拼回条款文本
-前，保证导出内容“带序号”。结果写入 3 列 xlsx：数量序号 / 符号 /
-详细内容（带序号）。直接用 python-docx + openpyxl 读写，无需安装
+表格里。采购需求表里，带符号的参数按原文拆成单独一行，序号、设备名称、
+配置、数量等不含符号的列各自成列，并按 Word 里的合并单元格合并；
+不再把设备名称和参数写进同一个单元格。正文条款仍写入 3 列 xlsx：
+数量序号 / 符号 / 详细内容（带序号）。Word 自动编号（w:numPr）会被
+重建并拼回条款文本前。直接用 python-docx + openpyxl 读写，无需安装
 Word/WPS/Excel。
 """
 
@@ -279,6 +281,13 @@ class SymbolClause:
     text: str
     section: str = ""
     source: str = ""
+    # 表格条款按原表列展开。columns 与表头等长；merge_keys 相同的相邻行
+    # 导出时合并。正文条款这两项留空，仍走三列导出。
+    columns: Tuple[str, ...] = ()
+    merge_keys: Tuple[Optional[Tuple[int, int, int]], ...] = ()
+    headers: Tuple[str, ...] = ()
+    header_spans: Tuple[int, ...] = ()
+    column_spans: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -514,31 +523,36 @@ def export_symbol_clauses_to_excel(
         center_top = Alignment(wrap_text=True, vertical="top", horizontal="center")
         header_font = Font(bold=True)
 
-        for column, header in enumerate(SYMBOL_CLAUSE_HEADERS, start=1):
-            cell = worksheet.cell(row=1, column=column, value=header)
-            cell.number_format = "@"
-            cell.alignment = center_top
-            cell.border = border
-            cell.font = header_font
-
-        for row_index, clause in enumerate(clauses, start=2):
-            values = (str(row_index - 1), clause.symbol, clause.text)
-            for column, value in enumerate(values, start=1):
-                cell = worksheet.cell(row=row_index, column=column, value=value)
-                cell.data_type = "s"
+        if any(clause.columns for clause in clauses):
+            _write_table_shaped_clauses(
+                worksheet, clauses, border, wrap_top, center_top, header_font
+            )
+        else:
+            for column, header in enumerate(SYMBOL_CLAUSE_HEADERS, start=1):
+                cell = worksheet.cell(row=1, column=column, value=header)
                 cell.number_format = "@"
-                cell.alignment = center_top if column < 3 else wrap_top
+                cell.alignment = center_top
                 cell.border = border
+                cell.font = header_font
 
-        widths = {1: 10, 2: 8}
-        widest = MIN_COLUMN_WIDTH
-        for clause in clauses:
-            for line in clause.text.splitlines() or [""]:
-                widest = max(widest, _display_width(line))
-        widths[3] = min(MAX_COLUMN_WIDTH, max(MIN_COLUMN_WIDTH, widest + 2))
+            for row_index, clause in enumerate(clauses, start=2):
+                values = (str(row_index - 1), clause.symbol, clause.text)
+                for column, value in enumerate(values, start=1):
+                    cell = worksheet.cell(row=row_index, column=column, value=value)
+                    cell.data_type = "s"
+                    cell.number_format = "@"
+                    cell.alignment = center_top if column < 3 else wrap_top
+                    cell.border = border
 
-        for column, width in widths.items():
-            worksheet.column_dimensions[get_column_letter(column)].width = width
+            widths = {1: 10, 2: 8}
+            widest = MIN_COLUMN_WIDTH
+            for clause in clauses:
+                for line in clause.text.splitlines() or [""]:
+                    widest = max(widest, _display_width(line))
+            widths[3] = min(MAX_COLUMN_WIDTH, max(MIN_COLUMN_WIDTH, widest + 2))
+
+            for column, width in widths.items():
+                worksheet.column_dimensions[get_column_letter(column)].width = width
 
         from file_io import atomic_output_path
         with atomic_output_path(output_path) as temporary:
@@ -665,14 +679,12 @@ def _extract_table_clauses(
     keep_symbols_in_text: bool = True,
     section_keywords: Optional[List[str]] = None,
 ) -> List[SymbolClause]:
-    """Extract independently marked clause blocks from table rows.
+    """Extract marked clauses from a table without folding context into the text.
 
-    Plain cells in the same row (such as sequence number and item name) are
-    retained as context. When one cell contains multiple marked clauses, each
-    clause becomes its own result instead of duplicating the whole cell.
+    序号、设备名称、配置、数量等不含符号的单元格各自占一列。同一个 Word
+    单元格拆出的多条符号参数，以及纵向合并覆盖到的后续行，导出时合并这些列。
+    参数列只保留当前这一条符号条款。
     """
-    # 先按文档顺序把表格内（含嵌套表格）所有段落喂给编号跟踪器，
-    # 得到“段落 -> 带重建序号文本”的映射，之后提取时只做查找。
     numbered: Dict[object, str] = {}
     for p_el in table._tbl.iter(qn("w:p")):
         numbered[p_el] = tracker.numbered_text(Paragraph(p_el, table))
@@ -682,49 +694,241 @@ def _extract_table_clauses(
 
     exported = _extract_table(table, paragraph_text_fn=paragraph_text_fn)
     section = _section_text(headings)
+    if not exported.column_count or not section_matches_keywords(section, section_keywords):
+        return []
 
-    rows: Dict[int, List[str]] = {}
-    for cell in sorted(exported.cells, key=lambda item: (item.row, item.column)):
-        cleaned = _clean_clause_text(cell.text)
-        if cleaned:
-            rows.setdefault(cell.row, []).append(cleaned)
+    covered = _covered_table_cells(exported)
+    row_slots = [
+        _table_row_slots(covered, row_index, exported.column_count)
+        for row_index in range(1, exported.row_count + 1)
+    ]
+    symbol_rows = [
+        row_index for row_index, slots in enumerate(row_slots, start=1)
+        if _row_symbol_blocks(slots, symbols, row_index)
+    ]
+    if not symbol_rows:
+        return []
 
+    header_row = _table_header_row(row_slots, min(symbol_rows), symbols)
+    headers, header_spans = _header_values(row_slots, header_row, exported.column_count)
     clauses: List[SymbolClause] = []
-    for row_index in sorted(rows):
-        cell_texts = rows[row_index]
-        cell_blocks = [
-            _split_symbol_clause_blocks(cell_text, symbols)
-            for cell_text in cell_texts
-        ]
-        if not any(cell_blocks):
+    for row_index, slots in enumerate(row_slots, start=1):
+        blocks_by_column = _row_symbol_blocks(slots, symbols, row_index)
+        if not blocks_by_column:
             continue
-        if not section_matches_keywords(section, section_keywords):
-            continue
-
-        for marked_cell_index, blocks in enumerate(cell_blocks):
+        for column_index, blocks in blocks_by_column.items():
             for block_symbols, block_text in blocks:
-                parts: List[str] = []
-                for cell_index, cell_text in enumerate(cell_texts):
-                    if cell_index == marked_cell_index:
-                        parts.append(block_text)
-                    elif not cell_blocks[cell_index]:
-                        # 序号、名称等不含符号的同排单元格是每条参数的公共上下文。
-                        parts.append(cell_text)
-
-                clause_text = _finalize_clause_text(
-                    "\n".join(parts), symbols, keep_symbols_in_text
-                )
+                clause_text = _finalize_clause_text(block_text, symbols, keep_symbols_in_text)
                 if not clause_text:
                     continue
+                values, keys, spans = _table_clause_columns(
+                    slots, column_index, clause_text, table_index, exported.column_count
+                )
                 for symbol in block_symbols:
                     clauses.append(SymbolClause(
                         symbol,
                         clause_text,
                         section,
                         f"表格{table_index}",
+                        columns=tuple(values),
+                        merge_keys=tuple(keys),
+                        headers=headers,
+                        header_spans=header_spans,
+                        column_spans=tuple(spans),
                     ))
-
     return clauses
+
+
+def _covered_table_cells(exported) -> Dict[Tuple[int, int], object]:
+    covered: Dict[Tuple[int, int], object] = {}
+    for cell in exported.cells:
+        for row_index in range(cell.row, cell.row + max(1, cell.row_span)):
+            for column_index in range(cell.column, cell.column + max(1, cell.column_span)):
+                covered[(row_index, column_index)] = cell
+    return covered
+
+
+def _table_row_slots(covered, row_index: int, column_count: int) -> List[object]:
+    slots = []
+    for column_index in range(1, column_count + 1):
+        cell = covered.get((row_index, column_index))
+        if cell is None or cell.column != column_index:
+            slots.append(None)
+        else:
+            slots.append(cell)
+    return slots
+
+
+def _row_symbol_blocks(
+    slots,
+    symbols: Optional[str],
+    row_index: Optional[int] = None,
+) -> Dict[int, List[Tuple[List[str], str]]]:
+    found: Dict[int, List[Tuple[List[str], str]]] = {}
+    for index, cell in enumerate(slots):
+        if cell is None:
+            continue
+        if row_index is not None and cell.row != row_index:
+            continue
+        blocks = _split_symbol_clause_blocks(_clean_clause_text(cell.text), symbols)
+        if blocks:
+            found[index] = blocks
+    return found
+
+
+def _table_header_row(row_slots, first_symbol_row: int, symbols: Optional[str]) -> Optional[int]:
+    for row_index in range(first_symbol_row - 1, 0, -1):
+        slots = row_slots[row_index - 1]
+        if _row_symbol_blocks(slots, symbols, row_index):
+            continue
+        labels = [
+            _clean_clause_text(cell.text)
+            for cell in slots
+            if cell is not None and _clean_clause_text(cell.text)
+        ]
+        if len(labels) >= 2:
+            return row_index
+    return None
+
+
+def _header_values(row_slots, header_row: Optional[int], column_count: int):
+    headers = [""] * column_count
+    spans = [1] * column_count
+    if header_row is None:
+        return tuple(headers), tuple(spans)
+    for index, cell in enumerate(row_slots[header_row - 1]):
+        if cell is None:
+            continue
+        headers[index] = _clean_clause_text(cell.text)
+        spans[index] = max(1, cell.column_span)
+    return tuple(headers), tuple(spans)
+
+
+def _table_clause_columns(slots, marked_index: int, clause_text: str, table_index: int, column_count: int):
+    values = [""] * column_count
+    keys: List[Optional[Tuple[int, int, int]]] = [None] * column_count
+    spans = [1] * column_count
+    for index, cell in enumerate(slots):
+        if cell is None or index >= column_count:
+            continue
+        spans[index] = max(1, cell.column_span)
+        if index == marked_index:
+            values[index] = clause_text
+            continue
+        if _split_symbol_clause_blocks(_clean_clause_text(cell.text)):
+            continue
+        values[index] = _clean_clause_text(cell.text)
+        keys[index] = (table_index, cell.row, cell.column)
+    return values, keys, spans
+
+
+def _write_table_shaped_clauses(worksheet, clauses, border, wrap_top, center, header_font) -> None:
+    from openpyxl.styles import Alignment
+    from openpyxl.utils import get_column_letter
+
+    left_mid = Alignment(wrap_text=True, vertical="center", horizontal="left")
+    cursor = 1
+    group: List[SymbolClause] = []
+    group_headers: Optional[Tuple[str, ...]] = None
+
+    def flush() -> None:
+        nonlocal cursor, group, group_headers
+        if not group:
+            return
+        headers = group_headers or ()
+        header_spans = group[0].header_spans if any(headers) else ()
+        if any(headers):
+            for column, title in enumerate(headers, start=1):
+                _write_sheet_cell(worksheet, cursor, column, title, border, center, header_font)
+            if header_spans:
+                _merge_horizontal(worksheet, cursor, header_spans)
+            cursor += 1
+        first_data = cursor
+        keys_rows = []
+        widths: Dict[int, int] = {}
+        for clause in group:
+            values = clause.columns or (clause.text,)
+            merge_keys = clause.merge_keys or tuple(None for _ in values)
+            spans = clause.column_spans or tuple(1 for _ in values)
+            for column, value in enumerate(values, start=1):
+                is_clause = column - 1 < len(merge_keys) and merge_keys[column - 1] is None and value
+                alignment = wrap_top if is_clause else left_mid
+                _write_sheet_cell(worksheet, cursor, column, value, border, alignment, None)
+                for line in (value or "").splitlines() or [""]:
+                    widths[column] = min(
+                        MAX_COLUMN_WIDTH,
+                        max(widths.get(column, MIN_COLUMN_WIDTH), _display_width(line) + 2),
+                    )
+            if spans:
+                _merge_horizontal(worksheet, cursor, spans)
+            keys_rows.append(merge_keys)
+            cursor += 1
+        _merge_vertical(worksheet, first_data, keys_rows)
+        for column, width in widths.items():
+            letter = get_column_letter(column)
+            current = worksheet.column_dimensions[letter].width or MIN_COLUMN_WIDTH
+            worksheet.column_dimensions[letter].width = max(current, width)
+        group = []
+        group_headers = None
+
+    for clause in clauses:
+        headers = clause.headers if clause.columns else ()
+        if group and headers != group_headers:
+            flush()
+        if not group:
+            group_headers = headers
+        group.append(clause)
+    flush()
+
+
+def _write_sheet_cell(worksheet, row_index: int, column: int, value: str, border, alignment, font) -> None:
+    cell = worksheet.cell(row=row_index, column=column, value=value)
+    cell.data_type = "s"
+    cell.number_format = "@"
+    cell.alignment = alignment
+    cell.border = border
+    if font is not None:
+        cell.font = font
+
+
+def _merge_horizontal(worksheet, row_index: int, spans: Tuple[int, ...]) -> None:
+    column = 1
+    for span in spans:
+        width = max(1, span)
+        if width > 1:
+            worksheet.merge_cells(
+                start_row=row_index,
+                end_row=row_index,
+                start_column=column,
+                end_column=column + width - 1,
+            )
+        column += width
+
+
+def _merge_vertical(worksheet, start_row: int, keys_rows: List[Tuple[Optional[Tuple[int, int, int]], ...]]) -> None:
+    if not keys_rows:
+        return
+    width = max(len(keys) for keys in keys_rows)
+    for column in range(width):
+        index = 0
+        while index < len(keys_rows):
+            key = keys_rows[index][column] if column < len(keys_rows[index]) else None
+            end = index
+            while (
+                key is not None
+                and end + 1 < len(keys_rows)
+                and column < len(keys_rows[end + 1])
+                and keys_rows[end + 1][column] == key
+            ):
+                end += 1
+            if end > index:
+                worksheet.merge_cells(
+                    start_row=start_row + index,
+                    end_row=start_row + end,
+                    start_column=column + 1,
+                    end_column=column + 1,
+                )
+            index = end + 1
 
 
 class _NumberingTracker:

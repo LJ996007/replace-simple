@@ -454,23 +454,22 @@ class ReplaceSimpleApp:
 
         rules_toolbar = ttk.Frame(rules_header, style="Toolbar.TFrame")
         rules_toolbar.grid(row=0, column=1, sticky="e")
-        self._create_busy_button(rules_toolbar, text="新增一行", command=self.add_rule_row, width=9).pack(side="left", padx=(0, 6))
-        self._create_busy_button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=9).pack(side="left", padx=(0, 6))
-        more = ttk.Menubutton(rules_toolbar, text="更多 ▼", width=9, style="TButton")
-        more.pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="新增一行", command=self.add_rule_row, width=7).pack(side="left", padx=(0, 4))
+        self._create_busy_button(rules_toolbar, text="删除选中", command=self.delete_selected_rules, width=7).pack(side="left", padx=(0, 4))
+        self._create_busy_button(rules_toolbar, text="清空规则", command=self.clear_rules, width=7).pack(side="left", padx=(0, 4))
+        more = ttk.Menubutton(rules_toolbar, text="更多 ▼", width=7, style="TButton")
+        more.pack(side="left", padx=(0, 4))
         self._busy_widgets.append(more)
         menu = tk.Menu(more, tearoff=False)
         menu.add_command(label="将选中规则设为明确删除", command=self.mark_selected_rules_for_deletion)
         menu.add_command(label="保存规则为 Excel…", command=self.save_rules_to_excel)
         menu.add_command(label="执行前检查", command=self.preview_replacement)
         menu.add_command(label="查看项目信息来源", command=self.show_project_info_details)
-        menu.add_separator()
-        menu.add_command(label="清空规则", command=self.clear_rules)
         more.configure(menu=menu)
-        self._create_busy_button(rules_toolbar, text="导入 Excel", command=self.import_rules_from_excel, width=10).pack(side="left", padx=(0, 6))
-        self._create_busy_button(rules_toolbar, text="导入招标文件", command=self.import_rules_from_tender_file, width=13).pack(side="left", padx=(0, 6))
+        self._create_busy_button(rules_toolbar, text="导入 Excel", command=self.import_rules_from_excel, width=9).pack(side="left", padx=(0, 4))
+        self._create_busy_button(rules_toolbar, text="导入招标文件", command=self.import_rules_from_tender_file, width=11).pack(side="left", padx=(0, 4))
         self.preset_button = self._create_busy_button(
-            rules_toolbar, text="预设 ▼", command=self.toggle_preset_popup, width=8
+            rules_toolbar, text="预设 ▼", command=self.toggle_preset_popup, width=7
         )
         self.preset_button.pack(side="left")
 
@@ -1096,11 +1095,12 @@ class ReplaceSimpleApp:
         self._show_result_window("\n".join(lines), title="项目信息来源")
 
     def add_rule_row(self):
-        self.rules_sheet.insert_row(row=["", ""])
-        last = max(self.rules_sheet.total_rows() - 1, 0)
+        selected_rows = self.rules_sheet.get_selected_rows(get_cells_as_rows=True)
+        insert_at = max(selected_rows) + 1 if selected_rows else self.rules_sheet.total_rows()
+        self.rules_sheet.insert_row(row=["", ""], idx=insert_at)
         try:
-            self.rules_sheet.see(row=last, column=0)
-            self.rules_sheet.select_row(last)
+            self.rules_sheet.see(row=insert_at, column=0)
+            self.rules_sheet.select_row(insert_at)
         except Exception:
             pass
         self._refresh_rules_sheet_view()
