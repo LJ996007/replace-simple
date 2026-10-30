@@ -5,6 +5,7 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 
 from docx import Document
+from word_numbering import document_numbered_text
 
 from legacy_office import LegacyOfficeSession, temporary_docx_source
 from symbol_clause_extractor import (
@@ -39,11 +40,12 @@ def validate_scan_files(file_paths, stamps):
 def scan_word_content(file_paths, symbols, progress_callback=None):
     tables, sections, stamps = [], [], {}
     table_skipped, symbol_skipped, errors = {}, {}, []
+    total_steps = len(file_paths) * 4 + 1
     with ExitStack() as stack:
         session = None
         for index, path in enumerate(file_paths, 1):
             if progress_callback:
-                progress_callback(index, len(file_paths), os.path.basename(path), "正在扫描")
+                progress_callback((index-1)*4, total_steps, os.path.basename(path), "正在读取文档")
             try:
                 stamp = file_stamp(path)
                 extension = os.path.splitext(path)[1].lower()
@@ -56,8 +58,16 @@ def scan_word_content(file_paths, symbols, progress_callback=None):
                     context = temporary_docx_source(path, session)
                 with context as readable:
                     document = Document(readable)
-                    file_tables = scan_word_tables(path, document=document)
-                    file_sections = scan_symbol_clause_sections(path, symbols=symbols, document=document)
+                    if progress_callback:
+                        progress_callback((index-1)*4+1, total_steps, os.path.basename(path), "正在提取表格")
+                    numbered=document_numbered_text(document)
+                    file_tables = scan_word_tables(path, document=document, numbered=numbered)
+                    if progress_callback:
+                        progress_callback((index-1)*4+2, total_steps, os.path.basename(path), "正在提取条款")
+                    file_sections = scan_symbol_clause_sections(path, symbols=symbols, document=document, numbered=numbered)
+                    del numbered
+                if progress_callback:
+                    progress_callback((index-1)*4+3, total_steps, os.path.basename(path), "正在核验扫描结果")
                 if file_stamp(path) != stamp:
                     raise ValueError("文件在扫描过程中发生变化，请重新扫描")
                 stamps[_file_identity(path)] = stamp
@@ -69,6 +79,10 @@ def scan_word_content(file_paths, symbols, progress_callback=None):
                     symbol_skipped[_result_key(symbol_skipped, os.path.basename(path), path)] = "未找到带符号条款"
             except Exception as exc:
                 errors.append(f"{path}: {_format_export_error(exc)}")
+            if progress_callback:
+                progress_callback(index*4, total_steps, os.path.basename(path), "正在整理扫描结果")
+    if progress_callback:
+        progress_callback(total_steps, total_steps, "", "扫描结束")
     error = "\n".join(errors) or None
     return (tables, table_skipped, error), (sections, symbol_skipped, error), stamps
 
@@ -87,7 +101,7 @@ def export_scanned_content(tables, sections, stamps, output_dir, symbols,
         jobs.extend((kind, path, selected) for path, selected in grouped.items())
     for index, (kind, path, items) in enumerate(jobs, 1):
         if progress_callback:
-            progress_callback(index, len(jobs), os.path.basename(path))
+            progress_callback(index-1, len(jobs), os.path.basename(path))
         try:
             validate_scan_files([path], stamps)
             if kind == 0:
@@ -104,4 +118,6 @@ def export_scanned_content(tables, sections, stamps, output_dir, symbols,
             results[kind][_result_key(results[kind], os.path.basename(path), path)] = result
         except Exception as exc:
             errors[kind].append(f"{path}: {_format_export_error(exc)}")
+        if progress_callback:
+            progress_callback(index, len(jobs), os.path.basename(path))
     return results[0], {}, "\n".join(errors[0]) or None, results[1], {}, "\n".join(errors[1]) or None

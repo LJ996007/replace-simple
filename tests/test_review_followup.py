@@ -152,7 +152,7 @@ class ReviewFollowupTests(unittest.TestCase):
             for i in range(200)
         }
         with patch.object(window, "_visible_scan_keys", wraps=window._visible_scan_keys) as visible, \
-                patch.object(window, "_apply_scan_filters"):
+                patch.object(window, "_refresh_all_scan_rows"):
             window._toggle_scan_iids(list(window.scan_item_by_iid))
             self.assertEqual(len(window.selected_scan_keys), 200)
             visible.assert_called_once()

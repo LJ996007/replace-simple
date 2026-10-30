@@ -31,6 +31,7 @@ class ReviewFixTests(unittest.TestCase):
         root.withdraw()
         try:
             app = main.ReplaceSimpleApp(root, restore_session=False)
+            root.deiconify()
             style = main.ttk.Style(root)
             original_styles = {name: (style.configure(name), style.map(name))
                                for name in (".", "TButton", "Accent.TButton", "TCombobox", "Scan.Treeview")}
@@ -106,7 +107,8 @@ class ReviewFixTests(unittest.TestCase):
                 app.open_word_table_exporter()
                 window = app.table_export_window
                 root.update()
-                window.window.geometry("1280x900")
+                root.geometry("1280x900")
+                root.deiconify()
                 root.update()
                 tree_frame = window.scan_tree.master
                 detail_frame = window.detail_frame
@@ -130,6 +132,7 @@ class ReviewFixTests(unittest.TestCase):
                 window._update_scan_detail()
                 self.assertIn("速度要求", window.preview_plain_text())
                 window.keyword_var.set("精度")
+                window._apply_scan_filters()  # 关键词输入现在延迟合并刷新；此处显式完成筛选。
                 self.assertEqual(len(window._visible_scan_keys()), 1)
                 self.assertIn("另有 2 项已选但被筛掉", window.scan_label.cget("text"))
                 window._toggle_scan_iids(["3"])

@@ -7,7 +7,8 @@ import threading
 import tkinter as tk
 import traceback
 from datetime import datetime
-from tkinter import messagebox, ttk
+from tkinter import ttk
+from app_dialogs import messagebox
 from app_settings import error_log_path
 
 # string_replacer 会拖入 openpyxl(~290ms)+ docx(~100ms)，合计约 400ms。
@@ -587,6 +588,8 @@ class BackgroundTaskRunner:
         self._on_progress = None
         self._on_success = None
         self._on_error = None
+        self._progress_lock = threading.Lock()
+        self._latest_progress = None
 
     @property
     def active(self):
@@ -600,9 +603,13 @@ class BackgroundTaskRunner:
         self._on_progress = on_progress
         self._on_success = on_success
         self._on_error = on_error
+        with self._progress_lock:
+            self._latest_progress = None
 
         def publish_progress(*args):
-            self._events.put(("progress", args))
+            # 中间状态可以合并，完成/失败事件必须保留。
+            with self._progress_lock:
+                self._latest_progress = args
 
         def task():
             try:
@@ -630,6 +637,9 @@ class BackgroundTaskRunner:
             else:
                 completion = (event_name, args)
 
+        with self._progress_lock:
+            latest_progress = self._latest_progress or latest_progress
+            self._latest_progress = None
         if latest_progress and self._on_progress:
             self._on_progress(*latest_progress)
 

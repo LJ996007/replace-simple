@@ -1,9 +1,11 @@
-"""Word 表格与指标条款提取窗口。"""
+"""主窗口中的 Word 表格与指标条款提取页面。"""
 
 import os
+import re
 from dataclasses import replace
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from app_dialogs import messagebox
 from app_settings import load_settings, save_settings
 from ui_common import (
     WORD_EXTENSIONS,
@@ -22,10 +24,6 @@ from ui_common import (
 
 
 class WordTableExportWindow:
-    WINDOW_WIDTH = 1280
-    WINDOW_HEIGHT = 1100
-    MIN_WIDTH = 1020
-    MIN_HEIGHT = 820
     SCAN_COLUMN_TITLES = {
         "selected": "导出",
         "type": "类型",
@@ -38,25 +36,10 @@ class WordTableExportWindow:
 
     def __init__(self, app, initial_files=None):
         self.app = app
-        self.window = tk.Toplevel(app.root)
+        self.window = ttk.Frame(app.workspace, style="App.TFrame")
         self.window.bind("<Destroy>", cancel_widget_callbacks, add="+")
         self._task_runner = BackgroundTaskRunner(self.window)
         self._busy_widgets = []
-        self.window.title("提取信息")
-        # Give the scan list enough room on first open.  The result list is the
-        # primary workspace in this window, so it should not start out cramped
-        # by the fixed-height sections around it.
-        self.window.configure(bg=app.app_bg)
-        # 不设置 transient：Windows 会为普通可调整大小的 Toplevel 提供最大化按钮。
-        self.window.resizable(True, True)
-        # 先藏起来，排完布局再相对主窗口居中显示，避免闪到屏幕左上角
-        self.window.withdraw()
-        width, height, min_w, min_h = self._fitted_window_size()
-        self.window.minsize(min_w, min_h)
-        try:
-            self.window.iconphoto(True, app._icon_photo)
-        except Exception:
-            pass
 
         self.file_paths = []
         self.table_items = []
@@ -89,52 +72,6 @@ class WordTableExportWindow:
         if initial_files:
             self._append_files(initial_files, show_status=False)
             self.status_var.set(f"已自动带入 {len(self.file_paths)} 个 Word 文件")
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-
-        geometry = center_window_on_parent(
-            self.window,
-            app.root,
-            width=width,
-            height=height,
-        )
-        self.window.deiconify()
-        if geometry:
-            self.window.geometry(geometry)
-            # Windows 上 withdraw 后再显示，偶发丢掉刚才写入的尺寸，idle 后再钉一次
-            self.window.after_idle(lambda g=geometry: self._reapply_geometry(g))
-        else:
-            center_window_on_parent(
-                self.window,
-                app.root,
-                width=width,
-                height=height,
-            )
-        self.window.lift()
-        self.window.focus_force()
-
-    def _fitted_window_size(self):
-        """按屏幕可用区域收敛默认尺寸，避免超出任务栏或小屏显示器。"""
-        width, height = self.WINDOW_WIDTH, self.WINDOW_HEIGHT
-        min_w, min_h = self.MIN_WIDTH, self.MIN_HEIGHT
-        try:
-            screen_w = int(self.window.winfo_screenwidth())
-            screen_h = int(self.window.winfo_screenheight())
-        except Exception:
-            return width, height, min_w, min_h
-        if screen_w > 1:
-            width = min(width, max(screen_w - 48, 800))
-            min_w = min(min_w, width)
-        if screen_h > 1:
-            height = min(height, max(screen_h - 88, 600))
-            min_h = min(min_h, height)
-        return width, height, min_w, min_h
-
-    def _reapply_geometry(self, geometry):
-        try:
-            if self.window.winfo_exists() and geometry:
-                self.window.geometry(geometry)
-        except tk.TclError:
-            pass
 
     def exists(self):
         try:
@@ -143,18 +80,16 @@ class WordTableExportWindow:
             return False
 
     def focus(self):
-        try:
-            self.window.lift()
-            self.window.focus_force()
-        except Exception:
-            pass
+        self.app.show_workspace("extract")
 
     def close(self):
         if self._task_runner.active:
-            messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭窗口。", parent=self.window)
+            messagebox.showinfo("任务进行中", "当前任务仍在读写文件，请等待完成后再关闭窗口。", parent=self.app.root)
             return
         if hasattr(self, "_output_path"):
             self._output_path.hide_tooltip()
+        self._close_filter_dropdown()
+        self.app.show_workspace("replace")
         self.app.table_export_window = None
         self.window.destroy()
 
@@ -184,9 +119,10 @@ class WordTableExportWindow:
 
     def _begin_indeterminate_task(self, status):
         self._set_busy_controls(True)
-        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.stop()
+        self.progress.configure(mode="indeterminate", maximum=100, value=0)
         self.progress.grid()
-        self.progress.start(12)
+        self.progress.start(30)
         self.status_var.set(status)
         self._refresh_constrained_texts()
 
@@ -199,14 +135,13 @@ class WordTableExportWindow:
         self._refresh_constrained_texts()
 
     def _create_widgets(self):
-        body = ttk.Frame(self.window, padding=12, style="App.TFrame")
+        body = ttk.Frame(self.window, style="App.TFrame")
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
 
         header = ttk.Frame(body, style="App.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(header, text="提取信息", style="Title.TLabel").pack(anchor="w")
         self.header_hint = ttk.Label(
             header,
             text="选择 .doc / .docx 文件，扫描表格和符号后在列表里勾选，再导出。",
@@ -313,7 +248,7 @@ class WordTableExportWindow:
             ttk.Entry(filters, textvariable=self.keyword_var, width=24)
         )
         self.keyword_entry.grid(row=0, column=4, sticky="ew")
-        self.keyword_var.trace_add("write", lambda *_: self._apply_scan_filters())
+        self.keyword_var.trace_add("write", lambda *_: self._schedule_scan_filters())
         self.only_selected_check = self._track_choice_widget(
             ttk.Checkbutton(
                 filters,
@@ -414,6 +349,9 @@ class WordTableExportWindow:
         self.scan_tree.bind("<space>", self._toggle_scan_rows_from_keyboard)
         self.scan_tree.bind("<<TreeviewSelect>>", self._update_scan_detail)
         self.scan_tree.bind("<<TreeviewClose>>", self._reopen_file_groups, add="+")
+        from tree_checkmarks import TreeviewCheckmarks
+        self._scan_checkmarks = TreeviewCheckmarks(self.scan_tree, 'selected', self._scan_tree_header_height,
+                                                  self._raise_scan_tree_column_separators)
         self._schedule_scan_tree_column_separators()
         self.scan_placeholder = None
 
@@ -530,6 +468,10 @@ class WordTableExportWindow:
             style="Accent.TButton",
         )
         self.export_button.grid(row=0, column=3, sticky="e")
+        self.review_button = self._create_busy_button(
+            action_frame, text="填入开评标表…", command=self.start_review_fill, width=23,
+        )
+        self.review_button.grid(row=1, column=2, columnspan=2, sticky="e", pady=(6, 0))
         self._refresh_scan_filter_headings()
         self._sync_scan_choice_state()
         self._status_elide = ElidedTextController(
@@ -571,7 +513,10 @@ class WordTableExportWindow:
             return
         for column, title in self.SCAN_COLUMN_TITLES.items():
             if column == "selected":
-                self.scan_tree.heading(column, text=self._visible_export_mark(), anchor="center")
+                self.scan_tree.heading(column, text='', anchor="center",
+                    image=self._scan_checkmarks.icon(self._visible_export_mark(),self.app.text_fg))
+                self._scan_checkmarks.header_mark = self._visible_export_mark()
+                self._scan_checkmarks.schedule()
                 continue
             marker = " [筛]" if column in self.scan_filters else ""
             self.scan_tree.heading(column, text=title + marker)
@@ -620,12 +565,15 @@ class WordTableExportWindow:
         text_width = max((font.measure(label) for _value, label in rows), default=80)
         menu_width = min(max(text_width + 44, button.winfo_width(), 220), 480)
         row_height = max(font.metrics("linespace") + 10, 28)
+        # 与表格列表的树形勾选同尺寸公式，两处图标完全一致。
+        dpi = self.window.winfo_fpixels("1i") / 96
+        self._filter_popup_mark_size = min(max(16, round(18 * dpi)), max(12, round(row_height * .7)))
         visible_rows = min(10, len(rows))
 
         popup = tk.Toplevel(self.window)
         popup.withdraw()
         popup.overrideredirect(True)
-        popup.transient(self.window)
+        popup.transient(self.app.root)
         popup.configure(bg=self.app.border_color)
         outer = tk.Frame(popup, bg=self.app.border_color, padx=1, pady=1)
         outer.pack(fill="both", expand=True)
@@ -655,14 +603,10 @@ class WordTableExportWindow:
             row.pack_propagate(False)
             mark = tk.Label(
                 row,
-                text=self._filter_choice_mark(column, value, available),
+                image=self._filter_mark_image(self._filter_choice_mark(column, value, available)),
                 bg=self.app.surface_bg,
-                fg=self.app.text_fg,
-                font=font,
-                width=2,
-                anchor="center",
             )
-            mark.pack(side="left", padx=(6, 0))
+            mark.pack(side="left", padx=(8, 4))
             shown = self._fit_filter_menu_label(label, menu_width - 40)
             text = tk.Label(
                 row,
@@ -689,7 +633,7 @@ class WordTableExportWindow:
         inner.bind("<Configure>", sync_scroll)
         popup.bind("<MouseWheel>", lambda event: self._scroll_filter_dropdown(canvas, event))
         popup.bind("<Escape>", lambda _event: self._close_filter_dropdown())
-        self._filter_escape_bind = self.window.bind(
+        self._filter_escape_bind = self.app.root.bind(
             "<Escape>", lambda _event: self._close_filter_dropdown(), add="+"
         )
         if len(rows) > visible_rows:
@@ -711,7 +655,7 @@ class WordTableExportWindow:
         popup.lift()
         popup.update_idletasks()
         popup.focus_set()
-        self._filter_click_bind = self.window.bind(
+        self._filter_click_bind = self.app.root.bind(
             "<Button-1>", self._on_filter_dropdown_click, add="+"
         )
 
@@ -779,12 +723,26 @@ class WordTableExportWindow:
         self._set_multi_filter(column, selected)
         self._refresh_filter_dropdown_marks(available)
 
+    def _filter_mark_image(self, mark):
+        """筛选菜单复用表格列表的勾选图标，不用字体字符，两处样式一致。"""
+        from PIL import ImageTk
+
+        from ui_icons import checkbox_icon
+        size = getattr(self, "_filter_popup_mark_size", 0) or 18
+        cache = getattr(self, "_filter_mark_images", None) or {}
+        self._filter_mark_images = cache
+        key = (mark, size)
+        if key not in cache:
+            state = {"☑": "checked", "☐": "unchecked", "◩": "mixed"}.get(mark, "unchecked")
+            cache[key] = ImageTk.PhotoImage(checkbox_icon(size, self.app.text_fg, state), master=self.window)
+        return cache[key]
+
     def _refresh_filter_dropdown_marks(self, available):
         if not self._filter_popup_exists():
             return
         column = self._filter_popup_column
         for value, mark in self._filter_popup_rows:
-            mark.configure(text=self._filter_choice_mark(column, value, available))
+            mark.configure(image=self._filter_mark_image(self._filter_choice_mark(column, value, available)))
 
     def _on_filter_dropdown_click(self, event):
         if not self._filter_popup_exists():
@@ -805,14 +763,14 @@ class WordTableExportWindow:
         self._filter_click_bind = None
         if bind_id:
             try:
-                self.window.unbind("<Button-1>", bind_id)
+                self.app.root.unbind("<Button-1>", bind_id)
             except tk.TclError:
                 pass
         escape_bind = self._filter_escape_bind
         self._filter_escape_bind = None
         if escape_bind:
             try:
-                self.window.unbind("<Escape>", escape_bind)
+                self.app.root.unbind("<Escape>", escape_bind)
             except tk.TclError:
                 pass
         popup = self._filter_popup
@@ -840,13 +798,27 @@ class WordTableExportWindow:
         self.keyword_var.set("")
         self._apply_scan_filters(select_first=True)
 
+    # 拆分成册的招标文件常把文件名作为标题段落，章节路径因此带上冗长前缀。
+    _FILE_NAME_PREFIX = re.compile(r"\S+\.(?:docx?|docm|wps)(?:\s*/\s*|\s+|$)", re.I)
+
+    @classmethod
+    def _display_section(cls, section):
+        """展示与筛选用去掉文件名前缀的章节名；扫描数据保持原样。"""
+        text = section
+        while True:
+            stripped = cls._FILE_NAME_PREFIX.sub("", text, count=1)
+            if stripped == text:
+                break
+            text = stripped
+        return text.strip() or section
+
     def _scan_filter_value(self, column, kind, item):
         if column == "file":
             return item.file_path
         if column == "type":
             return "表格" if kind == "table" else "符号条款"
         if column == "section":
-            return item.section
+            return self._display_section(item.section)
         return ""
 
     def _scan_row_matches_filters(self, kind, item):
@@ -883,7 +855,8 @@ class WordTableExportWindow:
 
     def _row_keys(self, kind, item):
         if kind == "symbol" and item.clauses:
-            return {self._scan_key("clause", child) for child in self._clause_items(item)}
+            identity = _file_identity(item.file_path)
+            return {('clause',identity,item.section,id(clause)) for clause in item.clauses}
         return {self._scan_key(kind, item)}
 
     def _schedule_scan_tree_column_separators(self, event=None):
@@ -897,6 +870,7 @@ class WordTableExportWindow:
     def _run_scan_tree_column_separator_update(self):
         self._scan_separator_after = None
         self._update_scan_tree_column_separators()
+        self._scan_checkmarks.schedule()
 
     def _scan_tree_header_height(self):
         """测量 Treeview 表头高度，用于底部分隔横线贴齐灰底下沿。"""
@@ -931,6 +905,10 @@ class WordTableExportWindow:
             return max(36, linespace + 22)
         except Exception:
             return 41
+
+    def _raise_scan_tree_column_separators(self):
+        for line in (*self._scan_column_separators,self._scan_gutter_separator,self._scan_header_bottom_line):
+            if line.winfo_manager():line.lift()
 
     def _update_scan_tree_column_separators(self, event=None):
         """Keep header separator overlays aligned while columns resize or scroll."""
@@ -997,13 +975,13 @@ class WordTableExportWindow:
         file_paths = filedialog.askopenfilenames(
             title="选择 Word 文件",
             filetypes=[("Word 文档", "*.doc;*.docx"), ("所有文件", "*.*")],
-            parent=self.window,
+            parent=self.app.root,
         )
         if file_paths:
             self._append_files(file_paths)
 
     def select_folder(self):
-        directory = filedialog.askdirectory(title="选择包含 Word 文件的文件夹", parent=self.window)
+        directory = filedialog.askdirectory(title="选择包含 Word 文件的文件夹", parent=self.app.root)
         if not directory:
             return
 
@@ -1018,7 +996,7 @@ class WordTableExportWindow:
         def on_success(collected):
             self._reset_busy_state()
             if not collected:
-                messagebox.showinfo("提示", "该文件夹中未找到 .doc 或 .docx 文件。", parent=self.window)
+                messagebox.showinfo("提示", "该文件夹中未找到 .doc 或 .docx 文件。", parent=self.app.root)
                 return
             self._append_files(collected)
 
@@ -1094,12 +1072,12 @@ class WordTableExportWindow:
 
     def scan_content(self):
         if not self.file_paths:
-            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
+            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.app.root)
             return
 
         file_paths = list(self.file_paths)
         symbol_chars = self.app.symbol_chars
-        self._begin_determinate_task(f"正在扫描 {len(file_paths)} 个 Word 文件...", len(file_paths))
+        self._begin_determinate_task(f"正在扫描 {len(file_paths)} 个 Word 文件...", len(file_paths)*4+1)
 
         def work(publish_progress):
             from word_scan import scan_word_content
@@ -1226,7 +1204,7 @@ class WordTableExportWindow:
         return (
             "☑" if checked == keys else "◩" if checked else "☐",
             type_text,
-            item.section,
+            self._display_section(item.section),
             item_text,
             quantity,
             self._hint_short(kind, item),
@@ -1239,7 +1217,16 @@ class WordTableExportWindow:
             return (kind, _file_identity(item.file_path), item.section, id(item.clauses[0]))
         return (kind, _file_identity(item.file_path), item.section)
 
-    def _apply_scan_filters(self, select_first=False):
+    def _schedule_scan_filters(self):
+        pending=getattr(self,'_filter_after',None)
+        if pending is not None:self.window.after_cancel(pending)
+        self._filter_after=self.window.after(150,self._apply_scan_filters)
+
+    def _apply_scan_filters(self, select_first=False, defer_preview=False):
+        pending=getattr(self,'_filter_after',None)
+        if pending is not None:
+            self.window.after_cancel(pending)
+            self._filter_after=None
         if not hasattr(self, "scan_tree"):
             return
         previous_selection = self.scan_tree.selection()
@@ -1332,7 +1319,8 @@ class WordTableExportWindow:
         if scroll:
             self.scan_tree.yview_moveto(scroll[0])
         if children:
-            self._update_scan_detail()
+            if defer_preview:self._schedule_scan_detail(None)
+            else:self._update_scan_detail()
         elif self.scan_rows:
             self._set_detail_text("当前筛选条件下没有扫描结果，请调整上方筛选条件。")
         else:
@@ -1456,7 +1444,7 @@ class WordTableExportWindow:
             self._check_anchor_iid = row_id
         if self.scan_tree.exists(row_id):
             self.scan_tree.focus(row_id)
-            self._update_scan_detail(iid=row_id)
+            self._schedule_scan_detail(row_id)
         return "break"
 
     def _row_is_fully_checked(self, iid):
@@ -1484,7 +1472,7 @@ class WordTableExportWindow:
             self.selected_scan_keys.update(keys)
         else:
             self.selected_scan_keys.difference_update(keys)
-        self._apply_scan_filters(select_first=True)
+        self._refresh_all_scan_rows()
 
     def _toggle_scan_rows_from_keyboard(self, event=None):
         self.toggle_selected_scan_rows()
@@ -1511,7 +1499,7 @@ class WordTableExportWindow:
             self.selected_scan_keys.difference_update(keys)
         else:
             self.selected_scan_keys.update(keys)
-        self._apply_scan_filters(select_first=True)
+        self._refresh_all_scan_rows()
 
     def select_recommended_tables(self):
         recommended_tables = {
@@ -1554,9 +1542,36 @@ class WordTableExportWindow:
         self.status_var.set(f"已取消当前筛出的 {len(visible_keys)} 项")
 
     def _refresh_all_scan_rows(self):
-        self._apply_scan_filters(select_first=True)
+        # 只有“只看已选”会因勾选改变行集合，其余情况保留原行、滚动及预览。
+        if self.only_selected_var.get():
+            self._apply_scan_filters(select_first=True, defer_preview=True)
+            return
+        for iid, (kind, item) in self.scan_item_by_iid.items():
+            keys = self._row_keys(kind,item)
+            checked = keys & self.selected_scan_keys
+            mark = '☑' if checked == keys else '◩' if checked else '☐'
+            if self.scan_tree.set(iid,'selected') != mark:
+                self.scan_tree.set(iid,'selected',mark)
+                if kind == 'symbol' and item.clauses:
+                    self.scan_tree.set(iid,'quantity',f'{item.clause_count}条 · 已选 {len(checked)}')
+            elif kind == 'symbol' and item.clauses:
+                quantity = f'{item.clause_count}条 · 已选 {len(checked)}'
+                if self.scan_tree.set(iid,'quantity') != quantity:
+                    self.scan_tree.set(iid,'quantity',quantity)
+        self._refresh_scan_filter_headings()
+        self._refresh_scan_label()
+        self._scan_checkmarks.refresh()
+
+    def _schedule_scan_detail(self, iid):
+        pending = getattr(self,'_scan_detail_after',None)
+        if pending is not None:self.window.after_cancel(pending)
+        self._scan_detail_after = self.window.after(40,lambda:self._update_scan_detail(iid=iid))
 
     def _update_scan_detail(self, event=None, iid=None):
+        pending = getattr(self,'_scan_detail_after',None)
+        if pending is not None:
+            self.window.after_cancel(pending)
+            self._scan_detail_after = None
         self._refresh_highlight_label()
         if iid is None:
             selection = self.scan_tree.selection()
@@ -1570,11 +1585,14 @@ class WordTableExportWindow:
             return
 
         kind, item = row
+        if getattr(self,'_preview_item',None) is item:
+            return
         if kind == "table":
             caption = f"{item.section}    表格{item.table_index}    {item.row_count}×{item.column_count}"
             if item.hint:
                 caption = f"{caption}\n{item.hint}"
             self._show_preview_table(caption, self._word_table_preview_cells(item))
+            self._preview_item = item
             return
         clauses = list(getattr(item, "clauses", ()) or ())
         caption = f"{item.section}    {len(clauses) or item.clause_count}条"
@@ -1582,6 +1600,7 @@ class WordTableExportWindow:
         if symbols:
             caption = f"{caption}    {symbols}"
         self._show_preview_table(caption, self._symbol_preview_cells(clauses, item))
+        self._preview_item = item
 
     def _word_table_preview_cells(self, item):
         table = getattr(item, "table", None)
@@ -1663,6 +1682,7 @@ class WordTableExportWindow:
             child.destroy()
 
     def _set_detail_text(self, text):
+        self._preview_item = None
         if not hasattr(self, "detail_caption"):
             return
         self.detail_caption.configure(text=text)
@@ -1763,7 +1783,7 @@ class WordTableExportWindow:
             pass
 
     def select_output_dir(self):
-        directory = filedialog.askdirectory(title="选择输出目录", parent=self.window)
+        directory = filedialog.askdirectory(title="选择输出目录", parent=self.app.root)
         if not directory:
             return
         self.output_dir = directory
@@ -1803,7 +1823,7 @@ class WordTableExportWindow:
         dialog = tk.Toplevel(self.window)
         dialog.title("自定义提取符号")
         dialog.withdraw()
-        dialog.transient(self.window)
+        dialog.transient(self.app.root)
         dialog.resizable(False, False)
         dialog.configure(bg=self.app.app_bg)
         try:
@@ -1924,18 +1944,150 @@ class WordTableExportWindow:
         dialog.focus_force()
         entry.focus_set()
 
+    def start_review_fill(self, choose_file=False):
+        """复用扫描快照；首次选模板，以后复用本次会话的目标文件。"""
+        from review_table_filler import extract_review_rules, inspect_review_targets
+        if self._task_runner.active or self.app._task_runner.active:
+            messagebox.showinfo("任务进行中", "请等待当前文件任务完成。", parent=self.app.root)
+            return
+        if not self.table_items:
+            messagebox.showinfo("提示", "请先扫描招标文件的表格。", parent=self.app.root)
+            return
+        selected = [item for item in self.table_items if self._scan_key("table", item) in self.selected_scan_keys]
+        items = selected or self.table_items
+        recent = [p for p in getattr(self.app, "_last_replace_outputs", [])
+                  if os.path.splitext(p)[1].lower() in (".xlsx", ".xlsm") and os.path.isfile(p)]
+        template = None if choose_file else getattr(self, "_review_template_path", None)
+        if not template or not os.path.isfile(template):
+            initial = recent[0] if len(recent) == 1 else None
+            template = filedialog.askopenfilename(
+                parent=self.app.root, title="选择替换后的开评标 Excel 文件",
+                initialdir=os.path.dirname(initial) if initial else self.app.output_dir,
+                initialfile=os.path.basename(initial) if initial else "",
+                filetypes=[("Excel 工作簿", "*.xlsx;*.xlsm")],
+            )
+        if not template:
+            return
+        self._begin_indeterminate_task("正在读取开评标表格模板...")
+
+        from visual_fill import inspect_visual_workbook
+        from visual_fill_dialog import VisualFillDialog
+        def on_success(sheets):
+            self._reset_busy_state()
+            if not sheets:
+                messagebox.showwarning("没有工作表", "文件中没有可填写的工作表。", parent=self.app.root)
+                return
+            self._review_template_path = template
+            self._mapping_dialog = VisualFillDialog(self, template, items, sheets)
+
+        self._task_runner.submit(lambda _publish: inspect_visual_workbook(template), on_success,
+                                 lambda exc: self._finish_background_error(exc, "读取开评标模板"))
+
+    def _show_review_fill_dialog(self, template, candidates, targets):
+        dialog = tk.Toplevel(self.app.root)
+        dialog.title("生成商务技术评审表")
+        dialog.geometry("780x560")
+        dialog.minsize(640, 440)
+        dialog.transient(self.app.root)
+        body = ttk.Frame(dialog, padding=14, style="App.TFrame")
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(4, weight=1)
+        ttk.Label(body, text="目标文件", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text=os.path.basename(template), wraplength=540).grid(row=0, column=1, sticky="w")
+
+        def change_template():
+            dialog.destroy()
+            self.start_review_fill(choose_file=True)
+
+        ttk.Button(body, text="更换…", command=change_template).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(body, text="来源评分表").grid(row=1, column=0, pady=10, sticky="w")
+        source = ttk.Combobox(body, state="readonly", values=[
+            f"{item.filename} · 表 {item.table_index} · {len(rules.criteria)} 项 / {rules.total} 分"
+            for item, rules in candidates])
+        source.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(10, 0))
+        # 多个候选必须明确选一个，防止把不同标包静默混用。
+        if len(candidates) == 1:
+            source.current(0)
+        ttk.Label(body, text="填入工作表").grid(row=2, column=0, sticky="w")
+        destination = ttk.Combobox(body, state="readonly", values=[t.sheet_name for t in targets])
+        destination.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0))
+        preferred = getattr(self, "_review_sheet_name", "")
+        destination.current(next((i for i, target in enumerate(targets) if target.sheet_name == preferred), 0))
+        summary = tk.StringVar()
+        ttk.Label(body, textvariable=summary, wraplength=710).grid(row=3, column=0, columnspan=3, sticky="w", pady=10)
+        preview = tk.Text(body, wrap="word", font=self.app.body_font, padx=8, pady=8)
+        preview.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=preview.yview)
+        scroll.grid(row=4, column=3, sticky="ns")
+        preview.configure(yscrollcommand=scroll.set)
+        ttk.Label(body, text="评分标准按原文填入；投标人栏保留，评分栏留空。结果另存到所选输出目录，未选时保存到模板所在目录。",
+                  wraplength=710).grid(row=5, column=0, columnspan=3, sticky="w", pady=10)
+
+        def refresh(_event=None):
+            choice = source.current()
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            if choice < 0:
+                summary.set("检测到多个来源，请选择本次要使用的评分表。")
+                generate.configure(state="disabled")
+            else:
+                _, rules = candidates[choice]
+                excluded = "、".join(c.factor.strip() for c in rules.excluded_prices) or "无"
+                summary.set(f"商务技术评分：{len(rules.criteria)} 项，合计 {rules.total} 分。排除的价格项：{excluded}。")
+                preview.insert("1.0", "\n\n".join(f"{i}. {c.factor}（{c.points} 分）\n{c.description}"
+                                                     for i, c in enumerate(rules.criteria, 1)))
+                generate.configure(state="normal")
+            preview.configure(state="disabled")
+
+        def generate_file():
+            if source.current() < 0 or self._task_runner.active or self.app._task_runner.active:
+                return
+            from review_table_filler import fill_review_workbook, review_output_path
+            from word_scan import validate_scan_files
+            item, rules = candidates[source.current()]
+            sheet = destination.get()
+            stamps = dict(self.scan_stamps)
+            output_dir = self.output_dir
+            self._review_sheet_name = sheet
+            dialog.destroy()
+            self._begin_indeterminate_task("正在生成商务技术评审表...")
+
+            def work(_publish):
+                validate_scan_files([item.file_path], stamps)
+                output = review_output_path(template, output_dir)
+                return fill_review_workbook(template, output, sheet, rules)
+
+            def done(result):
+                self._reset_busy_state()
+                self.status_var.set(f"已生成商务技术评审表：{result['count']} 项 / {result['total']} 分")
+                self._last_output_dir_to_open = os.path.dirname(result["output_path"])
+                self._show_result_window(
+                    f"已填入：{result['sheet_name']}\n来源：{item.filename} · 表 {item.table_index}\n"
+                    f"评分项：{result['count']} 项；合计：{result['total']} 分\n"
+                    f"排除价格项：{'、'.join(result['excluded']) or '无'}\n\n输出：{result['output_path']}",
+                    title="商务技术评审表生成结果")
+
+            self._task_runner.submit(work, done, lambda exc: self._finish_background_error(exc, "生成商务技术评审表"))
+
+        generate = ttk.Button(body, text="生成并另存", style="Accent.TButton", command=generate_file)
+        generate.grid(row=6, column=1, columnspan=2, sticky="e")
+        source.bind("<<ComboboxSelected>>", refresh)
+        refresh()
+        dialog.grab_set()
+
     def start_export(self):
         if not self.file_paths:
-            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.window)
+            messagebox.showwarning("提示", "请先选择 Word 文件。", parent=self.app.root)
             return
         if not self.scan_rows:
             messagebox.showwarning(
-                "提示", "请先点击“扫描表格和符号”。", parent=self.window
+                "提示", "请先点击“扫描表格和符号”。", parent=self.app.root
             )
             return
         if not self.selected_scan_keys:
             messagebox.showwarning(
-                "提示", "请先在扫描结果中选择至少一项。", parent=self.window
+                "提示", "请先在扫描结果中选择至少一项。", parent=self.app.root
             )
             return
 
@@ -1949,7 +2101,7 @@ class WordTableExportWindow:
         table_file_paths = list(dict.fromkeys(item.file_path for item in tables))
         symbol_file_paths = list(dict.fromkeys(item.file_path for item in sections))
         if not tables and not sections:
-            messagebox.showwarning("提示", "请先在扫描结果中选择至少一项。", parent=self.window)
+            messagebox.showwarning("提示", "请先在扫描结果中选择至少一项。", parent=self.app.root)
             return
 
         output_dir = self.output_dir
@@ -1983,7 +2135,8 @@ class WordTableExportWindow:
         self._task_runner.submit(work, on_success, on_error, self._update_progress)
 
     def _update_progress(self, current, total, filename, action="正在导出"):
-        self.progress.configure(maximum=total, value=current)
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=max(1,total), value=max(0,min(current,total)))
         self.status_var.set(f"{action} ({current}/{total})：{filename}")
         self._refresh_constrained_texts()
 
@@ -2006,7 +2159,7 @@ class WordTableExportWindow:
         detail = f"导出失败：{message}"
         if log_path:
             detail += f"\n\n错误日志：{log_path}"
-        messagebox.showerror("错误", detail, parent=self.window)
+        messagebox.showerror("错误", detail, parent=self.app.root)
 
     def _show_export_result(
         self,
@@ -2087,14 +2240,14 @@ class WordTableExportWindow:
         try:
             os.startfile(directory)
         except Exception as exc:
-            messagebox.showerror("错误", f"无法打开输出目录：{exc}", parent=self.window)
+            messagebox.showerror("错误", f"无法打开输出目录：{exc}", parent=self.app.root)
 
     def _show_result_window(self, message, title="导出结果"):
         window = tk.Toplevel(self.window)
         window.title(title)
         window.minsize(560, 320)
         window.configure(bg=self.app.app_bg)
-        window.transient(self.window)
+        window.transient(self.app.root)
         window.withdraw()
 
         body = ttk.Frame(window, padding=12, style="App.TFrame")

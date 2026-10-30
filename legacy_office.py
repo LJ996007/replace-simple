@@ -21,19 +21,19 @@ LEGACY_EXTENSIONS = (".doc", ".xls", ".ppt")
 
 _APPLICATION_CANDIDATES = {
     "word": (
-        ("Microsoft Word", "Word.Application"),
         ("WPS Writer", "KWPS.Application"),
         ("WPS Writer", "wps.Application"),
+        ("Microsoft Word", "Word.Application"),
     ),
     "excel": (
-        ("Microsoft Excel", "Excel.Application"),
         ("WPS Spreadsheets", "KET.Application"),
         ("WPS Spreadsheets", "et.Application"),
+        ("Microsoft Excel", "Excel.Application"),
     ),
     "powerpoint": (
-        ("Microsoft PowerPoint", "PowerPoint.Application"),
         ("WPS Presentation", "KWPP.Application"),
         ("WPS Presentation", "wpp.Application"),
+        ("Microsoft PowerPoint", "PowerPoint.Application"),
     ),
 }
 

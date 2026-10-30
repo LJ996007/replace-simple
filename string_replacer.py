@@ -620,6 +620,7 @@ def get_output_path(
     rules: Optional[List[Tuple[str, str]]] = None,
     output_dir: Optional[str] = None,
     reserved_output_paths: Optional[set] = None,
+    output_extension: Optional[str] = None,
 ) -> str:
     """生成输出路径。
 
@@ -631,6 +632,11 @@ def get_output_path(
     if rules:
         filename = apply_rules_to_filename(filename, rules)
 
+    if output_extension is None:
+        from office_conversion import MODERN_EXTENSIONS
+        output_extension = MODERN_EXTENSIONS.get(os.path.splitext(file_path)[1].lower())
+    if output_extension:
+        filename = os.path.splitext(filename)[0] + output_extension
     output_path = os.path.join(dir_path, filename)
     reserved = reserved_output_paths if reserved_output_paths is not None else set()
     candidate = output_path
@@ -676,74 +682,61 @@ def batch_replace(
     results = {}
     errors = []
     reserved_output_paths = set()
-    legacy_session = None
+    from office_conversion import MODERN_EXTENSIONS, converted_office_source
 
-    try:
-        for index, file_path in enumerate(file_paths):
-            filename = os.path.basename(file_path)
-            if progress_callback:
-                progress_callback(index + 1, len(file_paths), filename)
+    for index, file_path in enumerate(file_paths):
+        filename = os.path.basename(file_path)
+        if progress_callback:
+            progress_callback(index + 1, len(file_paths), filename)
 
-            try:
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                output_path = get_output_path(
-                    file_path,
-                    rules,
-                    output_dir,
-                    reserved_output_paths=reserved_output_paths,
-                )
-                ext = os.path.splitext(file_path)[1].lower()
+        try:
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            ext = os.path.splitext(file_path)[1].lower()
+            output_path = get_output_path(
+                file_path,
+                rules,
+                output_dir,
+                reserved_output_paths=reserved_output_paths,
+                output_extension=MODERN_EXTENSIONS.get(ext),
+            )
 
-                if ext in (".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx") and os.path.getsize(file_path) == 0:
-                    if not _same_file_path(file_path, output_path):
-                        shutil.copy2(file_path, output_path)
-                    count = 0
-                elif ext == ".docx":
-                    count = replace_in_docx(file_path, rules, output_path)
-                elif ext in (".xlsx", ".xlsm"):
-                    count = replace_in_xlsx(file_path, rules, output_path)
-                elif ext == ".pptx":
-                    count = replace_in_pptx(file_path, rules, output_path)
-                elif ext in (".doc", ".xls", ".ppt"):
-                    from legacy_office import (
-                        LegacyOfficeSession,
-                        replace_in_doc,
-                        replace_in_ppt,
-                        replace_in_xls,
-                    )
+            if ext in MODERN_EXTENSIONS:
+                modern_ext = MODERN_EXTENSIONS[ext]
+                if progress_callback:
+                    progress_callback(index + 1, len(file_paths),
+                                      f"{filename}：正在转换为 {modern_ext}，完成后自动替换（保留原文件）")
+                with converted_office_source(file_path) as converted_path:
+                    if progress_callback:
+                        progress_callback(index + 1, len(file_paths), f"{filename}：转换完成，正在替换")
+                    handler = {".docx": replace_in_docx, ".xlsx": replace_in_xlsx,
+                               ".pptx": replace_in_pptx}[modern_ext]
+                    count = handler(converted_path, rules, output_path)
+            elif ext in (".docx", ".xlsx", ".xlsm", ".pptx") and os.path.getsize(file_path) == 0:
+                if not _same_file_path(file_path, output_path):
+                    shutil.copy2(file_path, output_path)
+                count = 0
+            elif ext == ".docx":
+                count = replace_in_docx(file_path, rules, output_path)
+            elif ext in (".xlsx", ".xlsm"):
+                count = replace_in_xlsx(file_path, rules, output_path)
+            elif ext == ".pptx":
+                count = replace_in_pptx(file_path, rules, output_path)
+            else:
+                raise ValueError("不支持的文件格式")
 
-                    if legacy_session is None:
-                        candidate_session = LegacyOfficeSession()
-                        try:
-                            candidate_session.__enter__()
-                        except Exception:
-                            candidate_session.close()
-                            raise
-                        legacy_session = candidate_session
-                    if ext == ".doc":
-                        count = replace_in_doc(file_path, rules, output_path, legacy_session)
-                    elif ext == ".xls":
-                        count = replace_in_xls(file_path, rules, output_path, legacy_session)
-                    else:
-                        count = replace_in_ppt(file_path, rules, output_path, legacy_session)
-                else:
-                    raise ValueError("不支持的文件格式")
-
-                results[_result_key(results, filename, file_path)] = count
-                if result_callback:
-                    result_callback({"source_path": os.path.abspath(file_path),
-                                     "output_path": os.path.abspath(output_path),
-                                     "count": count, "error": "",
-                                     "status": "零命中" if count == 0 else "成功"})
-            except Exception as exc:
-                errors.append(f"{filename}: {_format_processing_error(exc)}")
-                if result_callback:
-                    result_callback({"source_path": os.path.abspath(file_path),
-                                     "output_path": "", "count": 0,
-                                     "error": _format_processing_error(exc), "status": "失败"})
-    finally:
-        if legacy_session is not None:
-            legacy_session.close()
+            results[_result_key(results, filename, file_path)] = count
+            if result_callback:
+                result_callback({"source_path": os.path.abspath(file_path),
+                                 "output_path": os.path.abspath(output_path),
+                                 "count": count, "error": "",
+                                 "converted_from": ext if ext in MODERN_EXTENSIONS else "",
+                                 "status": "零命中" if count == 0 else "成功"})
+        except Exception as exc:
+            errors.append(f"{filename}: {_format_processing_error(exc)}")
+            if result_callback:
+                result_callback({"source_path": os.path.abspath(file_path),
+                                 "output_path": "", "count": 0,
+                                 "error": _format_processing_error(exc), "status": "失败"})
 
     return results, "\n".join(errors) if errors else None

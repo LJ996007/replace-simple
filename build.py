@@ -133,11 +133,11 @@ def _make_portable_zip(dist_dir: str, zip_path: str) -> None:
         for root, _dirs, files in os.walk(dist_dir):
             for name in files:
                 full = os.path.join(root, name)
-                arc = os.path.relpath(full, "dist")
+                arc = os.path.relpath(full, os.path.dirname(os.path.abspath(dist_dir)))
                 zf.write(full, arc)
 
 
-def build() -> bool:
+def build(dist_root="dist") -> bool:
     if not os.path.exists(MAIN_SCRIPT):
         print(f"错误：找不到主脚本 {MAIN_SCRIPT}")
         return False
@@ -152,6 +152,7 @@ def build() -> bool:
     print(f"当前版本：v{APP_VERSION}")
     # 通过当前 Python 解释器启动，兼容 PyInstaller 已安装但 Scripts 目录未加入 PATH 的环境。
     command = [sys.executable, "-m", "PyInstaller", *PYINSTALLER_ARGS]
+    command += ["--distpath", os.fspath(dist_root)]
     command += [f"--exclude-module={m}" for m in EXCLUDE_MODULES]
     command.append(MAIN_SCRIPT)
     print("执行命令：")
@@ -166,8 +167,8 @@ def build() -> bool:
         print(f"打包失败：{exc}")
         return False
 
-    dist_dir = os.path.join("dist", APP_NAME)
-    zip_path = os.path.join("dist", f"{APP_NAME}-v{APP_VERSION}-portable.zip")
+    dist_dir = os.path.join(dist_root, APP_NAME)
+    zip_path = os.path.join(dist_root, f"{APP_NAME}-v{APP_VERSION}-portable.zip")
     print(f"打包成功：{dist_dir}/{APP_NAME}.exe")
 
     try:

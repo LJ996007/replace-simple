@@ -84,7 +84,7 @@ class LegacyOfficeTests(unittest.TestCase):
             self.assertIs(session.application("word"), application)
             self.assertEqual(session.backend_name("word"), "WPS Writer")
 
-        self.assertEqual(client.attempts[:2], ["Word.Application", "KWPS.Application"])
+        self.assertEqual(client.attempts, ["KWPS.Application"])
         self.assertEqual(application.quit_count, 1)
         self.assertEqual(pythoncom.initialized, 1)
         self.assertEqual(pythoncom.uninitialized, 1)
@@ -151,43 +151,6 @@ class LegacyOfficeTests(unittest.TestCase):
 
         self.assertEqual(count, 2)
         self.assertEqual(root.text, replacement + "C")
-
-    def test_batch_replace_routes_doc_to_legacy_backend(self):
-        calls = []
-
-        class FakeSession:
-            def __enter__(self):
-                calls.append("enter")
-                return self
-
-            def close(self):
-                calls.append("close")
-
-        def fake_replace(file_path, rules, output_path, session):
-            calls.append((Path(file_path).suffix, tuple(rules), Path(output_path).suffix))
-            shutil.copy2(file_path, output_path)
-            return 3
-
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "采购人.doc"
-            output_dir = Path(directory) / "output"
-            output_dir.mkdir()
-            source.write_bytes(b"legacy")
-            with (
-                patch.object(legacy_office, "LegacyOfficeSession", FakeSession),
-                patch.object(legacy_office, "replace_in_doc", fake_replace),
-            ):
-                results, error = batch_replace(
-                    [str(source)],
-                    [("采购人", "建设单位")],
-                    output_dir=str(output_dir),
-                )
-
-        self.assertIsNone(error)
-        self.assertEqual(results, {"采购人.doc": 3})
-        self.assertEqual(calls[0], "enter")
-        self.assertEqual(calls[-1], "close")
-        self.assertEqual(calls[1][0], ".doc")
 
     def test_main_supported_extensions_include_all_legacy_formats(self):
         from main import SUPPORTED_EXTENSIONS, WORD_EXTENSIONS

@@ -18,6 +18,7 @@ from docx.oxml.ns import qn
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
 from file_io import atomic_output_path
+from word_numbering import document_numbered_text
 
 
 TABLE_OUTPUT_SUFFIX = "_表格"
@@ -72,10 +73,12 @@ def get_table_export_output_path(docx_path: str, output_dir: Optional[str] = Non
     return candidate
 
 
-def scan_word_tables(docx_path: str, document=None) -> List[TableScanItem]:
+def scan_word_tables(docx_path: str, document=None, numbered=None) -> List[TableScanItem]:
     """Scan body tables and return context-rich metadata for user selection."""
     if document is None:
         document = Document(docx_path)
+    if numbered is None:numbered = document_numbered_text(document)
+    paragraph_text = lambda paragraph: numbered[paragraph._p] if paragraph._p in numbered else paragraph.text
     filename = os.path.basename(docx_path)
     table_items: List[TableScanItem] = []
     headings: Dict[int, str] = {}
@@ -102,7 +105,7 @@ def scan_word_tables(docx_path: str, document=None) -> List[TableScanItem]:
             continue
 
         table_index += 1
-        exported_table = _extract_table(block)
+        exported_table = _extract_table(block, paragraph_text_fn=paragraph_text)
         section = _section_text(headings)
         context = _context_text(recent_paragraphs)
         preview = _table_preview(exported_table)
@@ -186,11 +189,10 @@ def export_word_tables_to_excel(
 
     if exported_tables is None:
         document = Document(docx_path)
-        tables = _body_tables(document)
-        if table_indexes is not None:
-            selected = set(table_indexes)
-            tables = [table for index, table in enumerate(tables, start=1) if index in selected]
-        exported_tables = [_extract_table(table) for table in tables]
+        # 先扫描整份文档再筛选，避免只导出后面的表时编号错误地从头开始。
+        scanned = scan_word_tables(docx_path, document=document)
+        selected = set(table_indexes) if table_indexes is not None else None
+        exported_tables = [item.table for item in scanned if selected is None or item.table_index in selected]
 
     if not exported_tables:
         return 0

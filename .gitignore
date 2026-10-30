@@ -14,3 +14,4 @@ version_info.txt
 *.bak
 
 ChatGPT Image*.png
+outputs/

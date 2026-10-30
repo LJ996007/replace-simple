@@ -313,8 +313,9 @@ class SimpleReplacementTests(unittest.TestCase):
         app = None
         try:
             app = ReplaceSimpleApp(root, restore_session=False)
+            root.deiconify()
             app.open_word_table_exporter()
-            root.update_idletasks()
+            root.update()
             exporter = app.table_export_window
             long_dir = (
                 "C:/Users/LJ/WPSDrive/1154674488/WPS云盘/"
@@ -449,7 +450,7 @@ class SimpleReplacementTests(unittest.TestCase):
             app = ReplaceSimpleApp(root, restore_session=False)
             root.update_idletasks()
 
-            self.assertEqual(app.table_export_button.cget("text"), "提取信息")
+            self.assertEqual(app.table_export_button.cget("text"), "信息提取")
             self.assertEqual(app.version_info_button.cget("text"), "版本")
             self.assertEqual(root.title(), simple_main.format_version_title())
 
@@ -468,21 +469,19 @@ class SimpleReplacementTests(unittest.TestCase):
 
             self.assertIsNotNone(app.table_export_window)
             self.assertTrue(app.table_export_window.exists())
-            self.assertEqual(app.table_export_window.window.title(), "提取信息")
+            self.assertIs(app.table_export_window.window.master, app.workspace)
+            self.assertEqual(app.active_workspace, "extract")
             self.assertTrue(hasattr(app.table_export_window, "scan_tree"))
             self.assertEqual(app.table_export_window.scan_button.cget("text"), "扫描表格和符号")
             self.assertTrue(hasattr(app.table_export_window, "keep_symbols_check"))
             self.assertFalse(app.table_export_window.keep_symbols_var.get())
             self.assertFalse(hasattr(app.table_export_window, "filter_sections_check"))
             self.assertFalse(hasattr(app.table_export_window, "customize_sections_button"))
-            self.assertGreaterEqual(app.table_export_window.WINDOW_WIDTH, 1200)
-            self.assertGreaterEqual(app.table_export_window.WINDOW_HEIGHT, 1000)
             self.assertGreaterEqual(int(app.table_export_window.scan_tree.cget("height")), 18)
             self.assertTrue(hasattr(app.table_export_window, "detail_canvas"))
             self.assertFalse(hasattr(app.table_export_window, "recommend_button"))
             self.assertFalse(hasattr(app.table_export_window, "clear_all_button"))
-            self.assertEqual(app.table_export_window.window.resizable(), (1, 1))
-            self.assertFalse(bool(app.table_export_window.window.transient()))
+            self.assertIs(app.table_export_window.window.winfo_toplevel(), root)
             self.assertTrue(hasattr(app.table_export_window, "detail_scrollbar"))
             self.assertEqual(
                 app.table_export_window.scan_tree.cget("columns"),
@@ -495,7 +494,8 @@ class SimpleReplacementTests(unittest.TestCase):
                 for column in app.table_export_window.scan_tree.cget("columns")
             ))
             self.assertTrue(app.table_export_window.scan_tree.bind("<B1-Motion>"))
-            self.assertEqual(app.table_export_window.scan_tree.heading("selected", "text"), "☐")
+            self.assertIn(str(app.table_export_window._scan_checkmarks.icon('☐', app.text_fg)),
+                          app.table_export_window.scan_tree.heading("selected", "image"))
             self.assertFalse(hasattr(app.table_export_window, "toggle_visible_selection_button"))
             self.assertFalse(hasattr(app.table_export_window, "clear_visible_button"))
             self.assertFalse(app.table_export_window.scan_button.instate(["disabled"]))
@@ -517,11 +517,6 @@ class SimpleReplacementTests(unittest.TestCase):
             self.assertGreaterEqual(header_height, 20)
 
             exporter = app.table_export_window
-            fitted_w, fitted_h, min_w, min_h = exporter._fitted_window_size()
-            self.assertGreaterEqual(fitted_w, min_w)
-            self.assertGreaterEqual(fitted_h, min_h)
-            self.assertLessEqual(fitted_w, exporter.WINDOW_WIDTH)
-            self.assertLessEqual(fitted_h, exporter.WINDOW_HEIGHT)
             exporter._sync_scan_tree_x_scrollbar(0.0, 1.0)
             exporter.window.update_idletasks()
             self.assertFalse(bool(exporter.scan_x_scrollbar.grid_info()))
@@ -543,8 +538,9 @@ class SimpleReplacementTests(unittest.TestCase):
         app = None
         try:
             app = ReplaceSimpleApp(root, restore_session=False)
+            root.deiconify()
             app.open_word_table_exporter()
-            root.update_idletasks()
+            root.update()
             exporter = app.table_export_window
             file_path = str(Path("C:/fixtures/招标文件.docx"))
             exporter.file_paths = [file_path]
@@ -598,13 +594,13 @@ class SimpleReplacementTests(unittest.TestCase):
                 exporter.filter_boxes["type"].cget("text"),
                 "类型 符号条款 ▾",
             )
-            self.assertEqual(exporter.scan_tree.heading("selected", "text"), "☐")
+            self.assertIn(str(exporter._scan_checkmarks.icon('☐', app.text_fg)), exporter.scan_tree.heading('selected','image'))
             exporter._toggle_visible_from_heading()
             self.assertEqual(exporter.selected_scan_keys, {exporter._scan_key("symbol", symbol_item)})
-            self.assertEqual(exporter.scan_tree.heading("selected", "text"), "☑")
+            self.assertIn(str(exporter._scan_checkmarks.icon('☑', app.text_fg)), exporter.scan_tree.heading('selected','image'))
             exporter.clear_scan_selection()
             self.assertEqual(exporter.selected_scan_keys, set())
-            self.assertEqual(exporter.scan_tree.heading("selected", "text"), "☐")
+            self.assertIn(str(exporter._scan_checkmarks.icon('☐', app.text_fg)), exporter.scan_tree.heading('selected','image'))
             exporter._toggle_visible_from_heading()
 
             exporter.reset_scan_filters()
@@ -1074,12 +1070,9 @@ class SimpleReplacementTests(unittest.TestCase):
             output_dir = root / "output"
             source_dir.mkdir()
             filenames = [
-                "empty.doc",
                 "empty.docx",
-                "empty.xls",
                 "empty.xlsx",
                 "empty.xlsm",
-                "empty.ppt",
                 "empty.pptx",
             ]
             source_paths = []

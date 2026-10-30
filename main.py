@@ -1,10 +1,11 @@
-"""批量替换主窗口与程序入口。"""
+"""文档处理主窗口：批量替换、信息提取与程序入口。"""
 
 import ctypes
 import os
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from app_dialogs import messagebox
 from tksheet import Sheet
 from app_info import format_changelog, format_version_title
 from app_settings import load_settings, save_settings
@@ -59,8 +60,9 @@ class ReplaceSimpleApp:
         self._task_runner = BackgroundTaskRunner(root)
         self._busy_widgets = []
         self.root.title(format_version_title())
-        self.root.geometry("860x720")
-        self.root.minsize(800, 660)
+        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        self.root.geometry(f"{min(1180, screen_w - 48)}x{min(860, screen_h - 88)}")
+        self.root.minsize(min(1020, screen_w - 48), min(720, screen_h - 88))
 
         # 窗口标题栏 / 任务栏图标
         self._apply_window_icon()
@@ -72,6 +74,7 @@ class ReplaceSimpleApp:
         self._last_output_dir_to_open = None
         self._rules_resize_after = None
         self.table_export_window = None
+        self.active_workspace = "replace"
         self._project_info_details = []
         if restore_session:
             settings = load_settings()
@@ -151,6 +154,23 @@ class ReplaceSimpleApp:
         self.root.option_add("*TCombobox*Listbox.selectForeground", self.text_fg)
         style.configure("Title.TLabel", font=self.title_font, background=self.app_bg)
         style.configure("Subtitle.TLabel", font=self.small_font, foreground=self.muted_fg, background=self.app_bg)
+        style.configure(
+            "Workspace.TButton", font=self.section_font,
+            padding=(14, 4), anchor="center", background=self.surface_bg,
+            foreground=self.text_fg, borderwidth=1, relief="flat",
+        )
+        style.map(
+            "Workspace.TButton",
+            background=[("selected", "#E3EDF8"), ("active", "#EBF1F7")],
+            foreground=[("selected", self.accent_fg)],
+            bordercolor=[("focus", self.accent_fg), ("selected", "#9BBFDF")],
+        )
+        style.configure("Header.TButton", font=self.small_font, padding=(8, 3))
+        style.configure("Header.TMenubutton", font=self.small_font, padding=(8, 3),
+                        background="#E1E6ED",foreground=self.text_fg,arrowcolor=self.text_fg,
+                        relief="flat",borderwidth=0)
+        style.map("Header.TMenubutton",background=[("active","#D9DFE7"),("pressed","#D0D6DF")],
+                  foreground=[("disabled","#9AA4B2")])
         style.configure("SectionTitle.TLabel", font=self.section_font, background=self.surface_bg)
         style.configure("Hint.TLabel", font=self.small_font, foreground=self.muted_fg, background=self.surface_bg)
         style.configure("Muted.TLabel", font=self.body_font, foreground=self.muted_fg, background=self.surface_bg)
@@ -364,37 +384,57 @@ class ReplaceSimpleApp:
         self._finish_with_error(str(exc), log_path)
 
     def _create_widgets(self):
-        self.container = ttk.Frame(self.root, padding=(16, 12), style="App.TFrame")
-        self.container.pack(fill="both", expand=True)
+        self.shell = ttk.Frame(self.root, padding=(16, 8), style="App.TFrame")
+        self.shell.pack(fill="both", expand=True)
+        self.workspace = ttk.Frame(self.shell, style="App.TFrame")
+        self.workspace.columnconfigure(0, weight=1)
+        self.workspace.rowconfigure(0, weight=1)
+        self.workspace.grid_propagate(False)
+        self.container = ttk.Frame(self.workspace, style="App.TFrame")
+        self.container.grid(row=0, column=0, sticky="nsew")
         self.container.columnconfigure(0, weight=1)
 
-        self.header_frame = ttk.Frame(self.container, style="App.TFrame")
+        self.header_frame = ttk.Frame(self.shell, style="App.TFrame")
         header_frame = self.header_frame
-        header_frame.pack(fill="x", pady=(0, 10))
-
-        header_top = ttk.Frame(header_frame, style="App.TFrame")
-        header_top.pack(fill="x")
-        ttk.Label(header_top, text="批量文本替换", style="Title.TLabel").pack(side="left", anchor="w")
-        self.table_export_button = self._create_busy_button(
-            header_top,
-            text="提取信息",
-            command=self.open_word_table_exporter,
-            width=10,
-        )
+        header_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(header_frame, text="文档处理工具", style="Subtitle.TLabel").pack(side="left")
         self.version_info_button = ttk.Button(
-            header_top,
+            header_frame,
             text="版本",
             command=self.show_version_info,
             width=6,
+            style="Header.TButton",
         )
         self.version_info_button.pack(side="right")
-        self.table_export_button.pack(side="right", padx=(0, 6))
-
-        ttk.Label(
-            header_frame,
-            text="Word / Excel / PPT 文件内容与文件名同步替换",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        navigation = ttk.Frame(header_frame, style="App.TFrame")
+        navigation.pack(side="left", padx=(20, 0))
+        self.workspace_buttons = {}
+        self.workspace_indicators = {}
+        self.workspace_tooltips = []
+        for column, (key, title, subtitle) in enumerate((
+            ("replace", "批量替换", "Word / Excel / PPT · 内容与文件名同步替换"),
+            ("extract", "信息提取", "Word 表格、指标条款 · 导出 Excel"),
+        )):
+            navigation.columnconfigure(column, weight=1, uniform="workspace")
+            card = ttk.Frame(navigation, style="App.TFrame")
+            card.grid(row=0, column=column, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+            button = ttk.Button(
+                card, text=title, width=12, style="Workspace.TButton",
+                command=lambda mode=key: self.show_workspace(mode),
+            )
+            button.pack(fill="x")
+            indicator = tk.Frame(card, height=2, bg=self.accent_fg if key == "replace" else self.border_color)
+            indicator.pack(fill="x")
+            self.workspace_buttons[key] = button
+            self.workspace_indicators[key] = indicator
+            self.workspace_tooltips.append(HoverTooltip(
+                button, lambda text=subtitle: text, self.small_font, fg=self.text_fg,
+            ))
+            button.bind("<Left>", lambda _event: self._navigate_workspace("replace"))
+            button.bind("<Right>", lambda _event: self._navigate_workspace("extract"))
+        self.workspace_buttons["replace"].state(["selected"])
+        self.table_export_button = self.workspace_buttons["extract"]
+        self.workspace.pack(fill="both", expand=True)
 
         self.file_frame = ttk.Frame(self.container, padding=(12, 9), style="Surface.TFrame")
         file_frame = self.file_frame
@@ -687,27 +727,21 @@ class ReplaceSimpleApp:
         恢复上次窗口尺寸或主题控件请求高度变化时，底部操作区可能被挤出窗口。
         这里改为先测量顶部、文件区、底部区和规则区固定控件，再把剩余高度给表格。
         """
+        if self.active_workspace != "replace":
+            return
         try:
             self.root.update_idletasks()
         except Exception:
             pass
 
-        win_h = self.root.winfo_height()
+        win_h = self.workspace.winfo_height()
         if win_h <= 1:
             return
 
-        try:
-            container_pad_y = sum(self.container.pack_info().get("pady", (0, 0)))
-        except Exception:
-            container_pad_y = 0
-
         fixed_h = (
-            self.header_frame.winfo_reqheight() + 10
-            + self.file_frame.winfo_reqheight() + 8
+            self.file_frame.winfo_reqheight() + 8
             + self.bottom_frame.winfo_reqheight()
             + self._rules_fixed_height()
-            + 24
-            + container_pad_y
         )
         available = win_h - fixed_h
         new_h = max(MIN_SHEET_HEIGHT, available)
@@ -999,7 +1033,7 @@ class ReplaceSimpleApp:
             messagebox.showinfo(
                 "选择招标文件",
                 "已检测到多个 Word 文件。\n\n"
-                "请在主文件列表或「提取信息」窗口中选中一个招标文件，"
+                "请在「批量替换」或「信息提取」页面的文件列表中选中一个招标文件，"
                 "或者在接下来的窗口中重新选择。",
             )
 
@@ -1674,6 +1708,8 @@ class ReplaceSimpleApp:
 
         def on_success(result):
             results, error, details = result
+            self._last_replace_outputs = [item["output_path"] for item in details
+                                          if item["status"] != "失败" and item["output_path"]]
             failed = [item["source_path"] for item in details if item["status"] == "失败"]
             retry = (lambda: self._run_replace(failed, rules, output_dir)) if failed else None
             self._show_result(results, error, file_paths=file_paths, output_dir=output_dir,
@@ -1710,6 +1746,8 @@ class ReplaceSimpleApp:
         if details is not None:
             for item in details:
                 lines.append(f"\n【{item['status']}】{item['source_path']}：{item['count']} 处")
+                if item.get("converted_from"):
+                    lines.append(f"已由 {item['converted_from']} 自动转换，原文件已保留。")
                 if item["output_path"]:
                     lines.append("输出：" + item["output_path"])
                 if item["error"]:
@@ -1852,13 +1890,44 @@ class ReplaceSimpleApp:
         window.focus_force()
 
     def open_word_table_exporter(self):
-        initial_files = self._word_files_for_reuse()
-        if self.table_export_window and self.table_export_window.exists():
-            if initial_files:
-                self.table_export_window._append_files(initial_files, show_status=False)
-            self.table_export_window.focus()
-            return
-        self.table_export_window = WordTableExportWindow(self, initial_files=initial_files)
+        self.show_workspace("extract")
+
+    def _navigate_workspace(self, mode):
+        self.show_workspace(mode)
+        self.workspace_buttons[mode].focus_set()
+        return "break"
+
+    def show_workspace(self, mode):
+        """只切换页面的可见性；文件、规则和扫描快照留在原页面中。"""
+        if mode not in self.workspace_buttons:
+            raise ValueError(f"Unknown workspace: {mode}")
+        for tooltip in self.workspace_tooltips:
+            tooltip.hide()
+        self._close_preset_popup()
+        self._output_path.hide_tooltip()
+        exporter = self.table_export_window
+        if exporter and exporter.exists():
+            exporter._close_filter_dropdown()
+            exporter._output_path.hide_tooltip()
+        if mode == "extract":
+            if not exporter or not exporter.exists():
+                # 仅首次进入带入 Word；来回切换不重新加入用户已移除的文件。
+                exporter = WordTableExportWindow(self, initial_files=self._word_files_for_reuse())
+                self.table_export_window = exporter
+            self.container.grid_remove()
+            exporter.window.grid(row=0, column=0, sticky="nsew")
+            exporter.window.after_idle(exporter._refresh_constrained_texts)
+        else:
+            if exporter and exporter.exists():
+                exporter.window.grid_remove()
+            self.container.grid()
+        self.active_workspace = mode
+        for key, button in self.workspace_buttons.items():
+            button.state(["selected"] if key == mode else ["!selected"])
+            self.workspace_indicators[key].configure(bg=self.accent_fg if key == mode else self.border_color)
+        if mode == "replace":
+            self._on_window_configure()
+            self.root.after_idle(self._refresh_rules_sheet_view)
 
 
 def main():
