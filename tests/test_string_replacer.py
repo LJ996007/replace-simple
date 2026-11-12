@@ -404,7 +404,7 @@ class SimpleReplacementTests(unittest.TestCase):
         finally:
             root.destroy()
 
-    def test_capped_scrollbar_limits_full_span_and_maps_drag(self):
+    def test_scrollbar_preserves_real_span_and_native_commands(self):
         displayed = []
         commands = []
         model = CappedScrollbarModel(
@@ -412,7 +412,17 @@ class SimpleReplacementTests(unittest.TestCase):
             lambda first, last: displayed.append((first, last)),
         )
         model.set(0, 1)
-        self.assertEqual(displayed[-1], (0.14, 0.86))
+        self.assertEqual(displayed[-1], (0.0, 1.0))
+        model.dispatch("moveto", 0.5)
+        model.dispatch("scroll", 1, "units")
+        self.assertEqual(commands, [])
+
+        model.set("0", "0.9")
+        self.assertEqual(displayed[-1], (0.0, 0.9))
+        model.dispatch("moveto", "0.1")
+        self.assertEqual(commands[-1], ("moveto", "0.1"))
+        model.set(0.1, 1.0)
+        self.assertEqual(displayed[-1], (0.1, 1.0))
 
         model.set(0.25, 0.75)
         self.assertEqual(displayed[-1], (0.25, 0.75))
@@ -1913,6 +1923,77 @@ class SimpleReplacementTests(unittest.TestCase):
             info = extract_project_info(str(source_path))
 
         self.assertEqual(info.get("招标公告日期"), "2026年7月2日")
+
+    def test_extract_ignores_blank_fill_project_numbers(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "blank-fill-number.docx"
+
+            document = Document()
+            document.add_paragraph("项目编号：ABC-2026-001")
+            document.add_paragraph("项目编号：__________")
+            document.add_paragraph("项目编号：__________ 包 号：__________")
+            document.save(source_path)
+
+            from tender_info_extractor import extract_project_info_details
+            details = {item["field"]: item for item in extract_project_info_details(str(source_path))}
+
+        self.assertEqual(details["项目编号"]["value"], "ABC-2026-001")
+        self.assertEqual(details["项目编号"]["status"], "直接识别")
+
+    def test_extract_does_not_infer_announcement_date_from_opening_time(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "opening-only.docx"
+
+            document = Document()
+            document.add_paragraph("第一章 投标邀请")
+            document.add_paragraph("开标时间：2026年10月12日14时00分（北京时间）")
+            document.add_paragraph("第二章 投标人须知")
+            document.save(source_path)
+
+            from tender_info_extractor import extract_project_info_details
+            details = {item["field"]: item for item in extract_project_info_details(str(source_path))}
+
+        self.assertEqual(details["招标公告日期"]["value"], "")
+        self.assertEqual(details["招标公告日期"]["status"], "缺失")
+
+    def test_extract_filters_form_table_headers_and_supervision_contacts(self):
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "compatible-tender.docx"
+
+            document = Document()
+            document.add_paragraph("项目名称：常规采购项目")
+            project_table = document.add_table(rows=2, cols=3)
+            project_table.cell(0, 0).text = "序号"
+            project_table.cell(0, 1).text = "项目名称"
+            project_table.cell(0, 2).text = "合同\n签订时间"
+            project_table.cell(1, 0).text = "1"
+
+            item_table = document.add_table(rows=2, cols=3)
+            item_table.cell(0, 0).text = "序号"
+            item_table.cell(0, 1).text = "标的名称"
+            item_table.cell(0, 2).text = "总价（元）"
+            item_table.cell(1, 1).text = "常规设备"
+            document.add_table(rows=2, cols=3)
+            document.tables[-1].cell(0, 1).text = "标的名称"
+            document.tables[-1].cell(1, 1).text = "常规设备"
+
+            document.add_paragraph("1.采购人信息")
+            document.add_paragraph("名 称：示例医院")
+            document.add_paragraph("联系方式：温老师，010-12345678")
+            document.add_paragraph("采购人业务监督联系人：庞老师")
+            document.add_paragraph("联系方式：010-87654321")
+            document.add_paragraph("2.采购代理机构信息")
+            document.save(source_path)
+
+            from tender_info_extractor import extract_project_info_details
+            details = {item["field"]: item for item in extract_project_info_details(str(source_path))}
+
+        self.assertEqual(details["项目名称"]["value"], "常规采购项目")
+        self.assertNotEqual(details["项目名称"]["status"], "冲突")
+        self.assertEqual(details["标的名称"]["value"], "常规设备")
+        self.assertNotEqual(details["标的名称"]["status"], "冲突")
+        self.assertEqual(details["采购人联系人"]["value"], "温老师")
+        self.assertEqual(details["采购人电话"]["value"], "010-12345678")
 
     def test_extract_skips_junk_tender_item_rows(self):
         with TemporaryDirectory() as tmp_dir:

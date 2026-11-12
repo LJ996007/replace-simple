@@ -662,51 +662,29 @@ class BackgroundTaskRunner:
 
 
 class CappedScrollbarModel:
-    """限制滑块最大视觉长度，同时保持拖动位置与真实滚动范围一致。"""
+    """兼容原调用入口，直接使用控件的真实可见范围。"""
 
-    def __init__(self, command, display_setter, max_thumb_fraction=0.72):
+    def __init__(self, command, display_setter):
         self.command = command
         self.display_setter = display_setter
-        self.max_thumb_fraction = max_thumb_fraction
         self.actual_first = 0.0
         self.actual_last = 1.0
-        self.display_span = max_thumb_fraction
 
     def set(self, first, last):
         first = float(first)
         last = float(last)
         self.actual_first = first
         self.actual_last = last
-        actual_span = max(0.0, min(last - first, 1.0))
-        self.display_span = min(actual_span, self.max_thumb_fraction)
-
-        actual_range = max(1.0 - actual_span, 0.0)
-        display_range = max(1.0 - self.display_span, 0.0)
-        if actual_range <= 1e-9:
-            display_first = display_range / 2
-        else:
-            display_first = (first / actual_range) * display_range
-        display_first = max(0.0, min(display_first, display_range))
-        self.display_setter(display_first, display_first + self.display_span)
+        self.display_setter(first, last)
 
     def dispatch(self, *args):
-        if not args:
-            return
-        if args[0] == "moveto" and len(args) >= 2:
-            actual_span = max(self.actual_last - self.actual_first, 0.0)
-            actual_range = max(1.0 - actual_span, 0.0)
-            display_range = max(1.0 - self.display_span, 0.0)
-            if actual_range <= 1e-9 or display_range <= 1e-9:
-                return
-            display_first = max(0.0, min(float(args[1]), display_range))
-            actual_first = (display_first / display_range) * actual_range
-            self.command("moveto", actual_first)
+        if not args or (self.actual_first <= 0 and self.actual_last >= 1):
             return
         self.command(*args)
 
 
 class FlatScrollbar(ttk.Scrollbar):
-    """带扁平箭头、淡蓝配色和限长滑块的统一滚动条。"""
+    """统一配色，按真实范围显示滑块，无溢出时禁用。"""
 
     def __init__(self, parent, *, command, orient="vertical", **kwargs):
         style_name = (
@@ -715,21 +693,28 @@ class FlatScrollbar(ttk.Scrollbar):
         )
         kwargs.setdefault("style", style_name)
         super().__init__(parent, orient=orient, **kwargs)
-        self._capped_model = CappedScrollbarModel(command, super().set)
+        self._capped_model = CappedScrollbarModel(command, self._set_native_range)
         self.configure(command=self._capped_model.dispatch)
+        self.set(0, 1)
+
+    def _set_native_range(self, first, last):
+        super().set(first, last)
+        self.state(["disabled"] if first <= 0 and last >= 1 else ["!disabled"])
 
     def set(self, first, last):
         self._capped_model.set(first, last)
 
 
 def cap_existing_scrollbar(scrollbar, command, scrollable, orientation="vertical"):
-    """给第三方控件内部已创建的 ttk 滚动条套用统一样式与限长模型。"""
+    """给第三方控件内部滚动条套用统一样式，保留真实范围。"""
     style_name = (
         "Flat.Vertical.TScrollbar" if orientation == "vertical"
         else "Flat.Horizontal.TScrollbar"
     )
     scrollbar.configure(style=style_name)
-    display_setter = lambda first, last: ttk.Scrollbar.set(scrollbar, first, last)
+    def display_setter(first, last):
+        ttk.Scrollbar.set(scrollbar, first, last)
+        scrollbar.state(["disabled"] if first <= 0 and last >= 1 else ["!disabled"])
     model = CappedScrollbarModel(command, display_setter)
     scrollbar.configure(command=model.dispatch)
     if orientation == "vertical":
@@ -737,5 +722,6 @@ def cap_existing_scrollbar(scrollbar, command, scrollable, orientation="vertical
     else:
         scrollable.configure(xscrollcommand=model.set)
     scrollbar._capped_model = model
+    model.set(0, 1)
     return model
 

@@ -4,6 +4,7 @@ Extract common project fields from tender .docx files as replacement rules.
 
 import re
 from datetime import date
+from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from docx import Document
@@ -48,9 +49,22 @@ MAX_VALUE_LENGTH = 500
 # 标的名称表格列里不应视为标的的占位行
 _JUNK_TENDER_ITEM_VALUES = {"备注", "说明", "合计", "小计", "总计"}
 _JUNK_TENDER_ITEM_PREFIXES = ("注：", "注:", "备注", "以上")
+_JUNK_TABLE_HEADER_VALUES = {
+    "合同签订时间",
+    "项目单位",
+    "项目单位联系人/电话",
+    "项目内容描述",
+    "单价（元）",
+    "总价（元）",
+    "合价（元）",
+    "数量",
+    "单位",
+    "序号",
+}
 
 # 「详见第八章」「另行通知」这类引用性值不是真实开标信息
 _REFERENCE_VALUE_PATTERN = re.compile(r"详见|参见|见第|另行(?:通知|公告)")
+_BLANK_FILL_VALUE_PATTERN = re.compile(r"^[_＿\-—–]{2,}")
 PROCUREMENT_CONTEXT_FIELDS: Sequence[Tuple[str, Sequence[str]]] = (
     ("采购人名称", ("名称", "名 称", "单位名称", "机构名称")),
     ("采购人联系人", ("联系人", "联 系 人", "项目联系人")),
@@ -117,6 +131,10 @@ def _looks_like_any_key(text: str) -> bool:
     return False
 
 
+def _is_junk_table_header(text: str) -> bool:
+    return _normalize_key(text) in _JUNK_TABLE_HEADER_VALUES
+
+
 def _value_from_labeled_text(text: str, aliases: Iterable[str]) -> Optional[str]:
     line = _clean_text(text)
     if not line:
@@ -139,6 +157,14 @@ def _value_from_labeled_text(text: str, aliases: Iterable[str]) -> Optional[str]
     return None
 
 
+def _is_blank_fill_value(value: Optional[str]) -> bool:
+    compact = re.sub(r"\s+", "", value or "")
+    return not compact or bool(
+        re.fullmatch(r"[_＿\-—–]+", compact)
+        or _BLANK_FILL_VALUE_PATTERN.match(compact)
+    )
+
+
 class _FieldValues(dict):
     """提取值及其候选原文位置；对外仍返回普通字典。"""
 
@@ -150,6 +176,8 @@ class _FieldValues(dict):
 
 def _set_if_missing(found: _FieldValues, field_name: str, value: Optional[str], source=None) -> None:
     value = _trim_value(value or "")
+    if _is_blank_fill_value(value):
+        return
     if field_name in ("开标时间", "开标日期", "开标地点") and _is_reference_only_value(value):
         return
     if field_name in ("开标时间", "开标日期", "招标公告日期") and DATE_PATTERN.search(re.sub(r"\s+", "", value)) and not _date_from_text(value):
@@ -217,6 +245,7 @@ def _extract_tender_item_names_from_table(table, found: Dict[str, str]) -> None:
                     continue
                 if (
                     normalized in _JUNK_TENDER_ITEM_VALUES
+                    or _is_junk_table_header(value)
                     or normalized.startswith(_JUNK_TENDER_ITEM_PREFIXES)
                 ):
                     continue
@@ -258,6 +287,8 @@ def _extract_from_table(table, found: _FieldValues, source="正文表格") -> No
                     for next_column, next_text in enumerate(cells[index + 1:], index + 2):
                         if not next_text:
                             continue
+                        if _is_junk_table_header(next_text):
+                            continue
                         if _looks_like_any_key(next_text):
                             break
                         _set_if_missing(found, field_name, next_text, f"{source} 第{row_index}行第{next_column}列")
@@ -277,6 +308,8 @@ def _extract_from_table(table, found: _FieldValues, source="正文表格") -> No
                 for next_column, next_text in enumerate(cells[index + 1:], index + 2):
                     if not next_text:
                         continue
+                    if _is_junk_table_header(next_text):
+                        continue
                     if _looks_like_any_key(next_text):
                         break
                     location = f"{source} 第{row_index}行第{next_column}列"
@@ -294,6 +327,7 @@ def _extract_from_table(table, found: _FieldValues, source="正文表格") -> No
 def _extract_from_paragraphs(paragraphs, found: _FieldValues, source="正文") -> None:
     active_context: Optional[str] = None
     in_opening_section = False
+    skip_procurement_context = False
     for index, paragraph in enumerate(paragraphs, 1):
         found.source = f"{source} 第{index}段"
         text = _clean_text(paragraph.text)
@@ -317,6 +351,7 @@ def _extract_from_paragraphs(paragraphs, found: _FieldValues, source="正文") -
         context_field = _field_name_from_context(text)
         if context_field:
             active_context = context_field
+            skip_procurement_context = False
             if active_context == "procurement":
                 _extract_procurement_context_value(text, found)
                 for field_name, _placeholder, aliases in FIELD_DEFINITIONS:
@@ -324,7 +359,10 @@ def _extract_from_paragraphs(paragraphs, found: _FieldValues, source="正文") -
             continue
 
         if active_context == "procurement":
-            _extract_procurement_context_value(text, found)
+            if "业务监督" in normalized:
+                skip_procurement_context = True
+            if not skip_procurement_context:
+                _extract_procurement_context_value(text, found)
 
         for field_name, _placeholder, aliases in FIELD_DEFINITIONS:
             _set_if_missing(found, field_name, _value_from_labeled_text(text, aliases))
@@ -383,8 +421,13 @@ def _split_procurement_contact_and_phone(found: Dict[str, str]) -> None:
         return
 
 
+def _is_signature_date_paragraph(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(re.fullmatch(r"(?:日期[:：])?\d{4}年\d{1,2}月\d{1,2}日", compact))
+
+
 def _extract_announcement_signature_date(document) -> Optional[Tuple[str, str]]:
-    """返回第一章最后一个日期及其段落位置，作为待核对的推断。"""
+    """返回第一章末尾独立的落款日期，作为待核对的推断。"""
     in_first_chapter = False
     latest_in_chapter = None
     result = None
@@ -409,7 +452,7 @@ def _extract_announcement_signature_date(document) -> Optional[Tuple[str, str]]:
 
         if in_first_chapter:
             date = _date_from_text(text)
-            if date:
+            if date and _is_signature_date_paragraph(text):
                 latest_in_chapter = (date, f"正文 第{index}段")
 
     if in_first_chapter and latest_in_chapter:
@@ -458,6 +501,21 @@ def extract_project_info_details(docx_path: str) -> List[dict]:
     for name, placeholder, _aliases in FIELD_DEFINITIONS:
         candidates = list(found.candidates.get(name, []))
         value = found.get(name, "")
+        direct_value_counts = Counter(
+            candidate["value"]
+            for candidate in candidates
+            if candidate["kind"] == "直接识别"
+        )
+        has_consensus = False
+        if len(direct_value_counts) > 1:
+            winner, winner_count = direct_value_counts.most_common(1)[0]
+            if winner_count > 1 and all(
+                winner_count > count
+                for candidate_value, count in direct_value_counts.items()
+                if candidate_value != winner
+            ):
+                value = winner
+                has_consensus = True
         if value and (not candidates or name in ("采购人电话", "采购人联系人") and value != before_split.get(name)):
             if name == "开标日期":
                 sources = found.candidates.get("开标时间", [])
@@ -473,7 +531,9 @@ def extract_project_info_details(docx_path: str) -> List[dict]:
             if source:
                 candidates.append({"value": value, "source": source, "kind": "推断"})
         direct_values = {c["value"] for c in candidates if c["kind"] == "直接识别"}
-        conflict = len(direct_values) > 1 or not direct_values and len({c["value"] for c in candidates}) > 1
+        conflict = (
+            len(direct_values) > 1 and not has_consensus
+        ) or not direct_values and len({c["value"] for c in candidates}) > 1
         details.append({"field": name, "placeholder": placeholder,
                         "value": "" if conflict else value,
                         "status": "冲突" if conflict else "缺失" if not value else "推断" if any(c["kind"] == "推断" for c in candidates) else "直接识别",

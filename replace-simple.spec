@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
-datas = [('icon-256.png', '.')]
+datas = [('icon-256.png', '.'), ('theme_icons', 'theme_icons')]
 datas += collect_data_files('tksheet')
 
 
@@ -10,7 +10,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['openpyxl', 'xlrd', 'docx', 'pptx', 'win32com.client', 'pythoncom', 'pywintypes', 'tksheet'],
+    hiddenimports=['openpyxl', 'xlrd', 'docx', 'pptx', 'win32com.client', 'pythoncom', 'pywintypes', 'PySide6.QtWidgets', 'PySide6.QtCore', 'PySide6.QtGui', 'tksheet'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -508,19 +508,10 @@ def replace_in_workbook(workbook, rules: List[Tuple[str, str]]) -> int:
 
 
 def replace_in_xlsx(file_path: str, rules: List[Tuple[str, str]], output_path: str) -> int:
-    from openpyxl import load_workbook
+    from excel_text_replacer import replace_excel_package
 
-    keep_vba = os.path.splitext(output_path)[1].lower() == ".xlsm"
     with _atomic_editable_copy(file_path, output_path) as temporary_path:
-        workbook = load_workbook(temporary_path, keep_vba=keep_vba, rich_text=True)
-        try:
-            total_count = replace_in_workbook(workbook, rules)
-            if total_count:
-                workbook.save(temporary_path)
-        finally:
-            workbook.close()
-            if workbook.vba_archive is not None:
-                workbook.vba_archive.close()
+        total_count = replace_excel_package(temporary_path, rules)
 
     return total_count
 

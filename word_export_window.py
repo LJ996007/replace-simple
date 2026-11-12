@@ -1168,6 +1168,11 @@ class WordTableExportWindow:
         self.only_selected_var.set(False)
         self.keyword_var.set("")
         if hasattr(self, "scan_tree"):
+            for iid in getattr(self, '_scan_node_ids', set()):
+                if self.scan_tree.exists(iid):
+                    self.scan_tree.delete(iid)
+            self._scan_node_ids = set()
+            self._scan_source_version = None
             self.scan_tree.delete(*self.scan_tree.get_children())
             self._refresh_scan_filter_headings()
             self._schedule_scan_tree_column_separators()
@@ -1238,12 +1243,32 @@ class WordTableExportWindow:
         if current_row is not None:
             focus_key = self._scan_key(*current_row)
 
-        self.scan_tree.delete(*self.scan_tree.get_children())
+        source_version = tuple((kind, id(item)) for kind, item in self.scan_rows)
+        if getattr(self, '_scan_source_version', None) != source_version:
+            for cached_iid in getattr(self, '_scan_node_ids', set()):
+                if self.scan_tree.exists(cached_iid):
+                    self.scan_tree.delete(cached_iid)
+            self.scan_tree.delete(*self.scan_tree.get_children())
+            self._scan_node_ids = set()
+            self._scan_source_version = source_version
+        else:
+            # Retain Tcl rows and their identity; filters only reattach visible rows.
+            for cached_iid in self._scan_node_ids:
+                if self.scan_tree.exists(cached_iid):
+                    self.scan_tree.detach(cached_iid)
         self.scan_item_by_iid = {}
         self._file_group_labels = {}
         group_files = len({_file_identity(item.file_path) for _, item in self.scan_rows}) >= 2
         group_parent = {}
         group_counts = {}
+
+        def attach_row(parent, position, iid, **options):
+            if self.scan_tree.exists(iid):
+                self.scan_tree.move(iid, parent, position)
+                self.scan_tree.item(iid, **options)
+            else:
+                self.scan_tree.insert(parent, position, iid=iid, **options)
+                self._scan_node_ids.add(iid)
 
         def parent_for(item):
             if not group_files:
@@ -1254,7 +1279,7 @@ class WordTableExportWindow:
                 group_parent[identity] = gid
                 group_counts[gid] = 0
                 self._file_group_labels[gid] = item.filename
-                self.scan_tree.insert(
+                attach_row(
                     "",
                     "end",
                     iid=gid,
@@ -1281,7 +1306,7 @@ class WordTableExportWindow:
                 group_counts[parent] += 1
             key = self._scan_key(kind, item)
             self.scan_item_by_iid[iid] = (kind, item)
-            self.scan_tree.insert(
+            attach_row(
                 parent,
                 "end",
                 iid=iid,
@@ -1293,7 +1318,7 @@ class WordTableExportWindow:
             for index, child in children:
                 child_iid = f"{iid}.{index}"
                 self.scan_item_by_iid[child_iid] = ("clause", child)
-                self.scan_tree.insert(
+                attach_row(
                     iid,
                     "end",
                     iid=child_iid,
@@ -1636,36 +1661,28 @@ class WordTableExportWindow:
         return cells
 
     def _show_preview_table(self, caption, cells):
+        from visual_table import VisualTable
+        from openpyxl.utils.cell import get_column_letter
         self.detail_caption.configure(text=caption)
         self._clear_preview_cells()
-        wraps = {}
-        for row, column, _row_span, col_span, text, _header in cells:
-            wraps[(row, column)] = self._preview_wrap(text, col_span)
+        self._preview_cells = tuple(cells)
+        if not hasattr(self, '_preview_grid'):
+            self._preview_grid = VisualTable(self.detail_frame, self.app)
+        info = {'cells': {}, 'merges': [], 'styles': {}, 'widths': {}, 'max_row': 1, 'max_col': 1}
         for row, column, row_span, col_span, text, header in cells:
-            bg = "#E8EEF4" if header else "#FFFFFF"
-            label = tk.Label(
-                self.detail_table,
-                text=text,
-                bg=bg,
-                fg=self.app.text_fg,
-                font=self.app.body_font,
-                justify="left",
-                anchor="nw",
-                wraplength=wraps[(row, column)],
-                padx=6,
-                pady=4,
-            )
-            label.grid(
-                row=row,
-                column=column,
-                rowspan=row_span,
-                columnspan=col_span,
-                sticky="nsew",
-                padx=1,
-                pady=1,
-            )
-            self._bind_preview_wheel(label)
-        self._refresh_preview_scroll()
+            ref = f'{get_column_letter(column+1)}{row+1}'
+            info['cells'][ref] = text
+            info['styles'][ref] = {'bold': header, 'wrap': True}
+            info['max_row'] = max(info['max_row'], row+row_span)
+            info['max_col'] = max(info['max_col'], column+col_span)
+            if row_span > 1 or col_span > 1:
+                info['merges'].append(f'{ref}:{get_column_letter(column+col_span)}{row+row_span}')
+            info['widths'][column+1] = max(info['widths'].get(column+1, 0), self._preview_wrap(text, 1))
+        self.detail_canvas.grid_remove()
+        self.detail_scrollbar.grid_remove()
+        self.detail_x_scrollbar.grid_remove()
+        self._preview_grid.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        self._preview_grid.load(info)
 
     def _preview_wrap(self, text, column_span):
         length = len(text or "")
@@ -1678,6 +1695,11 @@ class WordTableExportWindow:
         return width * max(1, column_span)
 
     def _clear_preview_cells(self):
+        self._preview_cells = None
+        if hasattr(self, '_preview_grid'):
+            self._preview_grid.grid_remove()
+        self.detail_canvas.grid()
+        self.detail_scrollbar.grid()
         for child in self.detail_table.winfo_children():
             child.destroy()
 
@@ -1691,6 +1713,8 @@ class WordTableExportWindow:
 
     def preview_plain_text(self):
         parts = [self.detail_caption.cget("text")]
+        if getattr(self, '_preview_cells', None) is not None:
+            return '\n'.join([*parts, *(str(cell[4]) for cell in self._preview_cells)])
         for child in self.detail_table.winfo_children():
             try:
                 parts.append(child.cget("text"))
@@ -1720,6 +1744,12 @@ class WordTableExportWindow:
             self.detail_x_scrollbar.grid(row=1, column=0, sticky="ew")
 
     def _refresh_preview_scroll(self, event=None):
+        if getattr(self, '_preview_cells', None) is not None:
+            self.detail_x_scrollbar.grid_remove()
+            width = self.detail_frame.winfo_width()
+            if width > 1:
+                self.detail_caption.configure(wraplength=max(width - 8, 160))
+            return
         if not hasattr(self, "detail_canvas"):
             return
         try:

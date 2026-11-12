@@ -22,6 +22,10 @@ def settings_path():
     return os.path.join(_app_data_dir("APPDATA"), SETTINGS_NAME)
 
 
+def settings_directory():
+    return os.path.dirname(settings_path())
+
+
 def load_settings():
     try:
         with open(settings_path(), encoding="utf-8") as file:

@@ -1,5 +1,12 @@
 """文档处理主窗口：批量替换、信息提取与程序入口。"""
 
+import sys
+
+# The default frontend starts before importing the legacy widget library.
+if __name__ == "__main__" and "--legacy" not in sys.argv:
+    from qt_main import main as _qt_main
+    raise SystemExit(_qt_main())
+
 import ctypes
 import os
 import tkinter as tk
@@ -49,6 +56,7 @@ from ui_common import (
     FlatScrollbar,
     cap_existing_scrollbar,
 )
+from template_library import default_template_library_path, ensure_library
 from word_export_window import WordTableExportWindow
 
 
@@ -76,6 +84,7 @@ class ReplaceSimpleApp:
         self.table_export_window = None
         self.active_workspace = "replace"
         self._project_info_details = []
+        self._project_info_review_dialog = None
         if restore_session:
             settings = load_settings()
             self.presets = presets_from_settings(settings)
@@ -85,6 +94,13 @@ class ReplaceSimpleApp:
             self.presets = list(DEFAULT_PRESETS)
             self.symbol_chars = DEFAULT_SYMBOL_CHARS
             self.keep_clause_symbols = False
+            settings = {}
+        template_root = settings.get("template_library_root")
+        self.template_library_root = (
+            os.path.abspath(template_root)
+            if isinstance(template_root, str) and template_root.strip()
+            else default_template_library_path()
+        )
         self.preset_popup = None
 
         self._setup_fonts()
@@ -215,10 +231,10 @@ class ReplaceSimpleApp:
         )
         style.map(
             "Flat.Vertical.TScrollbar",
-            background=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
-            arrowcolor=[("pressed", "#315F86"), ("active", "#416F96")],
-            lightcolor=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
-            darkcolor=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
+            background=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
+            arrowcolor=[("disabled", "#ADB8C4"), ("pressed", "#315F86"), ("active", "#416F96")],
+            lightcolor=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
+            darkcolor=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
         )
         style.configure(
             "Flat.Horizontal.TScrollbar",
@@ -236,10 +252,10 @@ class ReplaceSimpleApp:
         )
         style.map(
             "Flat.Horizontal.TScrollbar",
-            background=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
-            arrowcolor=[("pressed", "#315F86"), ("active", "#416F96")],
-            lightcolor=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
-            darkcolor=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
+            background=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
+            arrowcolor=[("disabled", "#ADB8C4"), ("pressed", "#315F86"), ("active", "#416F96")],
+            lightcolor=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
+            darkcolor=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
         )
         style.configure(
             "Scan.Treeview",
@@ -284,10 +300,10 @@ class ReplaceSimpleApp:
             )
             style.map(
                 scan_style,
-                background=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
-                arrowcolor=[("pressed", "#315F86"), ("active", "#416F96")],
-                lightcolor=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
-                darkcolor=[("pressed", "#83AED3"), ("active", "#A5C4DF")],
+                background=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
+                arrowcolor=[("disabled", "#ADB8C4"), ("pressed", "#315F86"), ("active", "#416F96")],
+                lightcolor=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
+                darkcolor=[("disabled", "#EDF3F8"), ("pressed", "#83AED3"), ("active", "#A5C4DF")],
             )
 
         # 扁平次级按钮（clam 主题下方可定制 background/relief）
@@ -444,6 +460,7 @@ class ReplaceSimpleApp:
 
         file_toolbar = ttk.Frame(file_frame, style="Toolbar.TFrame")
         file_toolbar.grid(row=0, column=1, sticky="e")
+        self._create_busy_button(file_toolbar, text="模板库…", command=self.open_template_library, width=9).pack(side="left", padx=(0, 6))
         self._create_busy_button(file_toolbar, text="添加文件", command=self.select_files, width=10).pack(side="left", padx=(0, 6))
         self._create_busy_button(file_toolbar, text="添加文件夹", command=self.select_folder, width=11).pack(side="left", padx=(0, 6))
         self._create_busy_button(file_toolbar, text="移除选中", command=self.remove_selected_files, width=10).pack(side="left", padx=(0, 6))
@@ -573,7 +590,7 @@ class ReplaceSimpleApp:
         # 规则表只有两列且始终自适应填满，不需要水平滚动；隐藏 tksheet 默认
         # 常显的横向滚动条，避免它占位、显得多余。
         self.rules_sheet.hide("x_scrollbar")
-        # tksheet 自己创建滚动条，创建后再套用与应用其余位置相同的限长样式。
+        # tksheet 自己创建滚动条，创建后再套用与应用其余位置相同的样式。
         cap_existing_scrollbar(
             self.rules_sheet.yscroll,
             self.rules_sheet.MT._yscrollbar,
@@ -929,6 +946,7 @@ class ReplaceSimpleApp:
             "presets": self.presets,
             "symbol_chars": self.symbol_chars,
             "keep_clause_symbols": bool(self.keep_clause_symbols),
+            "template_library_root": self.template_library_root,
         }
         save_settings(data)
 
@@ -1127,6 +1145,32 @@ class ReplaceSimpleApp:
             for candidate in item["candidates"]:
                 lines.append(f"  {candidate['source']}：{candidate['value']}")
         self._show_result_window("\n".join(lines), title="项目信息来源")
+
+    def _show_project_info_review(self, details, source_path):
+        from project_info_review_dialog import ProjectInfoReviewDialog
+
+        if self._project_info_review_dialog and self._project_info_review_dialog.winfo_exists():
+            self._project_info_review_dialog.destroy()
+        self._project_info_review_dialog = ProjectInfoReviewDialog(
+            self.root,
+            details,
+            source_path,
+            on_apply=self._apply_project_info_review,
+        )
+
+    def _apply_project_info_review(self, action, rules):
+        self.rules_sheet.set_sheet_data([[old, new] for old, new in rules])
+        self._ensure_blank_rule_rows()
+        self._refresh_rules_sheet_view()
+        self._refresh_status()
+        if action != "replace":
+            self.status_var.set("项目信息已回填替换规则")
+            return True
+        if not self.replace_files:
+            messagebox.showwarning("确认并替换", "请先从模板库使用模板，或手动添加待处理文件。")
+            return False
+        self.root.after(50, self.start_replace)
+        return True
 
     def add_rule_row(self):
         selected_rows = self.rules_sheet.get_selected_rows(get_cells_as_rows=True)
@@ -1549,8 +1593,7 @@ class ReplaceSimpleApp:
             self._remember_word_files([file_path])
             self._remove_import_source_from_replace_files(file_path, "招标文件")
             self.status_var.set(f"已识别 {recognized}/{len(details)} 项：{os.path.basename(file_path)}；空白项不执行，可在“更多”核对来源")
-            if not recognized or any(item["status"] == "冲突" for item in details):
-                self.show_project_info_details()
+            self._show_project_info_review(details, file_path)
 
         def on_error(exc):
             self._reset_busy_state()
@@ -1560,6 +1603,49 @@ class ReplaceSimpleApp:
         self._task_runner.submit(work, on_success, on_error)
 
     # ---------- 文件 / 输出目录 ----------
+    def open_template_library(self):
+        from template_library_dialog import TemplateLibraryDialog
+
+        try:
+            ensure_library(self.template_library_root)
+        except OSError as exc:
+            messagebox.showerror("模板库", f"创建或打开模板库失败：{exc}")
+            return
+        TemplateLibraryDialog(
+            self.root,
+            self.template_library_root,
+            on_root_changed=self._change_template_library_root,
+            on_use=self.use_library_templates,
+        )
+
+    def _change_template_library_root(self, root_path):
+        self.template_library_root = root_path
+        save_settings({"template_library_root": root_path})
+
+    def _path_is_inside_template_library(self, path):
+        try:
+            candidate = os.path.realpath(os.path.abspath(path))
+            root = os.path.realpath(self.template_library_root)
+            return os.path.commonpath((root, candidate)) == root
+        except ValueError:
+            return False
+
+    def use_library_templates(self, file_paths):
+        if not file_paths:
+            return
+        if not self.output_dir or self._path_is_inside_template_library(self.output_dir):
+            output_dir = filedialog.askdirectory(
+                title="选择模板替换结果目录（不能位于模板库内）"
+            )
+            if not output_dir:
+                return
+            if self._path_is_inside_template_library(output_dir):
+                messagebox.showwarning("使用模板", "输出目录不能位于模板库内，已取消使用模板。")
+                return
+            self._apply_output_dir(output_dir)
+            self.status_var.set("已选择模板替换结果目录")
+        self._append_replace_files(file_paths)
+
     def _is_supported_file(self, file_path):
         return (
             not os.path.basename(file_path).startswith("~$")
@@ -1930,7 +2016,7 @@ class ReplaceSimpleApp:
             self.root.after_idle(self._refresh_rules_sheet_view)
 
 
-def main():
+def legacy_main():
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
@@ -1943,6 +2029,14 @@ def main():
     install_exception_handlers(root)
     ReplaceSimpleApp(root)
     root.mainloop()
+
+
+def main():
+    import sys
+    if "--legacy" in sys.argv:
+        return legacy_main()
+    from qt_main import main as qt_main
+    return qt_main()
 
 
 if __name__ == "__main__":

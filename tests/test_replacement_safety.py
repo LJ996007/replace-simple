@@ -30,12 +30,14 @@ class ReplacementSafetyTests(unittest.TestCase):
             presentation.slides.add_slide(presentation.slide_layouts[1]).shapes.title.text = "OLD"
             cases = (
                 (".docx", doc, replace_in_docx, "docx.document.Document.save"),
-                (".xlsx", workbook, replace_in_xlsx, "openpyxl.workbook.workbook.Workbook.save"),
-                (".xlsm", workbook, replace_in_xlsx, "openpyxl.workbook.workbook.Workbook.save"),
+                (".xlsx", workbook, replace_in_xlsx, "excel_text_replacer.replace_excel_package"),
+                (".xlsm", workbook, replace_in_xlsx, "excel_text_replacer.replace_excel_package"),
                 (".pptx", presentation, replace_in_pptx, "pptx.presentation.Presentation.save"),
             )
 
             def failed_save(_document, path):
+                if isinstance(_document, str):
+                    path = _document
                 Path(path).write_bytes(b"partial archive")
                 raise OSError("save interrupted")
 

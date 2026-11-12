@@ -69,6 +69,7 @@ def inspect_visual_workbook(path, package=None, base_info=None):
             continue
         info = result[name]
         root = _xml(package.zip.read(part))
+        info['protected'] = root.find(_tag('sheetProtection')) is not None
         fmt = root.find(_tag('sheetFormatPr'))
         default_width = float(fmt.get('defaultColWidth', 12)) if fmt is not None else 12
         default_height = float(fmt.get('defaultRowHeight', 15)) if fmt is not None else 15
@@ -144,10 +145,10 @@ def drop_values(source, bounds, target, row, column):
     return result
 
 
-def plan_visual_fill(path, pending, layouts=None):
+def plan_visual_fill(path, pending, layouts=None, *, package=None, info=None):
     """pending 为 {工作表名: {单元格: 值}}，可供界面及 Agent 共用。"""
-    package = _Package(path)
-    info = inspect_workbook(path,package)
+    package = package if package is not None else _Package(path)
+    info = info if info is not None else inspect_workbook(path,package)
     changes, errors = {}, []
     for name, values in pending.items():
         if not values:
@@ -205,7 +206,7 @@ def apply_visual_plan(path, output_path, plan, progress=None):
     if plan["errors"] or not (plan["count"] or plan.get('layout_count')):
         raise ValueError("请先处理预览中的问题，或拖入需要填写的内容。")
     # 再验证一次，防止调用方绕开保护/公式检查。
-    checked = plan_visual_fill(path,{name:{c["cell"]:c["new"] for c in values} for name,values in plan["sheets"].items()}, plan.get('layouts'))
+    checked = plan_visual_fill(path,{name:{c["cell"]:c["new"] for c in values} for name,values in plan["sheets"].items()}, plan.get('layouts'), package=None if plan.get('layouts') else package)
     if checked["errors"]:
         raise ValueError("；".join(checked["errors"]))
     changed = {}

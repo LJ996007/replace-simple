@@ -86,7 +86,7 @@ def plan_fill(path, rules, config, overrides=None):
     """不模糊猜测行。重复名称/缺失名称必须手动指定；0 表示明确跳过。"""
     package = _Package(path)
     sheet = config["sheet"]
-    info = inspect_workbook(path).get(sheet)
+    info = inspect_workbook(path, package).get(sheet)
     if info is None:
         raise ValueError("目标工作表不存在，请重新选择。")
     start, end, header = (int(config[k]) for k in ("start", "end", "header"))

@@ -34,6 +34,8 @@ class VisualFillDialog:
         self.sheets = sheets if sheets is not None else inspect_visual_workbook(template)
         self.digest = hashlib.sha256(Path(template).read_bytes()).hexdigest()
         self.original_digest = self.digest
+        stat = Path(template).stat()
+        self._original_stamp = (stat.st_size, stat.st_mtime_ns)
         self.original_sheets = self.sheets
         self.working_template = template
         self._scratch = tempfile.TemporaryDirectory(prefix='replace-preview-')
@@ -263,9 +265,33 @@ class VisualFillDialog:
         if event.widget is self.window and not self._saving:
             self._scratch.cleanup()
 
-    def verify_original(self):
+    def verify_original(self, fast=False):
+        if fast and hasattr(self, '_original_stamp'):
+            stat = Path(self.template).stat()
+            if (stat.st_size, stat.st_mtime_ns) == self._original_stamp:
+                return
         if hashlib.sha256(Path(self.template).read_bytes()).hexdigest()!=self.original_digest:
             raise ValueError('原模板文件已变化，请重新打开填表窗口。')
+
+    def preview_plan(self, pending):
+        """Plain text edits validate against the loaded snapshot; saving revalidates bytes."""
+        if self.layouts:
+            return plan_visual_fill(self.working_template, pending, self.layouts)
+        from workbook_session import WorkbookSession
+        session = WorkbookSession(self.working_template, self.sheets, self.digest)
+        changes, errors = {}, []
+        for name, values in pending.items():
+            try:
+                session.edit(name, values)
+                edits = [{'cell': ref, 'old': self.sheets[name]['cells'].get(ref, ''), 'new': value}
+                         for ref, value in session.pending.get(name, {}).items()
+                         if str(self.sheets[name]['cells'].get(ref, '')) != str(value)]
+                if edits:
+                    changes[name] = edits
+            except ValueError as exc:
+                errors.append(str(exc))
+        return {'digest': self.digest, 'sheets': changes, 'errors': errors,
+                'count': sum(map(len, changes.values())), 'layouts': {}, 'layout_count': 0}
 
     def preview_path(self):
         self._serial += 1
@@ -273,8 +299,8 @@ class VisualFillDialog:
 
     def commit(self,pending,operation):
         if self._saving:raise ValueError('正在保存，请稍候。')
-        self.verify_original()
-        plan = plan_visual_fill(self.working_template,pending,self.layouts)
+        self.verify_original(fast=True)
+        plan = self.preview_plan(pending)
         if plan['digest']!=self.digest:
             raise ValueError('模板文件已变化，请重新打开填表窗口。')
         if plan['errors']:
@@ -392,7 +418,7 @@ class VisualFillDialog:
             messagebox.showwarning('无法调整',str(exc),parent=self.window)
 
     def refresh(self,plan=None):
-        self.plan = plan or plan_visual_fill(self.working_template,self.pending,self.layouts)
+        self.plan = plan or self.preview_plan(self.pending)
         selection = self.right.selection
         self.target_changed()
         if selection and selection[2]<=self.right.info['max_col'] and selection[3]<=self.right.info['max_row']:
@@ -449,10 +475,30 @@ class VisualFillDialog:
             unit='列' if action in {'insert_left','insert_right'} else '行'
             count = simpledialog.askinteger(f'插入{unit}',f'插入{unit}数',initialvalue=1,minvalue=1,maxvalue=1000,parent=self.window)
             if count is None:return
-        try:
-            self.stage_structure(action,self.sheet.get(),bounds,count)
-        except (ValueError,OSError) as exc:
-            self.status.set(str(exc));messagebox.showwarning('无法编辑',str(exc),parent=self.window)
+        if self.owner._task_runner.active or self.owner.app._task_runner.active:
+            return
+        sheet = self.sheet.get()
+        self._saving = True
+        self.generate.configure(state='disabled')
+        self.owner._begin_indeterminate_task('正在后台调整工作簿结构…')
+        self.status.set('正在后台调整工作簿结构…')
+        def done(result):
+            self._saving = False
+            self.owner._reset_busy_state()
+            if self.window.winfo_exists():
+                self._accept_structure(result)
+            else:
+                self._scratch.cleanup()
+        def failed(exc):
+            self._saving = False
+            self.owner._reset_busy_state()
+            if self.window.winfo_exists():
+                self.refresh()
+                self.status.set(str(exc))
+                messagebox.showwarning('无法编辑',str(exc),parent=self.window)
+            else:
+                self._scratch.cleanup()
+        self.owner._task_runner.submit(lambda publish: self._prepare_structure(action,sheet,bounds,count),done,failed)
 
     def toggle_table_popout(self):
         """把右侧表格整体弹出为独立窗口编辑；还原时嵌回原位，内容与操作不变。"""
@@ -555,9 +601,12 @@ class VisualFillDialog:
         return skipped
 
     def stage_structure(self,action,sheet,bounds,count=1):
-        """可供 GUI/测试/Agent 共用的事务入口；所有成功操作才进入撤销栈。"""
-        from workbook_structure import edit_structure
+        """Synchronous transaction API for scripts/tests; GUI dispatches preparation to a worker."""
         if self._saving:raise ValueError('正在保存，请稍候。')
+        self._accept_structure(self._prepare_structure(action,sheet,bounds,count))
+
+    def _prepare_structure(self,action,sheet,bounds,count=1):
+        from workbook_structure import edit_structure
         self.verify_original()
         plan = plan_visual_fill(self.working_template,self.pending,self.layouts)
         if plan['errors']:raise ValueError('；'.join(plan['errors']))
@@ -582,15 +631,22 @@ class VisualFillDialog:
         elif action=='merge':
             marked[sheet] = {ref for ref in marked[sheet] if not (left<=range_boundaries(ref)[0]<=right and top<=range_boundaries(ref)[1]<=bottom)}
             marked[sheet].add(f'{get_column_letter(left)}{top}')
+        return {'output': output, 'sheets': sheets, 'marked': marked, 'plan': plan,
+                'digest': hashlib.sha256(Path(output).read_bytes()).hexdigest(),
+                'operation': {'kind':'structure','action':action,'sheet':sheet,'bounds':list(bounds),'count':count}}
+
+    def _accept_structure(self, result):
+        plan = result['plan']
+        sheet = result['operation']['sheet']
         self.checkpoint()
-        self.working_template,self.sheets = output,sheets
-        self.digest = hashlib.sha256(Path(output).read_bytes()).hexdigest()
+        self.working_template,self.sheets = result['output'],result['sheets']
+        self.digest = result['digest']
         self.applied['count'] += plan['count'];self.applied['layout_count'] += plan['layout_count']
         self.applied['structure_count'] += 1
         self.applied['sheets'] = list(dict.fromkeys([*self.applied['sheets'],*plan['sheets'],*plan['layouts'],sheet]))
         self.pending,self.layouts = {},{}
-        self.marked = marked
-        self.operations.append({'kind':'structure','action':action,'sheet':sheet,'bounds':list(bounds),'count':count})
+        self.marked = result['marked']
+        self.operations.append(result['operation'])
         self.refresh()
 
     def auto_match(self):

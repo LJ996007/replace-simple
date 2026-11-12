@@ -29,6 +29,7 @@ PYINSTALLER_ARGS = [
     "--noupx",           # DLL 压缩会拖慢加载并增加杀软误报概率，分发版明确关闭
     "--icon=icon.ico",           # exe 文件图标
     f"--version-file={VERSION_INFO_FILE}",  # Windows 文件属性中的版本信息
+    "--add-data=theme_icons;theme_icons",
     "--add-data=icon-256.png;.",   # 运行时窗口图标用大尺寸 PNG（Windows 用 ; 分隔）
     "--hidden-import=openpyxl",
     "--hidden-import=xlrd",
@@ -37,6 +38,9 @@ PYINSTALLER_ARGS = [
     "--hidden-import=win32com.client",
     "--hidden-import=pythoncom",
     "--hidden-import=pywintypes",
+    "--hidden-import=PySide6.QtWidgets",
+    "--hidden-import=PySide6.QtCore",
+    "--hidden-import=PySide6.QtGui",
     "--hidden-import=tksheet",
     "--collect-data=tksheet",   # tksheet 带有内置主题/图标等数据文件，打包时需一并收集
 ]
