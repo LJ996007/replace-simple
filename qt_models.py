@@ -154,6 +154,7 @@ class SheetModel(QAbstractTableModel):
             raise ValueError('Unknown sheet role')
         self.info = info or {'cells': {}, 'merges': [], 'max_row': 1, 'max_col': 1}
         self.session, self.sheet, self.on_error = session, sheet, on_error
+        self.zoom = 1.0
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else self.info['max_row']
@@ -178,8 +179,9 @@ class SheetModel(QAbstractTableModel):
             return QColor(PENDING) if ref in pending else QColor(style['bg']) if style.get('bg') else None
         if role == Qt.ForegroundRole and style.get('fg'):
             return QColor(style['fg'])
-        if role == Qt.FontRole and style:
-            font = QFont(style.get('family', 'Microsoft YaHei UI'), int(style.get('size', 11)))
+        if role == Qt.FontRole and (style or self.zoom != 1):
+            font = QFont(style.get('family', 'Microsoft YaHei UI'))
+            font.setPointSizeF(float(style.get('size', 11 if style else 10)) * self.zoom)
             font.setBold(style.get('bold', False))
             font.setItalic(style.get('italic', False))
             return font

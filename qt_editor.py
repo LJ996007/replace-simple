@@ -7,7 +7,7 @@ from PySide6.QtGui import QKeySequence, QShortcut, QDrag
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QTableView, QFileDialog, QMessageBox, QInputDialog, QAbstractItemView,
-    QDialogButtonBox, QFormLayout, QLineEdit, QMenu, QSpinBox, QToolBar, QToolButton,
+    QDialogButtonBox, QFormLayout, QLineEdit, QMenu, QSpinBox, QToolBar, QToolButton, QGroupBox,
 )
 from openpyxl.utils.cell import range_boundaries
 from qt_models import SheetModel, RowsModel
@@ -21,19 +21,26 @@ def configure_sheet(view, model):
     view.setModel(model)
     view.clearSpans()
     view.setWordWrap(False)
-    view.horizontalHeader().setDefaultSectionSize(150)
-    view.verticalHeader().setDefaultSectionSize(32)
     # Only explicit sizes are applied: never allocate one widget per cell.
     for ref in model.info.get('merges', []):
         l, t, r, b = range_boundaries(ref)
         if b > t or r > l:
             view.setSpan(t-1, l-1, b-t+1, r-l+1)
+    size_sheet(view, model, getattr(view, 'zoom_percent', 100) / 100)
+
+
+def size_sheet(view, model, scale):
+    model.zoom = scale
+    view.horizontalHeader().setMinimumSectionSize(max(15, int(30 * scale)))
+    view.verticalHeader().setMinimumSectionSize(max(10, int(24 * scale)))
+    view.horizontalHeader().setDefaultSectionSize(int(150 * scale))
+    view.verticalHeader().setDefaultSectionSize(max(10, int(32 * scale)))
     for col, width in model.info.get('column_pixels', {}).items():
         if col <= model.columnCount():
-            view.setColumnWidth(col-1, max(30, min(1790, int(width))))
+            view.setColumnWidth(col-1, int(max(30, min(1790, width)) * scale))
     for row, height in model.info.get('heights', {}).items():
         if row <= model.rowCount():
-            view.setRowHeight(row-1, max(24, min(546, int(height))))
+            view.setRowHeight(row-1, max(10, int(max(24, min(546, height)) * scale)))
 
 
 def selected_bounds(view):
@@ -106,6 +113,7 @@ class SheetPreview(QDialog):
 
 class TransferTable(QTableView):
     regionDropped = Signal(object, int, int)
+    zoomChanged = Signal(int)
     mime_type = 'application/x-replace-simple-region'
 
     def __init__(self, parent=None):
@@ -113,7 +121,27 @@ class TransferTable(QTableView):
         self.allowed_source = None
         self.drop_handler = None
         self._active_drag = None
+        self.zoom_percent = 100
         self.setDefaultDropAction(Qt.CopyAction)
+
+    def set_zoom(self, percent):
+        percent = max(25, min(250, int(percent)))
+        if percent == self.zoom_percent:
+            return
+        self.zoom_percent = percent
+        if self.model() is not None:
+            model = self.model()
+            size_sheet(self, model, percent / 100)
+            if model.rowCount() and model.columnCount():
+                model.dataChanged.emit(model.index(0, 0), model.index(model.rowCount()-1, model.columnCount()-1), [Qt.FontRole])
+        self.zoomChanged.emit(percent)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier and event.angleDelta().y():
+            self.set_zoom(self.zoom_percent + (25 if event.angleDelta().y() > 0 else -25))
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def startDrag(self, actions):
         import json
@@ -192,7 +220,9 @@ class VisualEditor(QDialog):
         self.scratch = tempfile.TemporaryDirectory(prefix='replace-qt-')
         self.serial = 0
         self.last_recipe = None
-        self.setWindowTitle('可视化编辑 · 另存为保护模板')
+        self.setWindowTitle('可视化编辑')
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self._was_maximized = False
         self.resize(1260, 800)
         self.setMinimumSize(860, 560)
         self.tasks = TaskController(self)
@@ -227,13 +257,17 @@ class VisualEditor(QDialog):
         source = QWidget()
         left = QVBoxLayout(source)
         left.setContentsMargins(0, 0, 0, 0)
-        left.addWidget(QLabel('来源表格'))
+        source_heading = QHBoxLayout()
+        source_heading.addWidget(QLabel('来源表格'), 1)
+        left.addLayout(source_heading)
         self.source_choice = BoundedComboBox()
         self.source_choice.setAccessibleName('来源表格')
         self.source_choice.addItems([f'{x.filename} · 表{x.table_index} · {x.section}' for x in items])
         self.source_choice.currentIndexChanged.connect(self.source_changed)
         left.addWidget(self.source_choice)
         self.source_view = TransferTable()
+        self.source_zoom = self.zoom_control(self.source_view, '来源表格缩放')
+        source_heading.addWidget(self.source_zoom)
         self.source_view.setToolTip('框选来源内容后填入目标位置，也可拖动选区到目标表格。')
         self.source_view.setDragEnabled(True)
         self.source_view.setDragDropMode(QAbstractItemView.DragOnly)
@@ -247,13 +281,17 @@ class VisualEditor(QDialog):
         target = QWidget()
         right = QVBoxLayout(target)
         right.setContentsMargins(0, 0, 0, 0)
-        right.addWidget(QLabel('目标工作表'))
+        target_heading = QHBoxLayout()
+        target_heading.addWidget(QLabel('目标工作表'), 1)
+        right.addLayout(target_heading)
         self.sheet = BoundedComboBox()
         self.sheet.setAccessibleName('目标工作表')
         self.sheet.addItems(session.sheets)
         self.sheet.currentTextChanged.connect(self.target_changed)
         right.addWidget(self.sheet)
         self.target = TransferTable()
+        self.target_zoom = self.zoom_control(self.target, '目标工作表缩放')
+        target_heading.addWidget(self.target_zoom)
         self.target.setAcceptDrops(True)
         self.target.setDragDropMode(QAbstractItemView.DropOnly)
         self.target.allowed_source = self.source_view
@@ -272,17 +310,41 @@ class VisualEditor(QDialog):
         configure_splitter(split)
         body.addWidget(split, 1)
         layout.addWidget(self.body, 1)
-        self.status = QLabel('双击或按 F2 编辑。浅蓝色表示待写入；原文单元格颜色保留。公式格受保护。')
+        self.status = QLabel()
+        self.target.setAccessibleName('目标工作表内容')
+        self.source_view.setAccessibleName('来源表格内容')
+        self.target.setToolTip('双击或按 F2 编辑；浅蓝色表示待写入。公式格受保护。')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.source_changed()
         self.target_changed()
         self.shortcuts = []
         for key, callback in [(QKeySequence.Undo, self.undo), (QKeySequence.Redo, self.redo),
-                              (QKeySequence.SaveAs, self.save)]:
+                              (QKeySequence.SaveAs, self.save), (QKeySequence('F11'), self.toggle_fullscreen)]:
             shortcut = QShortcut(key, self)
             shortcut.activated.connect(callback)
             self.shortcuts.append(shortcut)
+
+    @staticmethod
+    def zoom_control(view, name):
+        zoom = QSpinBox()
+        zoom.setRange(25, 250)
+        zoom.setSingleStep(25)
+        zoom.setSuffix('%')
+        zoom.setValue(100)
+        zoom.setAccessibleName(name)
+        zoom.setToolTip('仅缩放预览；也可按住 Ctrl 滚动鼠标滚轮。')
+        zoom.setFixedWidth(100)
+        zoom.valueChanged.connect(view.set_zoom)
+        view.zoomChanged.connect(zoom.setValue)
+        return zoom
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showMaximized() if self._was_maximized else self.showNormal()
+        else:
+            self._was_maximized = self.isMaximized()
+            self.showFullScreen()
 
     def eventFilter(self, watched, event):
         if hasattr(self, '_header_gesture'):
@@ -297,6 +359,7 @@ class VisualEditor(QDialog):
     def header_resized(self, axis, index, pixels):
         if self._header_gesture is None:
             return
+        pixels /= self.target.zoom_percent / 100
         values = self._header_gesture[1 if axis == 'heights' else 2]
         values[index+1] = (round(max(1, min(409, pixels * 3/4)), 2) if axis == 'heights'
                            else round(max(1, min(255, (pixels-5)/7)), 3))
@@ -537,6 +600,8 @@ class VisualEditor(QDialog):
             validate_scan_files(list(dict.fromkeys(x.file_path for x in self.items)), self.stamps)
 
     def save(self):
+        if self.tasks.busy:
+            return
         output, _ = QFileDialog.getSaveFileName(self, '另存为新文件', str(Path(self.session.original).with_stem(Path(self.session.original).stem+'_已填')),
                                                 'Excel 工作簿 (*.xlsx *.xlsm)')
         if not output:
@@ -568,6 +633,9 @@ class VisualEditor(QDialog):
         event.accept()
 
     def reject(self):
+        if self.isFullScreen():
+            self.toggle_fullscreen()
+            return
         self.close()
 
 
@@ -581,7 +649,11 @@ class MappingDialog(QDialog):
         layout = QVBoxLayout(self)
         self.body = QWidget()
         body = QVBoxLayout(self.body)
-        form = QFormLayout()
+        forms = QHBoxLayout()
+        source_group, target_group = QGroupBox('来源表格'), QGroupBox('目标工作表')
+        source_form, target_form = QFormLayout(source_group), QFormLayout(target_group)
+        forms.addWidget(source_group, 1)
+        forms.addWidget(target_group, 1)
         self.inputs = {}
         guess = session.sheets[sheet]['guess']
         for key, label, value in [('source_header', '来源表头行', 1), ('source_factor', '来源因素列（数字）', 1),
@@ -590,18 +662,27 @@ class MappingDialog(QDialog):
                                   ('end', '目标结束行', guess['end']), ('factor', '目标因素列', guess['factor']),
                                   ('description', '目标说明列', guess['description']), ('points', '目标分值列', guess['points'])]:
             field = QLineEdit(str(value))
+            field.setAccessibleName(label)
+            field.setToolTip(label)
             self.inputs[key] = field
             field.textChanged.connect(self.invalidate)
-            form.addRow(label, field)
+            form = source_form if key.startswith('source_') else target_form
+            form.addRow(label.replace('来源', '').replace('目标', ''), field)
+        body.addLayout(forms)
+        mode_row = QFormLayout()
         self.mode = QComboBox()
         self.mode.addItems(['按因素名称匹配', '按顺序填入'])
         self.mode.currentIndexChanged.connect(self.invalidate)
-        form.addRow('填入方式', self.mode)
-        body.addLayout(form)
+        mode_row.addRow('填入方式', self.mode)
+        body.addLayout(mode_row)
         self.preview = QTableView()
         self.model = RowsModel(['因素', '目标行（0 跳过）', '状态'], editable=True)
         self.model.editable_columns = {1}
         self.preview.setModel(self.model)
+        self.preview.setAccessibleName('映射核验结果')
+        self.preview.setColumnWidth(0, 180)
+        self.preview.setColumnWidth(1, 170)
+        self.preview.horizontalHeader().setStretchLastSection(True)
         self.model.dataChanged.connect(self.invalidate)
         body.addWidget(self.preview, 1)
         buttons = QHBoxLayout()
@@ -614,7 +695,8 @@ class MappingDialog(QDialog):
         buttons.addWidget(self.apply_button)
         body.addLayout(buttons)
         layout.addWidget(self.body)
-        self.message = QLabel('仅修改目标行列；目标行可手动指定。保存仍通过编辑器另存为。')
+        self.message = QLabel()
+        self.preview.setToolTip('目标行可手动指定，0 表示跳过；修改后请重新核验。')
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         self.tasks = TaskController(self)

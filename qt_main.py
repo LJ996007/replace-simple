@@ -14,6 +14,7 @@ from app_settings import load_settings, save_settings
 from replacement_rules import normalize_rule_rows, validate_rules, DELETE_MARKER
 from qt_models import RowsModel, ScanModel, SheetModel, ScanFilter, TemplateModel
 from qt_tasks import TaskController
+from qt_rule_table import RuleModel, RuleTable
 from qt_editor import VisualEditor, configure_sheet
 from qt_layout import BoundedComboBox, configure_splitter, LayoutSplitter as QSplitter
 from template_library import default_template_library_path
@@ -40,8 +41,8 @@ def toolbar(layout, actions):
     return row
 
 
-def table(model):
-    view = QTableView()
+def table(model, view=None):
+    view = view if view is not None else QTableView()
     view.setModel(model)
     view.setAlternatingRowColors(True)
     view.setWordWrap(False)
@@ -66,7 +67,8 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.batch_context = None
         self.library_root = self.settings.get('template_library_root') or default_template_library_path()
         self.stamps, self.scan_symbols, self.project_details = {}, '', []
-        self.setWindowTitle('replace-simple')
+        from app_info import format_version_title
+        self.setWindowTitle(format_version_title())
         self.resize(1260, 860)
         self.setMinimumSize(920, 640)
         self.setWindowIcon(QIcon(str(Path(__file__).with_name('icon-256.png'))))
@@ -84,7 +86,8 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.build_scan()
         self.build_library()
         self.output = QLineEdit(self.settings.get('qt_output_dir', ''))
-        self.output.setPlaceholderText('请选择输出目录，批量替换将生成到此处')
+        self.output.setPlaceholderText('选择输出目录')
+        self.output.setAccessibleName('输出目录')
         row = QHBoxLayout()
         row.addWidget(QLabel('输出目录'))
         row.addWidget(self.output, 1)
@@ -94,10 +97,10 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setVisible(False)
         layout.addWidget(self.progress)
-        self.status = QLabel('就绪 · 添加文件和替换规则，或切换到扫描提取。')
+        self.status = QLabel('就绪')
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(3000)
@@ -110,8 +113,8 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.log_toggle = QPushButton('处理详情')
         self.log_toggle.setCheckable(True)
         self.log_toggle.toggled.connect(self.log.setVisible)
+        actions.addWidget(self.status, 1)
         actions.addWidget(self.log_toggle)
-        actions.addStretch()
         self.setCentralWidget(central)
 
     def build_replace(self):
@@ -135,22 +138,20 @@ class MainWindow(WorkbenchActions, QMainWindow):
         toolbar(rl, [('新增规则', lambda: self.rules.append(['', ''])), ('删除选中规则', self.remove_rules),
                      ('标记删除原文', self.mark_delete), ('导入 Excel', self.import_rules),
                      ('导出规则', self.export_rules), ('提取项目信息…', self.extract_project)])
-        self.rules = RowsModel(['原文本 / 模板占位符', '替换为（空白跳过）'], self.settings.get('qt_rules', [['', ''] for _ in range(8)]), editable=True)
-        self.rule_view = table(self.rules)
+        self.rules = RuleModel(['原文本 / 模板占位符', '替换为（空白跳过）'], self.settings.get('qt_rules', [['', ''] for _ in range(8)]))
+        self.rule_view = table(self.rules, RuleTable())
+        self.rule_view.error.connect(self.error)
+        self.rule_view.setAccessibleName('替换规则')
+        self.rule_view.setToolTip(f'支持复制、粘贴、Delete 清空和 Ctrl+Z 撤销。空白值跳过；删除原文使用“{DELETE_MARKER}”。')
         self.rule_view.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.rule_view.setColumnWidth(0, 440)
         rl.addWidget(self.rule_view)
         split.addWidget(rules)
         configure_splitter(split, minimum=100, sizes=[230, 320])
         layout.addWidget(split, 1)
-        row = QHBoxLayout()
-        note = QLabel(f'空白替换值跳过；明确删除请使用“{DELETE_MARKER}”。')
-        note.setObjectName('hint')
-        row.addWidget(note, 1)
-        row.addWidget(button('开始批量替换', self.replace, True))
-        layout.addLayout(row)
-        toolbar(layout, [('预览输出路径…', self.preview_outputs), ('常用占位符…', self.manage_presets),
+        row = toolbar(layout, [('预览输出路径…', self.preview_outputs), ('常用占位符…', self.manage_presets),
                          ('仅重试失败', self.retry_failed), ('导出处理报告…', self.export_report)])
+        row.addWidget(button('开始批量替换', self.replace, True))
         self.tabs.addTab(page, '批量替换')
 
     def build_scan(self):
@@ -175,6 +176,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.search = QLineEdit()
         self.search.setClearButtonEnabled(True)
         self.search.setPlaceholderText('筛选文件、章节或内容…')
+        self.search.setAccessibleName('筛选扫描结果')
         filters.addWidget(self.search, 1)
         self.keep_symbols = QCheckBox('导出保留符号')
         self.keep_symbols.setChecked(bool(self.settings.get('keep_clause_symbols', False)))
@@ -212,6 +214,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.preview_text.setPlaceholderText('选择扫描结果后显示完整文本。')
         self.preview_stack.addTab(self.scan_preview, '表格预览')
         self.preview_stack.addTab(self.preview_text, '完整文本')
+        self.scans.modelReset.connect(self.clear_scan_preview)
         split.addWidget(self.preview_stack)
         configure_splitter(split)
         results_layout.addWidget(split, 1)
@@ -263,9 +266,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.templates.dataChanged.connect(self.update_template_selection)
         self.templates.modelReset.connect(self.update_template_selection)
         self.update_template_selection()
-        hint = QLabel('模板添加时复制入库；批量替换输出目录必须位于库外。')
-        hint.setObjectName('hint')
-        layout.addWidget(hint)
+        self.library_path.setToolTip('添加模板时复制入库；批量替换输出目录必须位于库外。')
         self.library_items = []
         self.visible_templates = []
         self.tabs.addTab(page, '模板库')
@@ -274,6 +275,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
     def error(self, text):
         self.status.setText(str(text))
         self.log.appendPlainText(str(text))
+        self.log_toggle.setChecked(True)
         QMessageBox.warning(self, '操作未完成', str(text))
 
     def busy_changed(self, busy):
@@ -281,10 +283,12 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.output.setEnabled(not busy)
         self.choose_output_button.setEnabled(not busy)
         self.progress.setRange(0, 0 if busy else 100)
+        self.progress.setVisible(busy)
         if busy:
             self.status.setText('正在后台处理…')
         else:
             self.progress.setValue(100)
+            self.status.setText('就绪')
 
     def progress_changed(self, args):
         if len(args) >= 2:
@@ -335,11 +339,14 @@ class MainWindow(WorkbenchActions, QMainWindow):
             self.rules.setData(self.rules.index(row, 1), DELETE_MARKER)
 
     def import_rules(self):
-        path, _ = QFileDialog.getOpenFileName(self, '导入规则', '', 'Excel (*.xlsx *.xls)')
+        path, _ = QFileDialog.getOpenFileName(self, '导入规则', '', 'Excel (*.xlsx *.xlsm *.xls)')
         if path:
             from string_replacer import load_replacement_rules
-            self.tasks.submit(lambda p: load_replacement_rules(path), self.rules.replace)
-            self.files.remove([i for i, row in enumerate(self.files.rows) if os.path.normcase(row[1]) == os.path.normcase(os.path.abspath(path))])
+            def done(rows):
+                self.rules.replace(rows)
+                self.files.remove([i for i, row in enumerate(self.files.rows) if os.path.normcase(row[1]) == os.path.normcase(os.path.abspath(path))])
+                self.status.setText(f'已导入 {len(rows)} 条规则。')
+            self.tasks.submit(lambda p: load_replacement_rules(path), done)
 
     def export_rules(self):
         path, _ = QFileDialog.getSaveFileName(self, '导出规则', '替换规则.xlsx', 'Excel (*.xlsx)')
@@ -423,13 +430,21 @@ class MainWindow(WorkbenchActions, QMainWindow):
             self.proxy.select_values()
             self.scans.load(tables[0], sections[0])
             self.search.clear()
-            self.status.setText(f'扫描完成：{len(tables[0])} 张表格、{len(sections[0])} 个条款章节。勾选后可导出。')
+            summary = f'{len(tables[0])} 张表格、{len(sections[0])} 个条款章节'
+            self.status.setText(f'扫描完成：{summary}。')
             if tables[2] or sections[2]:
                 self.log.appendPlainText(tables[2] or sections[2])
+                self.log_toggle.setChecked(True)
+                self.status.setText(f'部分来源扫描失败：{summary}。请查看处理详情。')
         self.tasks.submit(lambda p: scan_word_content(paths, symbols, p), done)
+
+    def clear_scan_preview(self):
+        configure_sheet(self.scan_preview, SheetModel())
+        self.preview_text.clear()
 
     def preview_scan(self, current, previous=None):
         if not current.isValid():
+            self.clear_scan_preview()
             return
         kind, item = self.scans.items[self.proxy.mapToSource(current).row()]
         if kind == 'table':
@@ -438,6 +453,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
             self.preview_text.setPlainText('\n'.join(c.text for c in item.table.cells))
             self.preview_stack.setCurrentIndex(0)
         else:
+            configure_sheet(self.scan_preview, SheetModel())
             self.preview_text.setPlainText('\n\n'.join(c.text for c in item.clauses))
             self.preview_stack.setCurrentIndex(1)
 
@@ -582,9 +598,14 @@ class MainWindow(WorkbenchActions, QMainWindow):
         if not self.persist:
             event.accept()
             return
-        save_settings({'qt_rules': self.rules.rows, 'qt_output_dir': self.output.text(),
-                       'template_library_root': self.library_root, 'symbol_chars': self.symbols.text(),
-                       'keep_clause_symbols': self.keep_symbols.isChecked(), 'presets': self.presets})
+        try:
+            save_settings({'qt_rules': self.rules.rows, 'qt_output_dir': self.output.text(),
+                           'template_library_root': self.library_root, 'symbol_chars': self.symbols.text(),
+                           'keep_clause_symbols': self.keep_symbols.isChecked(), 'presets': self.presets})
+        except OSError as exc:
+            event.ignore()
+            self.error(f'设置未保存，请检查目录权限或磁盘空间后重新关闭：{exc}')
+            return
         event.accept()
 
 
