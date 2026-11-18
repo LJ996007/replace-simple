@@ -113,7 +113,7 @@ class WorkbenchActions:
             self.rules.replace(rows)
             self.status.setText(f'已保存预设并添加 {count} 条规则。')
             dialog.accept()
-        toolbar(layout, [('新增', new), ('删除选中', remove), ('保存并添加勾选项', apply)])
+        toolbar(layout, [('新增', new), ('删除选中', remove), ('保存并添加', apply)])
         dialog.exec()
 
     def filter_scans(self):

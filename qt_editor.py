@@ -242,13 +242,13 @@ class VisualEditor(QDialog):
         structures.setMovable(False)
         for text, action in [('上方插行', 'insert_above'), ('下方插行', 'insert_below'),
                              ('左侧插列', 'insert_left'), ('右侧插列', 'insert_right'),
-                             ('删除选中行', 'delete_rows'), ('合并选区', 'merge'), ('取消合并', 'unmerge')]:
+                             ('删除行', 'delete_rows'), ('合并选区', 'merge'), ('取消合并', 'unmerge')]:
             structures.addAction(text, lambda checked=False, a=action: self.structure(a))
         menu = QMenu('排版与配方…', structures)
-        for text, callback in [('设置行高', lambda: self.resize_cells('height')),
-                               ('设置列宽', lambda: self.resize_cells('width')),
-                               ('自动行高', self.auto_height), ('保存整套操作配方…', self.save_recipe),
-                               ('载入并应用配方…', self.load_recipe), ('复用旧版已存配方…', self.load_saved_recipe), ('弹出目标表格…', self.popup_target)]:
+        for text, callback in [('行高…', lambda: self.resize_cells('height')),
+                               ('列宽…', lambda: self.resize_cells('width')),
+                               ('自动行高', self.auto_height), ('保存配方…', self.save_recipe),
+                               ('应用配方…', self.load_recipe), ('旧版配方…', self.load_saved_recipe), ('独立查看…', self.popup_target)]:
             menu.addAction(text, callback)
         structures.addAction(menu.menuAction())
         structures.widgetForAction(menu.menuAction()).setPopupMode(QToolButton.InstantPopup)
@@ -273,7 +273,7 @@ class VisualEditor(QDialog):
         self.source_view.setDragDropMode(QAbstractItemView.DragOnly)
         self.source_view.setSelectionMode(QAbstractItemView.ContiguousSelection)
         left.addWidget(self.source_view, 1)
-        transfer = QPushButton('将来源选区填入目标选中位置')
+        transfer = QPushButton('填入目标选区')
         transfer.setEnabled(bool(items))
         transfer.clicked.connect(self.transfer)
         left.addWidget(transfer)
@@ -303,7 +303,7 @@ class VisualEditor(QDialog):
             header.viewport().installEventFilter(self)
             header.sectionResized.connect(lambda index, old, new, a=axis: self.header_resized(a, index, new))
         right.addWidget(self.target, 1)
-        popup = QPushButton('弹出目标表格…')
+        popup = QPushButton('独立查看…')
         popup.clicked.connect(self.popup_target)
         right.addWidget(popup)
         split.addWidget(target)
@@ -688,7 +688,7 @@ class MappingDialog(QDialog):
         buttons = QHBoxLayout()
         preview = QPushButton('核验并预览')
         preview.clicked.connect(self.build)
-        self.apply_button = QPushButton('确认回填到编辑器')
+        self.apply_button = QPushButton('回填编辑器')
         self.apply_button.setEnabled(False)
         self.apply_button.clicked.connect(self.apply)
         buttons.addWidget(preview)

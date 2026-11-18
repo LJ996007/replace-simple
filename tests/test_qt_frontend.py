@@ -724,13 +724,13 @@ class NativeFrontendTests(unittest.TestCase):
         timeout.timeout.connect(lambda: APP.activePopupWidget().hide()
                                 if APP.activePopupWidget() else None)
         with patch.object(editor, 'resize_cells') as resize_cells:
-            QTimer.singleShot(30, lambda: choose('设置行高'))
+            QTimer.singleShot(30, lambda: choose('行高…'))
             timeout.start(1000)
             QTest.mouseClick(structures.widgetForAction(menu_action), Qt.LeftButton)
             QTest.qWait(60)
             timeout.stop()
             APP.processEvents()
-            self.assertIn('设置行高', observed)
+            self.assertIn('行高…', observed)
             resize_cells.assert_called_once_with('height')
         # Force real overflow even on machines with smaller fonts.
         structures.setMaximumWidth(350)

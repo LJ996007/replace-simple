@@ -91,7 +91,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel('输出目录'))
         row.addWidget(self.output, 1)
-        self.choose_output_button = button('选择目录…', self.choose_output)
+        self.choose_output_button = button('浏览…', self.choose_output)
         row.addWidget(self.choose_output_button)
         layout.addLayout(row)
         self.progress = QProgressBar()
@@ -127,7 +127,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.raw_toggle.setCheckable(True)
         self.raw_toggle.setToolTip('展开查看本次处理的原始数据。')
         self.raw_toggle.toggled.connect(self.raw_log.setVisible)
-        self.raw_toggle.toggled.connect(lambda on: self.raw_toggle.setText('收起原始诊断' if on else '原始诊断'))
+        self.raw_toggle.toggled.connect(lambda on: self.raw_toggle.setText('收起诊断' if on else '原始诊断'))
         details_row.addWidget(self.raw_toggle)
         details_layout.addLayout(details_row)
         details_layout.addWidget(self.raw_log)
@@ -150,8 +150,8 @@ class MainWindow(WorkbenchActions, QMainWindow):
         files = QWidget()
         fl = QVBoxLayout(files)
         fl.setContentsMargins(0, 0, 0, 0)
-        toolbar(fl, [('添加文件', self.add_files), ('添加文件夹', self.add_folder),
-                     ('移除选中', self.remove_files), ('使用模板库', lambda: self.tabs.setCurrentIndex(2))])
+        toolbar(fl, [('添加文件', self.add_files), ('添加目录', self.add_folder),
+                     ('移除选中', self.remove_files), ('模板库', lambda: self.tabs.setCurrentIndex(2))])
         self.files = RowsModel(['文件名', '完整路径'])
         self.file_view = table(self.files)
         self.file_view.setColumnWidth(0, 280)
@@ -160,8 +160,8 @@ class MainWindow(WorkbenchActions, QMainWindow):
         rules = QWidget()
         rl = QVBoxLayout(rules)
         rl.setContentsMargins(0, 8, 0, 0)
-        toolbar(rl, [('新增规则', lambda: self.rules.append(['', ''])), ('删除选中规则', self.remove_rules),
-                     ('标记删除原文', self.mark_delete), ('导入 Excel', self.import_rules),
+        toolbar(rl, [('新增', lambda: self.rules.append(['', ''])), ('移除规则', self.remove_rules),
+                     ('删除原文', self.mark_delete), ('导入规则…', self.import_rules),
                      ('导出规则', self.export_rules), ('提取项目信息…', self.extract_project)])
         self.rules = RuleModel(['原文本 / 模板占位符', '替换为（空白跳过）'], self.settings.get('qt_rules', [['', ''] for _ in range(8)]))
         self.rule_view = table(self.rules, RuleTable())
@@ -174,17 +174,17 @@ class MainWindow(WorkbenchActions, QMainWindow):
         split.addWidget(rules)
         configure_splitter(split, minimum=100, sizes=[230, 320])
         layout.addWidget(split, 1)
-        row = toolbar(layout, [('预览输出路径…', self.preview_outputs), ('常用占位符…', self.manage_presets),
-                         ('仅重试失败', self.retry_failed), ('导出处理报告…', self.export_report)])
-        row.addWidget(button('开始批量替换', self.replace, True))
+        row = toolbar(layout, [('输出预览…', self.preview_outputs), ('占位符…', self.manage_presets),
+                         ('重试失败', self.retry_failed), ('导出报告…', self.export_report)])
+        row.addWidget(button('开始替换', self.replace, True))
         self.tabs.addTab(page, '批量替换')
 
     def build_scan(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 14, 0, 8)
-        toolbar(layout, [('添加 Word', self.add_scan_files), ('移除选中来源', self.remove_scan_files),
-                         ('扫描表格与条款', self.scan), ('打开工作簿编辑…', self.open_editor)])
+        toolbar(layout, [('添加 Word', self.add_scan_files), ('移除来源', self.remove_scan_files),
+                         ('开始扫描', self.scan), ('编辑工作簿…', self.open_editor)])
         self.scan_splitter = QSplitter(Qt.Vertical)
         self.scan_files = RowsModel(['Word 来源文件'])
         self.scan_file_view = table(self.scan_files)
@@ -243,9 +243,9 @@ class MainWindow(WorkbenchActions, QMainWindow):
         split.addWidget(self.preview_stack)
         configure_splitter(split)
         results_layout.addWidget(split, 1)
-        toolbar(results_layout, [('勾选当前筛选结果', lambda: self.check_visible(True)),
-                                 ('取消当前筛选勾选', lambda: self.check_visible(False)), ('筛选…', self.filter_scans),
-                                 ('弹出表格…', self.popup_scan), ('导出勾选结果', self.export_scan)])
+        toolbar(results_layout, [('全选结果', lambda: self.check_visible(True)),
+                                 ('取消勾选', lambda: self.check_visible(False)), ('筛选…', self.filter_scans),
+                                 ('独立查看…', self.popup_scan), ('导出勾选项…', self.export_scan)])
         self.scan_splitter.addWidget(results)
         configure_splitter(self.scan_splitter, minimum=85, sizes=[110, 360])
         results.setMinimumHeight(210)
@@ -269,7 +269,7 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.category.setAccessibleName('模板分类')
         self.category.currentTextChanged.connect(self.refresh_templates)
         row = toolbar(layout, [('刷新', self.refresh_library), ('新建分类', self.new_category),
-                               ('重命名分类', self.rename_category), ('删除空分类', self.delete_category)])
+                               ('重命名', self.rename_category), ('删除空分类', self.delete_category)])
         row.insertWidget(0, self.category)
         self.templates = TemplateModel()
         self.template_view = table(self.templates)
@@ -284,8 +284,8 @@ class MainWindow(WorkbenchActions, QMainWindow):
         self.template_selection.setObjectName('hint')
         layout.addWidget(self.template_selection)
         actions = toolbar(layout, [('添加模板…', self.add_templates)])
-        self.delete_templates_button = button('删除勾选模板', self.delete_templates)
-        self.use_templates_button = button('使用勾选模板', self.use_templates)
+        self.delete_templates_button = button('删除模板', self.delete_templates)
+        self.use_templates_button = button('使用模板', self.use_templates)
         actions.insertWidget(1, self.delete_templates_button)
         actions.insertWidget(2, self.use_templates_button)
         self.templates.dataChanged.connect(self.update_template_selection)
@@ -731,7 +731,7 @@ class ProjectReview(QDialog):
         layout.addWidget(split, 1)
         self.view.selectionModel().currentChanged.connect(self.show_sources)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText('确认并回填规则')
+        buttons.button(QDialogButtonBox.Ok).setText('回填规则')
         buttons.button(QDialogButtonBox.Cancel).setText('取消')
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
