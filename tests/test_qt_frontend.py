@@ -18,7 +18,7 @@ from docx import Document
 
 from qt_models import RowsModel, SheetModel, ScanModel
 from qt_tasks import TaskController
-from qt_main import MainWindow, STYLE, ProjectReview
+from qt_main import MainWindow, STYLE, ProjectReview, format_result_summary
 from qt_editor import VisualEditor, MappingDialog
 from workbook_session import WorkbookSession
 from word_table_exporter import ExportedTable, ExportedTableCell, TableScanItem
@@ -466,6 +466,48 @@ class NativeFrontendTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0], ['来源', '输出', '状态', '命中数', '错误'])
         window.close(); window.deleteLater()
+
+    def test_result_details_are_readable_with_raw_diagnostics_secondary(self):
+        output = self.root/'详情输出'; output.mkdir()
+        broken = self.root/'损坏.docx'; broken.write_bytes(b'not a zip')
+        window = MainWindow(restore=False)
+        window.append_files([str(self.source), str(broken)])
+        window.rules.replace([['新说明', '替换说明']])
+        window.output.setText(str(output))
+        window.replace(); wait_task(window.tasks)
+        text = window.log.toPlainText()
+        self.assertIn('批量替换完成', text)
+        self.assertIn('共 2 个文件（成功 1、失败 1）', text)
+        self.assertIn('来源.docx — 成功：命中', text)
+        self.assertIn('输出', text)
+        self.assertIn('损坏.docx — 失败：', text)
+        self.assertNotIn("{'source_path'", text)
+        self.assertNotIn("'明细'", text)
+        self.assertIn("'明细'", window.raw_log.toPlainText())
+        self.assertFalse(window.raw_log.isVisibleTo(window))
+        self.assertTrue(window.details_panel.isVisibleTo(window))
+        window.copy_details()
+        self.assertIn('批量替换完成', APP.clipboard().text())
+        self.assertNotIn("'明细'", APP.clipboard().text())
+        window.raw_toggle.setChecked(True)
+        self.assertTrue(window.raw_log.isVisibleTo(window))
+        window.copy_details()
+        copied = APP.clipboard().text()
+        self.assertIn('批量替换完成', copied)
+        self.assertIn("'明细'", copied)
+        window.raw_toggle.setChecked(False)
+        window.close(); window.deleteLater()
+
+    def test_format_result_summary_covers_scan_export_and_unknown_shapes(self):
+        value = ({'来源.docx': {'tables': 2, 'output_path': 'C:/x/表格.xlsx'}}, {}, None, {}, {}, None)
+        summary = format_result_summary(value)
+        self.assertIn('导出完成：表格 1 个来源、条款 0 个来源', summary)
+        self.assertIn('来源.docx → 表格.xlsx（2 张）', summary)
+        self.assertIn('导出完成：表格 0 个来源、条款 1 个来源',
+                      format_result_summary(({}, {}, None, {'来源.docx': {'count': 3, 'output_path': 'C:/x/条款.xlsx'}}, {}, None)))
+        self.assertIn('失败：无法导出', format_result_summary(({}, {}, '无法导出', {}, {}, None)))
+        self.assertEqual(format_result_summary({'foo': 'bar'}), '')
+        self.assertIn('没有可记录的文件明细', format_result_summary({'结果': {}, '错误': None, '明细': []}))
 
     def test_clause_selection_and_combined_filters_export_only_checked_clause(self):
         from word_scan import scan_word_content

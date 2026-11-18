@@ -101,18 +101,43 @@ class MainWindow(WorkbenchActions, QMainWindow):
         layout.addWidget(self.progress)
         self.status = QLabel('就绪')
         self.status.setWordWrap(True)
+        # Details panel: readable summary by default, raw diagnostics on demand.
+        self.details_panel = QWidget()
+        details_layout = QVBoxLayout(self.details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(4)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(3000)
-        self.log.setMaximumHeight(100)
-        self.log.setPlaceholderText('处理结果和错误将在这里显示。')
-        layout.addWidget(self.log)
-        self.log.setVisible(False)
+        self.log.setMaximumHeight(110)
+        self.log.setPlaceholderText('处理概况、逐文件状态和失败原因将在这里显示。')
+        details_layout.addWidget(self.log)
+        self.raw_log = QPlainTextEdit()
+        self.raw_log.setReadOnly(True)
+        self.raw_log.setMaximumBlockCount(3000)
+        self.raw_log.setMaximumHeight(140)
+        self.raw_log.setPlaceholderText('原始诊断数据（供核对与反馈）。')
+        self.raw_log.setVisible(False)
+        details_row = QHBoxLayout()
+        details_row.addStretch()
+        self.copy_details_button = button('复制', self.copy_details)
+        self.copy_details_button.setToolTip('把当前显示的处理详情复制到剪贴板。')
+        details_row.addWidget(self.copy_details_button)
+        self.raw_toggle = QPushButton('原始诊断')
+        self.raw_toggle.setCheckable(True)
+        self.raw_toggle.setToolTip('展开查看本次处理的原始数据。')
+        self.raw_toggle.toggled.connect(self.raw_log.setVisible)
+        self.raw_toggle.toggled.connect(lambda on: self.raw_toggle.setText('收起原始诊断' if on else '原始诊断'))
+        details_row.addWidget(self.raw_toggle)
+        details_layout.addLayout(details_row)
+        details_layout.addWidget(self.raw_log)
+        layout.addWidget(self.details_panel)
+        self.details_panel.setVisible(False)
         actions = QHBoxLayout()
         layout.addLayout(actions)
         self.log_toggle = QPushButton('处理详情')
         self.log_toggle.setCheckable(True)
-        self.log_toggle.toggled.connect(self.log.setVisible)
+        self.log_toggle.toggled.connect(self.details_panel.setVisible)
         actions.addWidget(self.status, 1)
         actions.addWidget(self.log_toggle)
         self.setCentralWidget(central)
@@ -298,9 +323,25 @@ class MainWindow(WorkbenchActions, QMainWindow):
 
     def result(self, value):
         import pprint
-        self.log.appendPlainText(pprint.pformat(value, width=110, sort_dicts=False))
+        summary = format_result_summary(value)
+        if summary:
+            self.log.appendPlainText(summary)
+        else:
+            self.log.appendPlainText('处理完成。本次结果无标准摘要，详细数据见“原始诊断”。')
+        self.raw_log.appendPlainText(pprint.pformat(value, width=110, sort_dicts=False))
         self.log_toggle.setChecked(True)
-        self.status.setText('处理结束，详细结果见下方。失败项不会被当作成功。')
+        self.status.setText('处理结束，概况见下方。失败项不会被当作成功。')
+
+    def copy_details(self):
+        parts = [self.log.toPlainText()]
+        if not self.raw_log.isHidden():
+            parts.append(self.raw_log.toPlainText())
+        text = '\n\n'.join(part for part in parts if part.strip())
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status.setText('处理详情已复制到剪贴板。')
+        else:
+            self.status.setText('暂无处理详情可复制。')
 
     def choose_output(self):
         path = QFileDialog.getExistingDirectory(self, '选择输出目录', self.output.text())
@@ -611,6 +652,59 @@ class MainWindow(WorkbenchActions, QMainWindow):
 
 def deepcopy_rows(rows):
     return [list(row) for row in rows]
+
+
+def _status_counts(details):
+    counts = {}
+    for item in details:
+        status = item.get('status') or '未知'
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def format_result_summary(value):
+    """Render a finished task result as readable Chinese lines.
+
+    Returns '' when the value has no known shape; the caller then points the
+    user to the raw diagnostics instead of dumping code-style output.
+    """
+    if isinstance(value, dict) and isinstance(value.get('明细'), list):
+        details = value['明细']
+        if not details:
+            return '处理完成：没有可记录的文件明细。'
+        counts = _status_counts(details)
+        hits = sum(int(item.get('count') or 0) for item in details)
+        order = ['成功', '零命中', '失败']
+        summary = '、'.join(f'{name} {counts[name]}' for name in order + [k for k in counts if k not in order] if counts.get(name))
+        lines = [f'批量替换完成：共 {len(details)} 个文件（{summary}），合计命中 {hits} 处。']
+        for index, item in enumerate(details, 1):
+            name = Path(item.get('source_path') or '未知文件').name
+            status = item.get('status') or '未知'
+            output = Path(item.get('output_path') or '').name
+            if status == '失败':
+                lines.append(f'{index}. {name} — 失败：{item.get("error") or "未提供原因"}')
+            elif status == '零命中':
+                suffix = f'，输出 {output}' if output else ''
+                lines.append(f'{index}. {name} — 零命中：没有匹配到任何规则{suffix}')
+            elif status == '成功':
+                converted = item.get('converted_from') or ''
+                note = f'（由 {converted} 转换后替换）' if converted else ''
+                lines.append(f'{index}. {name} — 成功：命中 {item.get("count", 0)} 处，输出 {output}{note}')
+            else:
+                lines.append(f'{index}. {name} — {status}：{item.get("error") or output or "无附加信息"}')
+        return '\n'.join(lines)
+    if isinstance(value, tuple) and len(value) == 6:
+        table_results, _, table_errors, clause_results, _, clause_errors = value
+        lines = [f'导出完成：表格 {len(table_results)} 个来源、条款 {len(clause_results)} 个来源。']
+        for name, info in table_results.items():
+            lines.append(f'表格：{name} → {Path(info["output_path"]).name}（{info["tables"]} 张）')
+        for name, info in clause_results.items():
+            lines.append(f'条款：{name} → {Path(info["output_path"]).name}（{info["count"]} 条）')
+        for message in (table_errors, clause_errors):
+            if message:
+                lines.append(f'失败：{message}')
+        return '\n'.join(lines)
+    return ''
 
 
 class ProjectReview(QDialog):

@@ -4,7 +4,7 @@
 
 当前源码默认使用 **PySide6 中文工作台**（基础版本信息仍来自 `app_info.py`）。Tk 入口保留，使用 `python main.py --legacy` 启动。
 
-2026-11-13 复核已修复规则表快捷编辑、失败/取消状态、扫描预览残留、设置保存失败及编辑器缩放/全屏；完整回归 **338 passed、48 subtests passed、1 skipped**。可用程序保持在 `dist/replace-simple/replace-simple.exe` 和 `dist/v1.10.0/replace-simple/replace-simple.exe`；本地便携包为 `dist/replace-simple-v1.10.0-qt-20261113-portable.zip`。旧目录备份、截图、原生交互验证限制见 [本次复核记录](docs/Qt迁移复核-20261113.md)。
+2026-11-13 复核已修复规则表快捷编辑、失败/取消状态、扫描预览残留、设置保存失败及编辑器缩放/全屏；完整回归 **338 passed、48 subtests passed、1 skipped**。2026-11-18 起“处理详情”默认显示易读的处理概况、逐文件成功/零命中/失败状态、命中数和失败原因，原始诊断数据折叠在“原始诊断”次级区并可随“复制”按钮一并复制；完整回归 **340 passed、48 subtests passed、1 skipped**。可用程序保持在 `dist/replace-simple/replace-simple.exe` 和 `dist/v1.10.0/replace-simple/replace-simple.exe`；最新本地便携包为 `dist/replace-simple-v1.10.0-qt-20261118-portable.zip`（校验和见 `dist/SHA256SUMS-v1.10.0-qt-20261118.txt`）。旧目录备份、截图、原生交互验证限制见 [本次复核记录](docs/Qt迁移复核-20261113.md)。
 
 ## PySide6 工作台
 
